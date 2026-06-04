@@ -77,12 +77,29 @@ class SimulatedTradeInput(BaseModel):
     contract_type: ContractType
     duration: Annotated[int, Field(ge=1)]
     duration_unit: DurationUnit
+    allow_live: bool = False
 
 
 class AccountStatusInput(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
     api_token: NonEmptyString
+
+
+class OpenContractStatusInput(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    api_token: NonEmptyString
+    contract_id: Annotated[int, Field(ge=1)] | None = None
+
+
+class CloseContractInput(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    api_token: NonEmptyString
+    contract_id: Annotated[int, Field(ge=1)]
+    price: Annotated[float, Field(ge=0)] = 0.0
+    allow_live: bool = False
 
 
 def utc_now_iso() -> str:
@@ -95,6 +112,26 @@ def mask_secret(value: str | None) -> str | None:
     if len(value) <= 6:
         return "***"
     return f"{value[:3]}***{value[-3:]}"
+
+
+def account_type_from_authorize(authorize: dict[str, Any]) -> str:
+    loginid = str(authorize.get("loginid") or authorize.get("account") or "")
+    landing_company = str(authorize.get("landing_company_name") or "").lower()
+    if loginid.upper().startswith("VRTC") or "virtual" in landing_company:
+        return "demo"
+    if loginid:
+        return "live"
+    return "unknown"
+
+
+def enforce_demo_or_explicit_live(authorize: dict[str, Any], allow_live: bool) -> str:
+    account_type = account_type_from_authorize(authorize)
+    if account_type == "live" and not allow_live:
+        raise DerivAPIError(
+            "Live account execution is blocked by default. Use a demo token, "
+            "or explicitly set allow_live=true after human confirmation."
+        )
+    return account_type
 
 
 def clean_json(data: dict[str, Any]) -> str:
@@ -499,6 +536,7 @@ async def execute_simulated_trade(
     contract_type: str,
     duration: int,
     duration_unit: str,
+    allow_live: bool = False,
 ) -> str:
     """Authorize and buy a Deriv CALL/PUT contract, returning an immutable receipt."""
     tool = "execute_simulated_trade"
@@ -511,11 +549,13 @@ async def execute_simulated_trade(
                 "contract_type": contract_type,
                 "duration": duration,
                 "duration_unit": duration_unit,
+                "allow_live": allow_live,
             }
         )
 
         async with DerivWebSocketClient(api_token=params.api_token) as client:
             authorize = client.authorization or {}
+            account_type = enforce_demo_or_explicit_live(authorize, params.allow_live)
             currency = authorize.get("currency")
 
             proposal_response = await client.request(
@@ -554,6 +594,8 @@ async def execute_simulated_trade(
                 "duration_unit": params.duration_unit,
                 "proposal_id": proposal_id,
                 "longcode": buy.get("longcode") or proposal.get("longcode"),
+                "account_type": account_type,
+                "loginid": authorize.get("loginid"),
                 "api_token": mask_secret(params.api_token),
                 "note": "Use a Deriv demo token for simulated trading workflows.",
             }
@@ -569,6 +611,7 @@ async def check_account_status(api_token: str) -> str:
     try:
         params = AccountStatusInput.model_validate({"api_token": api_token})
         async with DerivWebSocketClient(api_token=params.api_token) as client:
+            authorize = client.authorization or {}
             balance_response = await client.request({"balance": 1, "subscribe": 0})
             portfolio_response = await client.request({"portfolio": 1})
 
@@ -580,10 +623,79 @@ async def check_account_status(api_token: str) -> str:
                 tool,
                 {
                     "loginid": balance.get("loginid"),
+                    "account_type": account_type_from_authorize(authorize),
                     "currency": balance.get("currency"),
                     "cash_balance": cash_balance,
                     "net_equity_estimate": cash_balance + portfolio["total_open_buy_price"],
                     "portfolio": portfolio,
+                    "api_token": mask_secret(params.api_token),
+                },
+            )
+    except Exception as exc:
+        return error_response(tool, exc)
+
+
+@mcp.tool()
+async def get_open_contract_status(api_token: str, contract_id: int | None = None) -> str:
+    """Authorize and fetch latest status for one open contract or all open contracts."""
+    tool = "get_open_contract_status"
+    try:
+        params = OpenContractStatusInput.model_validate(
+            {"api_token": api_token, "contract_id": contract_id}
+        )
+        async with DerivWebSocketClient(api_token=params.api_token) as client:
+            authorize = client.authorization or {}
+            payload: dict[str, Any] = {"proposal_open_contract": 1}
+            if params.contract_id:
+                payload["contract_id"] = params.contract_id
+            response = await client.request(payload)
+            contract = response.get("proposal_open_contract") or {}
+            return ok_response(
+                tool,
+                {
+                    "account_type": account_type_from_authorize(authorize),
+                    "loginid": authorize.get("loginid"),
+                    "contract": contract,
+                    "api_token": mask_secret(params.api_token),
+                },
+            )
+    except Exception as exc:
+        return error_response(tool, exc)
+
+
+@mcp.tool()
+async def close_open_contract(
+    api_token: str,
+    contract_id: int,
+    price: float = 0.0,
+    allow_live: bool = False,
+) -> str:
+    """Authorize and sell an open contract by contract_id. price=0 means sell at market."""
+    tool = "close_open_contract"
+    try:
+        params = CloseContractInput.model_validate(
+            {
+                "api_token": api_token,
+                "contract_id": contract_id,
+                "price": price,
+                "allow_live": allow_live,
+            }
+        )
+        async with DerivWebSocketClient(api_token=params.api_token) as client:
+            authorize = client.authorization or {}
+            account_type = enforce_demo_or_explicit_live(authorize, params.allow_live)
+            response = await client.request(
+                {"sell": params.contract_id, "price": params.price},
+                retries=0,
+            )
+            sell = response.get("sell") or {}
+            return ok_response(
+                tool,
+                {
+                    "account_type": account_type,
+                    "loginid": authorize.get("loginid"),
+                    "contract_id": params.contract_id,
+                    "sell": sell,
                     "api_token": mask_secret(params.api_token),
                 },
             )

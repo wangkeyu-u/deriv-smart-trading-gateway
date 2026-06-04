@@ -90,6 +90,19 @@ cd /Users/wangkeyu/Documents/项目
 - `get_historical_candles`
 - `execute_simulated_trade`
 - `check_account_status`
+- `get_open_contract_status`
+- `close_open_contract`
+
+## Agent Capabilities And Safety
+
+The web app uses a hierarchical team model:
+
+- Trading Manager: decomposes user goals and dispatches work.
+- Market Analyst, Strategy Researcher, Chart Engineer, Report Agent: read and analyze market or run data.
+- Risk Sentinel and Compliance Reviewer: check trade size, token status, and unsafe instructions.
+- Execution Trader: the only sub-agent allowed to place or close Deriv contracts.
+
+By default, every write action is blocked until the user confirms the next order in the sidebar. Demo accounts are supported by default. Live-account execution is blocked unless the UI and backend both receive explicit `allow_live=true`.
 
 ## Configuration
 

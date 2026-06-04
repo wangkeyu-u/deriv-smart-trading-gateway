@@ -27,7 +27,9 @@ import streamlit as st
 
 from server import (
     check_account_status,
+    close_open_contract,
     execute_simulated_trade,
+    get_open_contract_status,
     get_historical_candles,
     get_market_ticks,
     mask_secret,
@@ -51,6 +53,11 @@ I18N = {
         "sidebar_caption": "多智能体交易终端",
         "language": "语言",
         "security": "安全密钥配置",
+        "execution_safety": "交易安全闸门",
+        "require_trade_confirmation": "下单前需要人工确认",
+        "confirm_next_trade": "我确认下一笔模拟盘订单",
+        "allow_live_execution": "允许 live 账户执行交易",
+        "pending_trade": "待确认交易",
         "deriv_token": "Deriv API Token",
         "llm_api": "大模型 API",
         "model": "模型",
@@ -161,6 +168,11 @@ I18N = {
         "sidebar_caption": "Multi-agent trading terminal",
         "language": "Language",
         "security": "Secure Credentials",
+        "execution_safety": "Execution Safety Gate",
+        "require_trade_confirmation": "Require human confirmation before orders",
+        "confirm_next_trade": "I confirm the next demo order",
+        "allow_live_execution": "Allow live account execution",
+        "pending_trade": "Pending Trade",
         "deriv_token": "Deriv API Token",
         "llm_api": "Model API",
         "model": "Model",
@@ -897,6 +909,10 @@ def init_state() -> None:
         "llm_model": "local-rule-engine",
         "custom_base_url": "",
         "provider": "本地规则",
+        "require_trade_confirmation": True,
+        "confirm_next_trade": False,
+        "allow_live_execution": False,
+        "pending_trade": None,
         "language": "zh",
         "last_language": "zh",
         "messages": [{"role": "assistant", "content": text_for("zh", "initial_message")}],
@@ -1328,6 +1344,25 @@ def render_sidebar() -> None:
 
         st.session_state.deriv_token = deriv_token
 
+        st.subheader(t("execution_safety"))
+        st.session_state.require_trade_confirmation = st.toggle(
+            t("require_trade_confirmation"),
+            value=bool(st.session_state.require_trade_confirmation),
+            help="建议保持开启。每次下单后会自动取消确认。",
+        )
+        st.session_state.confirm_next_trade = st.checkbox(
+            t("confirm_next_trade"),
+            value=bool(st.session_state.confirm_next_trade),
+        )
+        st.session_state.allow_live_execution = st.checkbox(
+            t("allow_live_execution"),
+            value=bool(st.session_state.allow_live_execution),
+            help="默认关闭。开启后服务端仍会要求显式 allow_live=true。",
+        )
+        if st.session_state.pending_trade:
+            with st.expander(t("pending_trade"), expanded=True):
+                st.json(st.session_state.pending_trade)
+
         if selected_provider == "本地规则":
             st.session_state.llm_api_key = ""
             st.session_state.llm_model = "local-rule-engine"
@@ -1704,6 +1739,20 @@ def extract_amount(text: str) -> float:
     return 0.0
 
 
+def extract_contract_id(text: str) -> int | None:
+    match = re.search(r"(?:contract[_\s-]?id|合同|合约|id)\s*[:：#]?\s*(\d{4,})", text, flags=re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def has_close_intent(text: str) -> bool:
+    lowered = text.lower()
+    return any(word in text for word in ["平仓", "卖出合约", "关闭合约"]) or any(
+        word in lowered for word in ["close", "sell contract", "exit contract"]
+    )
+
+
 def extract_duration(text: str) -> int:
     match = re.search(r"(\d+)\s*(?:分钟|分|m\b|小时|h\b|tick|ticks|跳)", text, flags=re.IGNORECASE)
     if not match:
@@ -1829,9 +1878,16 @@ def summarize_api_result(result: dict[str, Any] | None) -> str:
         return f"{data.get('symbol')} candles={data.get('returned_count')}"
     if data.get("receipt"):
         receipt = data["receipt"]
-        return f"contract_id={receipt.get('contract_id')}"
+        return f"{data.get('account_type', 'demo')} contract_id={receipt.get('contract_id')}"
+    if data.get("sell"):
+        sell = data["sell"]
+        return f"closed contract_id={data.get('contract_id') or sell.get('contract_id')} sold_for={sell.get('sold_for')}"
+    if data.get("contract"):
+        contract = data["contract"]
+        status = contract.get("status") or ("open" if contract else "none")
+        return f"contract status={status} id={contract.get('contract_id')}"
     if data.get("balance") or data.get("portfolio"):
-        return "account status loaded"
+        return f"{data.get('account_type', 'account')} status loaded"
     return "ok"
 
 
@@ -2225,6 +2281,7 @@ def execution_agent(
     contract_type: str,
     duration: int,
     duration_unit: str,
+    contract_id: int | None = None,
     risk_note: str = "Use demo token and execute within user-specified parameters.",
     events: list[AgentEvent],
     writer: Callable[[str], None] | None = None,
@@ -2255,6 +2312,31 @@ def execution_agent(
         )
         return report
 
+    close_intent = has_close_intent(task)
+    contract_id = contract_id or extract_contract_id(task)
+    pending = {
+        "action": "close_open_contract" if close_intent else "execute_simulated_trade",
+        "symbol": symbol,
+        "amount": float(amount),
+        "contract_type": contract_type,
+        "duration": int(duration),
+        "duration_unit": duration_unit,
+        "contract_id": contract_id,
+        "allow_live": bool(st.session_state.allow_live_execution),
+    }
+    if st.session_state.require_trade_confirmation and not st.session_state.confirm_next_trade:
+        st.session_state.pending_trade = pending
+        report = {
+            "role": "Execution Trader",
+            "ok": False,
+            "status": "blocked",
+            "reason": "pending_human_confirmation",
+            "pending_trade": pending,
+        }
+        append_team_event(events, "执行交易员", "经理", "已拦截写操作：需要老板在侧边栏确认下一笔订单。", writer)
+        remember_agent_report("execution", report)
+        return report
+
     account_result = call_deriv_tool(
         "check_account_status",
         check_account_status(st.session_state.deriv_token),
@@ -2262,48 +2344,105 @@ def execution_agent(
         writer,
     )
     account_ok = bool(account_result.get("ok"))
-    receipt_result = call_deriv_tool(
-        "execute_simulated_trade",
-        execute_simulated_trade(
-            st.session_state.deriv_token,
-            symbol,
-            float(amount),
-            contract_type,
-            int(duration),
-            duration_unit,
+    account_type = ((account_result.get("data") or {}).get("account_type") or "unknown")
+    if account_type == "live" and not st.session_state.allow_live_execution:
+        report = {
+            "role": "Execution Trader",
+            "ok": False,
+            "status": "blocked",
+            "reason": "live_account_blocked",
+            "account": account_result.get("data"),
+        }
+        append_team_event(events, "执行交易员", "经理", "已拦截 live 账户写操作：默认只允许 demo token。", writer)
+        remember_agent_report("execution", report)
+        return report
+
+    if close_intent:
+        if not contract_id:
+            status_result = call_deriv_tool(
+                "get_open_contract_status",
+                get_open_contract_status(st.session_state.deriv_token, None),
+                {"api_token": st.session_state.deriv_token, "contract_id": None},
+                writer,
+            )
+            report = {
+                "role": "Execution Trader",
+                "ok": False,
+                "status": "blocked",
+                "reason": "missing_contract_id_for_close",
+                "account_checked": account_ok,
+                "account": account_result.get("data"),
+                "open_contract_status": status_result.get("data"),
+            }
+            append_team_event(events, "执行交易员", "经理", "平仓需要明确 contract_id。我已读取持仓状态供老板选择。", writer)
+            remember_agent_report("execution", report)
+            return report
+        receipt_result = call_deriv_tool(
+            "close_open_contract",
+            close_open_contract(
+                st.session_state.deriv_token,
+                contract_id,
+                0.0,
+                bool(st.session_state.allow_live_execution),
+            ),
+            {
+                "api_token": st.session_state.deriv_token,
+                "contract_id": contract_id,
+                "price": 0.0,
+                "allow_live": bool(st.session_state.allow_live_execution),
+            },
+            writer,
         )
-        ,
-        {
-            "api_token": st.session_state.deriv_token,
-            "symbol": symbol,
-            "amount": float(amount),
-            "contract_type": contract_type,
-            "duration": int(duration),
-            "duration_unit": duration_unit,
-        },
-        writer,
-    )
+    else:
+        receipt_result = call_deriv_tool(
+            "execute_simulated_trade",
+            execute_simulated_trade(
+                st.session_state.deriv_token,
+                symbol,
+                float(amount),
+                contract_type,
+                int(duration),
+                duration_unit,
+                bool(st.session_state.allow_live_execution),
+            ),
+            {
+                "api_token": st.session_state.deriv_token,
+                "symbol": symbol,
+                "amount": float(amount),
+                "contract_type": contract_type,
+                "duration": int(duration),
+                "duration_unit": duration_unit,
+                "allow_live": bool(st.session_state.allow_live_execution),
+            },
+            writer,
+        )
+    st.session_state.confirm_next_trade = False
+    st.session_state.pending_trade = None
     if receipt_result.get("ok"):
         st.session_state.last_trade_receipt = receipt_result
-        receipt = ((receipt_result.get("data") or {}).get("receipt") or {})
+        receipt = ((receipt_result.get("data") or {}).get("receipt") or (receipt_result.get("data") or {}).get("sell") or {})
         report = {
             "role": "Execution Trader",
             "ok": True,
             "account_checked": account_ok,
             "account": account_result.get("data"),
             "receipt": receipt,
+            "action": pending["action"],
         }
         append_team_event(
             events,
             "执行交易员",
             "经理",
             (
-                "下单成功，"
-                f"合同ID: {receipt.get('contract_id')}，成交价: {receipt.get('purchase_price')} "
-                f"{receipt.get('currency')}。"
+                ("平仓成功，" if close_intent else "下单成功，")
+                +
+                f"合同ID: {receipt.get('contract_id') or contract_id}，"
+                f"成交价: {receipt.get('purchase_price') or receipt.get('sold_for') or receipt.get('sell_price')} "
+                f"{receipt.get('currency', '')}。"
             ),
             writer,
         )
+        remember_agent_report("execution", report)
         return report
 
     error_message = (receipt_result.get("error") or {}).get("message", "unknown error")
@@ -2315,6 +2454,7 @@ def execution_agent(
         "error": error_message,
     }
     append_team_event(events, "执行交易员", "经理", f"下单失败：{error_message}", writer)
+    remember_agent_report("execution", report)
     return report
 
 
@@ -2347,6 +2487,7 @@ def assign_task_to_execution_agent(
         contract_type=str(arguments.get("contract_type") or "CALL").upper(),
         duration=int(arguments.get("duration") or 1),
         duration_unit=str(arguments.get("duration_unit") or "m"),
+        contract_id=arguments.get("contract_id"),
         risk_note=str(arguments.get("risk_note") or "经理批准的模拟盘交易。"),
         events=events,
         writer=writer,
@@ -2923,6 +3064,7 @@ def execute_trade_closed_loop(plan: ToolPlan) -> tuple[dict[str, Any], str]:
             params["contract_type"],
             params["duration"],
             params["duration_unit"],
+            bool(st.session_state.allow_live_execution),
         ),
         {
             "api_token": st.session_state.deriv_token,
@@ -2931,6 +3073,7 @@ def execute_trade_closed_loop(plan: ToolPlan) -> tuple[dict[str, Any], str]:
             "contract_type": params["contract_type"],
             "duration": params["duration"],
             "duration_unit": params["duration_unit"],
+            "allow_live": bool(st.session_state.allow_live_execution),
         },
     )
 
@@ -3974,6 +4117,7 @@ def direct_arguments(agent_id: str, task: str) -> dict[str, Any]:
                 "contract_type": contract_type,
                 "duration": extract_duration(task) or 5,
                 "duration_unit": extract_duration_unit(task),
+                "contract_id": extract_contract_id(task),
                 "risk_note": "老板直派执行任务，请按模拟盘安全边界执行。",
             }
         )
