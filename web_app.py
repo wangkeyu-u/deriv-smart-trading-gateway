@@ -8,17 +8,21 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import html
+import operator
 import json
 import math
 import re
 import sqlite3
 import time
+import urllib.parse
+import xml.etree.ElementTree as ET
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, TypedDict
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -42,9 +46,34 @@ Action = Literal["get_market_ticks", "get_historical_candles", "execute_simulate
 DEFAULT_SYMBOL = "R_100"
 DEFAULT_GRANULARITY = 60
 DEFAULT_COUNT = 60
+COMMON_DERIV_SYMBOLS = [
+    "R_10",
+    "R_25",
+    "R_50",
+    "R_75",
+    "R_100",
+    "1HZ10V",
+    "1HZ25V",
+    "1HZ50V",
+    "1HZ75V",
+    "1HZ100V",
+    "BOOM500",
+    "BOOM1000",
+    "CRASH500",
+    "CRASH1000",
+    "JD10",
+    "JD25",
+    "JD50",
+    "JD75",
+    "JD100",
+    "frxEURUSD",
+    "frxGBPUSD",
+    "frxUSDJPY",
+]
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "local_data"
 DB_PATH = DATA_DIR / "gateway.sqlite3"
+AGENT_PROMPTS_PATH = APP_DIR / "agent_prompts.json"
 LOCAL_TZ = ZoneInfo("Asia/Kuala_Lumpur")
 
 I18N = {
@@ -162,6 +191,26 @@ I18N = {
         "example_tick": "查 R_100 最新价",
         "example_candles": "画 R_100 最近 120 根 1分钟K线",
         "example_trade": "10 美金看涨 · 5 ticks",
+        "advisor_council": "老板谋士室",
+        "advisor_caption": "多个谋士在限时内读取行情与网页信息，快速讨论后给老板一个可执行倾向。只做决策建议，不自动下单。",
+        "advisor_question": "请谋士团分析什么？",
+        "advisor_placeholder": "例如：R_100 接下来 5-10 分钟该等还是做多？请结合最新行情和网页消息给我快速结论。",
+        "advisor_time_budget": "限时预算（秒）",
+        "advisor_web_toggle": "允许联网找资料",
+        "advisor_symbol": "分析 Symbol",
+        "advisor_start": "召集谋士",
+        "advisor_empty": "请输入要谋士团分析的问题。",
+        "advisor_processing": "谋士团正在限时讨论...",
+        "advisor_done": "谋士团已给出结论",
+        "advisor_result": "谋士结论",
+        "advisor_sources": "网页来源",
+        "advisor_no_sources": "本轮没有抓到可用网页来源，结论主要来自行情与内部规则。",
+        "advisor_transcript": "谋士讨论纪要",
+        "advisor_download": "下载谋士报告 JSON",
+        "advisor_consensus": "一致结论",
+        "advisor_confidence": "置信度",
+        "advisor_elapsed": "耗时",
+        "advisor_disclaimer": "谋士结论不会绕过交易安全闸门；下单仍需走执行交易员和人工确认。",
     },
     "en": {
         "sidebar_title": "Deriv Gateway",
@@ -277,6 +326,26 @@ I18N = {
         "example_tick": "R_100 latest tick",
         "example_candles": "R_100 · 120 candles · 1m",
         "example_trade": "10 USD CALL · 5 ticks",
+        "advisor_council": "Boss Advisor Room",
+        "advisor_caption": "Several advisors read market data and web context under a strict time budget, then produce one actionable view. Advice only; no automatic orders.",
+        "advisor_question": "What should the advisors analyze?",
+        "advisor_placeholder": "Example: Should I wait or go long on R_100 over the next 5-10 minutes? Use latest market data and web context.",
+        "advisor_time_budget": "Time budget (seconds)",
+        "advisor_web_toggle": "Allow web research",
+        "advisor_symbol": "Analysis Symbol",
+        "advisor_start": "Convene Advisors",
+        "advisor_empty": "Please enter an advisor question.",
+        "advisor_processing": "Advisors are debating under the time limit...",
+        "advisor_done": "Advisor conclusion ready",
+        "advisor_result": "Advisor Result",
+        "advisor_sources": "Web Sources",
+        "advisor_no_sources": "No usable web sources were found. This run mainly used market data and local rules.",
+        "advisor_transcript": "Advisor Transcript",
+        "advisor_download": "Download Advisor JSON",
+        "advisor_consensus": "Consensus",
+        "advisor_confidence": "Confidence",
+        "advisor_elapsed": "Elapsed",
+        "advisor_disclaimer": "Advisor output does not bypass the execution safety gate; orders still require the execution agent and human confirmation.",
     },
 }
 
@@ -391,9 +460,212 @@ AGENT_SPECS: dict[str, dict[str, str]] = {
     },
 }
 
+ADVISOR_SPECS: list[dict[str, str]] = [
+    {
+        "id": "macro",
+        "code": "MX",
+        "zh_name": "宏观大佬",
+        "en_name": "Macro Chair",
+        "zh_role": "先看大环境、新闻冲击和风险偏好",
+        "en_role": "Reads macro context, news shocks, and risk appetite",
+        "color": "#7aa7ff",
+    },
+    {
+        "id": "quant",
+        "code": "QX",
+        "zh_name": "量化大佬",
+        "en_name": "Quant Chair",
+        "zh_role": "只认短线动量、均线和最新 Tick",
+        "en_role": "Focuses on short-term momentum, moving averages, and ticks",
+        "color": "#6ee7f9",
+    },
+    {
+        "id": "flow",
+        "code": "FX",
+        "zh_name": "盘口大佬",
+        "en_name": "Flow Chair",
+        "zh_role": "盯节奏、波动和临场执行窗口",
+        "en_role": "Watches rhythm, volatility, and execution windows",
+        "color": "#00b894",
+    },
+    {
+        "id": "risk",
+        "code": "RX",
+        "zh_name": "风控大佬",
+        "en_name": "Risk Chair",
+        "zh_role": "先保命，再谈收益",
+        "en_role": "Protects capital before seeking upside",
+        "color": "#f5b84b",
+    },
+    {
+        "id": "contrarian",
+        "code": "CX",
+        "zh_name": "反方谋士",
+        "en_name": "Devil's Advocate",
+        "zh_role": "专门挑刺，找共识里的漏洞",
+        "en_role": "Challenges consensus and hunts for weak assumptions",
+        "color": "#c39bff",
+    },
+]
+
+
+class AdvisorGraphState(TypedDict, total=False):
+    question: str
+    symbol: str
+    budget: int
+    use_web: bool
+    language: str
+    started_at: float
+    writer: Callable[[str], None] | None
+    sources: list[dict[str, str]]
+    market: dict[str, Any]
+    news_signal: dict[str, Any]
+    opinions: Annotated[list[dict[str, Any]], operator.add]
+    logs: Annotated[list[str], operator.add]
+    local_consensus: dict[str, Any]
+    consensus: str
+    stance: str
+    confidence: float
+    vote_counts: dict[str, int]
+    graph_runtime: str
+
+
+def default_agent_prompts() -> dict[str, dict[str, str]]:
+    return {
+        "manager": {
+            "name": "交易经理",
+            "prompt": "你是交易经理，负责把老板目标拆成行情、策略、风控、合规、执行和报告任务。不要直接下单。",
+        },
+        "market": {
+            "name": "行情分析师",
+            "prompt": "你负责读取 Deriv Tick/K 线，判断趋势、连续波动和触发条件。输出要短、准、可审计。",
+        },
+        "strategy": {
+            "name": "策略研究员",
+            "prompt": "你负责把交易目标拆成假设、观察窗口、入场条件、退出条件和需要哪些 agent 协同。",
+        },
+        "risk": {
+            "name": "风控官",
+            "prompt": "你负责检查 Token、账户、金额、live/demo 边界和最大损失。你的默认立场是先保护本金。",
+        },
+        "compliance": {
+            "name": "合规审查员",
+            "prompt": "你负责阻止含糊、缺授权、缺方向、满仓、梭哈或绕过安全闸门的请求。",
+        },
+        "chart": {
+            "name": "图表工程师",
+            "prompt": "你负责生成 K 线快照、对比走势、测量窗口和可下载数据。",
+        },
+        "execution": {
+            "name": "执行交易员",
+            "prompt": "你是唯一能提交 Deriv 写操作的 agent。必须经过风控、合规和人工确认，不允许绕过安全闸门。",
+        },
+        "report": {
+            "name": "报告员",
+            "prompt": "你负责把每轮协作写成时间线、结构化结果、回执和复盘摘要。",
+        },
+        "advisor.macro": {
+            "name": "宏观大佬",
+            "prompt": "你先看外部消息、宏观风险偏好和新闻催化。没有明确催化时，不要催促老板追单。",
+        },
+        "advisor.quant": {
+            "name": "量化大佬",
+            "prompt": "你只认短线动量、MA5/MA20、最新 Tick 和窗口内涨跌幅。趋势不干净就倾向等待。",
+        },
+        "advisor.flow": {
+            "name": "盘口大佬",
+            "prompt": "你盯盘口节奏、波动速度和临场执行窗口。给出方向时必须附带等待确认条件。",
+        },
+        "advisor.risk": {
+            "name": "风控大佬",
+            "prompt": "你先保命，再谈收益。外部信息不足、置信度不足或时间过紧时，优先建议 WAIT。",
+        },
+        "advisor.contrarian": {
+            "name": "反方谋士",
+            "prompt": "你专门挑战共识，寻找已经被价格吸收、追高杀跌、样本不足和信息滞后的风险。",
+        },
+        "advisor.chief": {
+            "name": "首席谋士",
+            "prompt": "你汇总所有谋士观点，只输出一个短线结论：CALL、PUT 或 WAIT；必须包含置信度、执行前提和失效条件。",
+        },
+    }
+
+
+def load_agent_prompts() -> dict[str, dict[str, str]]:
+    defaults = default_agent_prompts()
+    if not AGENT_PROMPTS_PATH.exists():
+        return defaults
+    try:
+        loaded = json.loads(AGENT_PROMPTS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return defaults
+    if not isinstance(loaded, dict):
+        return defaults
+    merged = dict(defaults)
+    for key, value in loaded.items():
+        if isinstance(value, dict):
+            existing = merged.get(str(key), {})
+            merged[str(key)] = {
+                "name": str(value.get("name") or existing.get("name") or key),
+                "prompt": str(value.get("prompt") or existing.get("prompt") or ""),
+            }
+    return merged
+
+
+def agent_prompt(agent_id: str) -> str:
+    return load_agent_prompts().get(agent_id, {}).get("prompt", "")
+
+
+def safe_agent_id(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", value.strip())
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_").lower()
+    return cleaned or "custom"
+
+
+def advisor_node_name(advisor_id: str) -> str:
+    return f"advisor_{safe_agent_id(advisor_id)}"
+
+
+def advisor_specs() -> list[dict[str, str]]:
+    specs = [dict(item) for item in ADVISOR_SPECS]
+    existing = {item["id"] for item in specs}
+    colors = ["#7aa7ff", "#6ee7f9", "#00b894", "#f5b84b", "#c39bff", "#d8d257"]
+    for key, value in load_agent_prompts().items():
+        if not key.startswith("advisor.") or key == "advisor.chief":
+            continue
+        advisor_id = safe_agent_id(key.split(".", 1)[1])
+        if advisor_id in existing:
+            continue
+        name = str(value.get("name") or advisor_id)
+        role = str(value.get("prompt") or "")[:44] or "自定义谋士"
+        specs.append(
+            {
+                "id": advisor_id,
+                "code": advisor_id[:2].upper().ljust(2, "X"),
+                "zh_name": name,
+                "en_name": name,
+                "zh_role": role,
+                "en_role": role,
+                "color": colors[len(specs) % len(colors)],
+            }
+        )
+        existing.add(advisor_id)
+    return specs
+
 
 def current_lang() -> str:
+    if not in_streamlit_runtime():
+        return "zh"
     return st.session_state.get("language", "zh")
+
+
+def in_streamlit_runtime() -> bool:
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+        return get_script_run_ctx(suppress_warning=True) is not None
+    except Exception:
+        return False
 
 
 def t(key: str) -> str:
@@ -618,6 +890,20 @@ def init_local_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS advisor_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                question TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                consensus TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                elapsed_ms REAL NOT NULL,
+                result_json TEXT NOT NULL
+            )
+            """
+        )
 
 
 def save_team_run(user_prompt: str, result: TeamRunResult) -> None:
@@ -676,6 +962,43 @@ def load_recent_runs(limit: int = 5) -> list[dict[str, Any]]:
             """
             SELECT id, created_at, user_prompt, final_answer, ok
             FROM team_runs
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def save_advisor_run(result: dict[str, Any]) -> None:
+    init_local_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO advisor_runs (
+                created_at, question, symbol, consensus, confidence, elapsed_ms, result_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now(timezone.utc).isoformat(),
+                str(result.get("question") or ""),
+                str(result.get("symbol") or DEFAULT_SYMBOL),
+                str(result.get("consensus") or ""),
+                float(result.get("confidence") or 0),
+                float(result.get("elapsed_ms") or 0),
+                json.dumps(result, ensure_ascii=False, default=str),
+            ),
+        )
+
+
+def load_recent_advisor_runs(limit: int = 3) -> list[dict[str, Any]]:
+    init_local_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT id, created_at, question, symbol, consensus, confidence, elapsed_ms
+            FROM advisor_runs
             ORDER BY id DESC
             LIMIT ?
             """,
@@ -901,6 +1224,19 @@ MANAGER_TOOLS: list[dict[str, Any]] = [
 ]
 
 
+def manager_system_prompt() -> str:
+    prompts = load_agent_prompts()
+    prompt_lines = []
+    for agent_id in ["manager", "strategy", "market", "risk", "compliance", "chart", "execution", "report"]:
+        item = prompts.get(agent_id) or {}
+        prompt_lines.append(f"- {item.get('name', agent_id)}({agent_id}): {item.get('prompt', '')}")
+    return (
+        MANAGER_SYSTEM_PROMPT
+        + "\n\n每个员工的专属 prompt，请调度时尊重：\n"
+        + "\n".join(prompt_lines)
+    )
+
+
 def init_state() -> None:
     defaults = {
         "deriv_token": "",
@@ -932,6 +1268,12 @@ def init_state() -> None:
         "sync_version": 0,
         "chart_snapshots": [],
         "direct_prompt_nonce": 0,
+        "advisor_prompt_nonce": 0,
+        "advisor_time_budget": 10,
+        "advisor_use_web": True,
+        "advisor_symbol": DEFAULT_SYMBOL,
+        "advisor_runs": [],
+        "last_advisor_result": None,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -1200,6 +1542,102 @@ def configure_page() -> None:
             font-size: .82rem;
             padding-top: .45rem;
         }
+        .advisor-room {
+            border: 1px solid var(--line);
+            background: linear-gradient(135deg, rgba(17,30,27,.98), rgba(9,18,16,.98));
+            padding: 1rem;
+            margin: 0 0 1rem;
+            box-shadow: 0 22px 70px rgba(0,0,0,.26);
+        }
+        .advisor-room-head {
+            display: flex;
+            justify-content: space-between;
+            gap: 1rem;
+            align-items: flex-start;
+            margin-bottom: .75rem;
+        }
+        .advisor-title {
+            color: var(--text) !important;
+            font-size: 1.18rem;
+            font-weight: 950;
+        }
+        .advisor-caption {
+            color: var(--muted) !important;
+            font-size: .86rem;
+            line-height: 1.48;
+            max-width: 900px;
+        }
+        .advisor-deadline {
+            border: 1px solid rgba(245,184,75,.45);
+            background: rgba(245,184,75,.12);
+            color: #ffd886 !important;
+            padding: .35rem .55rem;
+            font-size: .76rem;
+            font-weight: 900;
+            white-space: nowrap;
+        }
+        .advisor-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+            gap: .65rem;
+            margin-top: .7rem;
+        }
+        .advisor-card {
+            border: 1px solid rgba(145,164,155,.28);
+            background: rgba(255,255,255,.045);
+            padding: .75rem;
+            min-height: 150px;
+        }
+        .advisor-card-top {
+            display: flex;
+            align-items: center;
+            gap: .55rem;
+            margin-bottom: .45rem;
+        }
+        .advisor-code {
+            width: 34px;
+            height: 34px;
+            display: grid;
+            place-items: center;
+            border: 1px solid rgba(122,167,255,.42);
+            background: rgba(122,167,255,.12);
+            color: var(--text) !important;
+            font-weight: 950;
+        }
+        .advisor-name {
+            font-weight: 900;
+            color: var(--text) !important;
+            line-height: 1.25;
+        }
+        .advisor-role {
+            color: var(--muted) !important;
+            font-size: .76rem;
+            line-height: 1.3;
+        }
+        .advisor-stance {
+            display: inline-block;
+            margin: .15rem 0 .4rem;
+            padding: .18rem .42rem;
+            border: 1px solid rgba(0,184,148,.38);
+            color: var(--green-2) !important;
+            background: rgba(0,184,148,.11);
+            font-size: .76rem;
+            font-weight: 950;
+        }
+        .advisor-copy {
+            color: var(--soft) !important;
+            font-size: .82rem;
+            line-height: 1.45;
+        }
+        .advisor-result {
+            border: 1px solid rgba(0,184,148,.42);
+            background: rgba(0,184,148,.1);
+            padding: .85rem;
+            margin-top: .75rem;
+        }
+        .advisor-result strong {
+            color: var(--green-2) !important;
+        }
         div[data-testid="stTextArea"] textarea {
             border: 1px solid var(--line);
             background: #08110f;
@@ -1419,6 +1857,7 @@ def render_sidebar() -> None:
         )
         st.write(f"{t('model_name')}: `{st.session_state.llm_model}`")
         st.caption(f"{t('db_path')}: `{DB_PATH}`")
+        st.caption(f"Agent prompts: `{AGENT_PROMPTS_PATH}`")
 
         st.divider()
         st.subheader(t("history"))
@@ -1427,6 +1866,13 @@ def render_sidebar() -> None:
             with st.expander(f"#{row['id']} · {status} · {row['created_at'][:16]}", expanded=False):
                 st.caption(row["user_prompt"])
                 st.write(row["final_answer"])
+        for row in load_recent_advisor_runs(3):
+            with st.expander(
+                f"谋士 #{row['id']} · {row['symbol']} · {float(row['confidence']):.0%}",
+                expanded=False,
+            ):
+                st.caption(row["question"])
+                st.write(row["consensus"])
 
         if st.button(t("clear_chat"), width="stretch"):
             st.session_state.messages = []
@@ -1441,6 +1887,8 @@ def render_sidebar() -> None:
             st.session_state.sync_version = 0
             st.session_state.agent_reports = {}
             st.session_state.chart_snapshots = []
+            st.session_state.advisor_runs = []
+            st.session_state.last_advisor_result = None
             st.session_state.agent_execution_log = default_agent_log()
             st.session_state.messages = [{"role": "assistant", "content": initial_message()}]
             st.rerun()
@@ -1702,11 +2150,26 @@ def extract_contract_type(text: str) -> str:
     return ""
 
 
+def normalize_deriv_symbol(symbol: str) -> str:
+    raw = symbol.strip()
+    if not raw:
+        return DEFAULT_SYMBOL
+    upper = raw.upper()
+    if upper == "STPRNG":
+        return "stpRNG"
+    if upper.startswith("FRX") and len(upper) == 9:
+        return "frx" + upper[3:]
+    return upper
+
+
 def extract_symbol(text: str) -> str:
-    symbol_match = re.search(r"\b(?:R_\d+|frx[A-Za-z]{6})\b", text, flags=re.IGNORECASE)
+    symbol_match = re.search(
+        r"\b(?:R_\d+|1HZ\d+V|BOOM\d+|CRASH\d+|JD\d+|RDBULL|RDBEAR|stpRNG|frx[A-Za-z]{6})\b",
+        text,
+        flags=re.IGNORECASE,
+    )
     if symbol_match:
-        raw = symbol_match.group(0)
-        return raw.upper() if raw.upper().startswith("R_") else raw[:3].lower() + raw[3:].upper()
+        return normalize_deriv_symbol(symbol_match.group(0))
     if "欧元" in text or "eurusd" in text.lower():
         return "frxEURUSD"
     return DEFAULT_SYMBOL
@@ -1785,8 +2248,619 @@ def extract_condition(text: str) -> dict[str, Any] | None:
     return None
 
 
+def advisor_name(advisor: dict[str, str], lang: str | None = None) -> str:
+    return advisor["zh_name"] if (lang or current_lang()) == "zh" else advisor["en_name"]
+
+
+def advisor_role(advisor: dict[str, str], lang: str | None = None) -> str:
+    return advisor["zh_role"] if (lang or current_lang()) == "zh" else advisor["en_role"]
+
+
+def clean_feed_text(value: str | None) -> str:
+    if not value:
+        return ""
+    value = re.sub(r"<[^>]+>", " ", value)
+    return re.sub(r"\s+", " ", html.unescape(value)).strip()
+
+
+def parse_rss_items(xml_text: str, limit: int) -> list[dict[str, str]]:
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+    items: list[dict[str, str]] = []
+    for item in root.findall(".//item"):
+        title = clean_feed_text(item.findtext("title"))
+        link = clean_feed_text(item.findtext("link"))
+        source = clean_feed_text(item.findtext("source")) or urllib.parse.urlparse(link).netloc
+        published = clean_feed_text(item.findtext("pubDate"))
+        if title and link:
+            items.append(
+                {
+                    "title": title,
+                    "url": link,
+                    "source": source or "web",
+                    "published": published,
+                }
+            )
+        if len(items) >= limit:
+            break
+    return items
+
+
+def fetch_news_rss(query: str, limit: int, timeout_seconds: float) -> list[dict[str, str]]:
+    try:
+        import httpx
+
+        encoded = urllib.parse.quote_plus(query)
+        url = f"https://news.google.com/rss/search?q={encoded}&hl=en-US&gl=US&ceid=US:en"
+        with httpx.Client(
+            timeout=max(1.0, timeout_seconds),
+            headers={"User-Agent": "DerivSmartTradingGateway/1.0"},
+            follow_redirects=True,
+        ) as client:
+            response = client.get(url)
+            response.raise_for_status()
+            return parse_rss_items(response.text, limit)
+    except Exception:
+        return []
+
+
+def build_advisor_queries(question: str, symbol: str) -> list[str]:
+    symbol_query = symbol
+    if symbol.upper().startswith("R_"):
+        symbol_query = f'Deriv "{symbol}" volatility index'
+    if symbol.lower().startswith("frx"):
+        symbol_query = f"{symbol[3:6]} {symbol[6:]} forex"
+    base = re.sub(r"\s+", " ", question).strip()
+    return [
+        f"{symbol_query} latest market news",
+        f"{symbol_query} short term volatility trading",
+        f"{base} market news",
+    ]
+
+
+def collect_advisor_web_context(
+    question: str,
+    symbol: str,
+    time_budget_seconds: int,
+    use_web: bool,
+    writer: Callable[[str], None] | None = None,
+) -> list[dict[str, str]]:
+    if not use_web:
+        return []
+    started = time.perf_counter()
+    queries = build_advisor_queries(question, symbol)
+    web_deadline = max(1.0, min(float(time_budget_seconds) * 0.35, 3.0))
+    per_query_timeout = max(0.8, min(1.4, web_deadline / max(len(queries), 1) + 0.4))
+    sources: list[dict[str, str]] = []
+    seen: set[str] = set()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(3, len(queries))) as pool:
+        futures = {
+            pool.submit(fetch_news_rss, query, 4, per_query_timeout): query
+            for query in queries
+        }
+        try:
+            for future in concurrent.futures.as_completed(
+                futures,
+                timeout=web_deadline,
+            ):
+                for item in future.result():
+                    key = item.get("url") or item.get("title")
+                    if key and key not in seen:
+                        item["query"] = futures[future]
+                        sources.append(item)
+                        seen.add(key)
+                if len(sources) >= 8 or (time.perf_counter() - started) > web_deadline:
+                    break
+        except concurrent.futures.TimeoutError:
+            pass
+    if writer:
+        writer(f"Web research -> {len(sources)} sources within {time.perf_counter() - started:.1f}s")
+    return sources[:8]
+
+
+def headline_sentiment(sources: list[dict[str, str]]) -> dict[str, Any]:
+    positive_words = ["rise", "rally", "bull", "gain", "up", "strong", "surge", "突破", "上涨", "走强", "利好"]
+    negative_words = ["fall", "drop", "bear", "down", "weak", "risk", "sell", "跌", "下跌", "走弱", "风险"]
+    positive = 0
+    negative = 0
+    for source in sources:
+        title = source.get("title", "").lower()
+        positive += sum(1 for word in positive_words if word in title)
+        negative += sum(1 for word in negative_words if word in title)
+    if positive > negative:
+        label = "bullish"
+    elif negative > positive:
+        label = "bearish"
+    else:
+        label = "mixed"
+    return {"label": label, "positive": positive, "negative": negative}
+
+
+def advisor_market_snapshot(
+    symbol: str,
+    started_at: float,
+    time_budget_seconds: int,
+    writer: Callable[[str], None] | None = None,
+    *,
+    persist_state: bool = True,
+    trace_api: bool = True,
+) -> dict[str, Any]:
+    market: dict[str, Any] = {"symbol": symbol, "tick": None, "candles": None, "summary": "no market data"}
+    deadline_at = started_at + max(4, time_budget_seconds)
+    tick_result = call_deriv_tool_before_deadline(
+        "get_market_ticks",
+        lambda: get_market_ticks(symbol, False),
+        {"symbol": symbol, "subscribe": False, "advisor": True},
+        deadline_at,
+        writer,
+        trace_api=trace_api,
+    )
+    if tick_result.get("ok"):
+        market["tick_result"] = tick_result
+        market["tick"] = ((tick_result.get("data") or {}).get("tick") or {})
+        if persist_state and in_streamlit_runtime():
+            st.session_state.last_tick = tick_result
+
+    remaining = deadline_at - time.perf_counter()
+    if remaining > 2.8:
+        candle_result = call_deriv_tool_before_deadline(
+            "get_historical_candles",
+            lambda: get_historical_candles(symbol, 60, 60),
+            {"symbol": symbol, "granularity": 60, "count": 60, "advisor": True},
+            deadline_at,
+            writer,
+            trace_api=trace_api,
+        )
+        if candle_result.get("ok"):
+            market["candles"] = candle_result
+            if persist_state and in_streamlit_runtime():
+                st.session_state.last_candles = candle_result
+
+    frame = candles_frame_from_result(market.get("candles"))
+    latest_quote = (market.get("tick") or {}).get("quote")
+    if not frame.empty:
+        first_close = float(frame.iloc[0]["close"])
+        latest_close = float(frame.iloc[-1]["close"])
+        ma5 = float(frame.iloc[-1]["ma5"]) if not math.isnan(float(frame.iloc[-1]["ma5"])) else latest_close
+        ma20 = float(frame.iloc[-1]["ma20"]) if not math.isnan(float(frame.iloc[-1]["ma20"])) else latest_close
+        change_pct = (latest_close - first_close) / first_close * 100 if first_close else 0.0
+        if latest_close > first_close and ma5 >= ma20:
+            trend = "up"
+        elif latest_close < first_close and ma5 <= ma20:
+            trend = "down"
+        else:
+            trend = "mixed"
+        market.update(
+            {
+                "trend": trend,
+                "latest_close": latest_close,
+                "change_pct": change_pct,
+                "ma5": ma5,
+                "ma20": ma20,
+                "summary": f"{symbol} 60m window trend={trend}, change={change_pct:+.2f}%, ma5={ma5:.5g}, ma20={ma20:.5g}",
+            }
+        )
+    elif latest_quote is not None:
+        market.update({"trend": "tick_only", "summary": f"{symbol} latest tick={latest_quote}"})
+    return market
+
+
+def persist_advisor_market_state(market: dict[str, Any]) -> None:
+    if not in_streamlit_runtime():
+        return
+    tick_result = market.get("tick_result")
+    if isinstance(tick_result, dict) and tick_result.get("ok"):
+        st.session_state.last_tick = tick_result
+    candle_result = market.get("candles")
+    if isinstance(candle_result, dict) and candle_result.get("ok"):
+        st.session_state.last_candles = candle_result
+
+
+def stance_from_market_and_news(market: dict[str, Any], news_signal: dict[str, Any]) -> str:
+    trend = market.get("trend")
+    if trend == "up" and news_signal.get("label") != "bearish":
+        return "CALL"
+    if trend == "down" and news_signal.get("label") != "bullish":
+        return "PUT"
+    return "WAIT"
+
+
+def local_advisor_opinion(
+    advisor: dict[str, str],
+    question: str,
+    market: dict[str, Any],
+    sources: list[dict[str, str]],
+    news_signal: dict[str, Any],
+    lang: str | None = None,
+) -> dict[str, Any]:
+    advisor_id = advisor["id"]
+    prompt = agent_prompt(f"advisor.{advisor_id}")
+    base_stance = stance_from_market_and_news(market, news_signal)
+    source_count = len(sources)
+    trend = market.get("trend", "unknown")
+    latest = market.get("latest_close") or (market.get("tick") or {}).get("quote")
+    if advisor_id == "risk":
+        stance = "WAIT" if base_stance != "WAIT" and source_count == 0 else base_stance
+        rationale = "没有网页确认时降低仓位和冲动；若要做，只做 demo 小额并保留撤退条件。"
+        invalidation = "最新 Tick 反向突破或连续三根反向波动。"
+    elif advisor_id == "contrarian":
+        stance = "WAIT" if base_stance in {"CALL", "PUT"} else "CALL" if trend == "down" else "PUT"
+        rationale = "反方视角：短线共识可能已经被价格吸收，必须等下一根确认。"
+        invalidation = "若价格继续沿原方向扩大并伴随新闻确认，反方观点失效。"
+    elif advisor_id == "quant":
+        stance = base_stance
+        rationale = f"量化视角看 {market.get('summary')}；趋势不干净就不追。"
+        invalidation = "MA5/MA20 关系反转，或最新价跌回本轮窗口中位。"
+    elif advisor_id == "macro":
+        stance = base_stance if news_signal.get("label") != "mixed" else "WAIT"
+        rationale = f"网页情绪={news_signal.get('label')}，来源={source_count} 条；没有外部催化就不加速。"
+        invalidation = "出现新的高影响消息或相关新闻标题方向反转。"
+    else:
+        stance = base_stance
+        rationale = f"盘口节奏倾向 {base_stance}，最新价/收盘={latest}；等待短周期确认后再交给执行链。"
+        invalidation = "报价停滞、跳动变慢或连续反向 Tick。"
+    return {
+        "advisor_id": advisor_id,
+        "name": advisor_name(advisor, lang),
+        "role": advisor_role(advisor, lang),
+        "prompt": prompt,
+        "stance": stance,
+        "rationale": rationale,
+        "invalidation": invalidation,
+        "question": question,
+    }
+
+
+def consensus_from_opinions(opinions: list[dict[str, Any]], market: dict[str, Any], sources: list[dict[str, str]]) -> dict[str, Any]:
+    votes = [str(item.get("stance") or "WAIT") for item in opinions]
+    counts = {stance: votes.count(stance) for stance in {"CALL", "PUT", "WAIT"}}
+    winner = max(counts, key=counts.get)
+    support = counts[winner] / max(len(votes), 1)
+    data_bonus = 0.12 if market.get("candles") else 0.04
+    web_bonus = min(len(sources), 6) * 0.025
+    confidence = min(0.92, max(0.25, support * 0.62 + data_bonus + web_bonus))
+    if winner == "CALL":
+        summary = "谋士团偏向看涨/做多，但只建议进入原交易链复核，不直接下单。"
+    elif winner == "PUT":
+        summary = "谋士团偏向看跌/做空，但只建议进入原交易链复核，不直接下单。"
+    else:
+        summary = "谋士团建议等待，当前信息不足以支持短线立即出手。"
+    return {
+        "stance": winner,
+        "summary": summary,
+        "confidence": round(confidence, 3),
+        "vote_counts": counts,
+    }
+
+
+def advisor_llm_synthesis(
+    question: str,
+    symbol: str,
+    market: dict[str, Any],
+    sources: list[dict[str, str]],
+    opinions: list[dict[str, Any]],
+    consensus: dict[str, Any],
+    remaining_seconds: float,
+) -> str | None:
+    if not in_streamlit_runtime():
+        return None
+    provider: Provider = st.session_state.llm_provider
+    if provider == "本地规则" or not st.session_state.llm_api_key or remaining_seconds < 2.5:
+        return None
+    source_lines = "\n".join(
+        f"- {item.get('title')} ({item.get('source')}, {item.get('published')})"
+        for item in sources[:6]
+    ) or "- no web source"
+    opinion_lines = "\n".join(
+        f"- {item['name']}: {item['stance']} | {item['rationale']} | invalidation: {item['invalidation']}"
+        for item in opinions
+    )
+    prompt = f"""
+你是首席谋士。你的专属 prompt：
+{agent_prompt("advisor.chief")}
+
+请基于下列材料，在 120 字以内给老板一个短线交易决策建议。
+要求：必须包含 方向(CALL/PUT/WAIT)、置信度、执行前提、失效条件。不要建议绕过人工确认。
+
+问题: {question}
+Symbol: {symbol}
+行情: {json.dumps(market, ensure_ascii=False, default=str)[:2500]}
+网页来源:
+{source_lines}
+谋士观点:
+{opinion_lines}
+本地一致结论: {json.dumps(consensus, ensure_ascii=False)}
+""".strip()
+    try:
+        if provider in {"OpenAI", "DeepSeek", "OpenAI-Compatible"}:
+            from openai import OpenAI
+
+            base_url = OPENAI_COMPATIBLE_BASE_URLS.get(provider)
+            if provider == "OpenAI-Compatible":
+                base_url = st.session_state.custom_base_url.strip() or None
+                if not base_url:
+                    return None
+            kwargs: dict[str, Any] = {
+                "api_key": st.session_state.llm_api_key,
+                "timeout": max(2.0, min(8.0, remaining_seconds)),
+            }
+            if base_url:
+                kwargs["base_url"] = base_url
+            client = OpenAI(**kwargs)
+            response = client.chat.completions.create(
+                model=st.session_state.llm_model,
+                messages=[
+                    {"role": "system", "content": "你输出简洁、可审计、适合短线交易前复核的中文建议。"},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.15,
+                max_tokens=220,
+            )
+            return (response.choices[0].message.content or "").strip() or None
+        if provider == "Anthropic":
+            from anthropic import Anthropic
+
+            client = Anthropic(api_key=st.session_state.llm_api_key, timeout=max(2.0, min(8.0, remaining_seconds)))
+            response = client.messages.create(
+                model=st.session_state.llm_model,
+                max_tokens=220,
+                temperature=0.15,
+                system="你输出简洁、可审计、适合短线交易前复核的中文建议。",
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return "\n".join(
+                block.text for block in response.content if getattr(block, "type", None) == "text"
+            ).strip() or None
+    except Exception:
+        return None
+    return None
+
+
+def advisor_langgraph_available() -> bool:
+    try:
+        import langgraph  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+def make_langgraph_advisor_node(advisor: dict[str, str]) -> Callable[[AdvisorGraphState], dict[str, Any]]:
+    def node(state: AdvisorGraphState) -> dict[str, Any]:
+        opinion = local_advisor_opinion(
+            advisor,
+            str(state.get("question") or ""),
+            dict(state.get("market") or {}),
+            list(state.get("sources") or []),
+            dict(state.get("news_signal") or {}),
+            str(state.get("language") or "zh"),
+        )
+        return {
+            "opinions": [opinion],
+            "logs": [f"{opinion['name']} -> {opinion['stance']}: {opinion['rationale']}"],
+        }
+
+    return node
+
+
+def build_advisor_langgraph() -> Any:
+    from langgraph.graph import END, START, StateGraph
+
+    graph = StateGraph(AdvisorGraphState)
+
+    def web_research_node(state: AdvisorGraphState) -> dict[str, Any]:
+        started = time.perf_counter()
+        sources = collect_advisor_web_context(
+            str(state.get("question") or ""),
+            str(state.get("symbol") or DEFAULT_SYMBOL),
+            int(state.get("budget") or 10),
+            bool(state.get("use_web")),
+            None,
+        )
+        return {
+            "sources": sources,
+            "graph_runtime": "langgraph",
+            "logs": [f"Web research -> {len(sources)} sources within {time.perf_counter() - started:.1f}s"],
+        }
+
+    def market_snapshot_node(state: AdvisorGraphState) -> dict[str, Any]:
+        market = advisor_market_snapshot(
+            str(state.get("symbol") or DEFAULT_SYMBOL),
+            float(state.get("started_at") or time.perf_counter()),
+            int(state.get("budget") or 10),
+            None,
+            persist_state=False,
+            trace_api=False,
+        )
+        return {"market": market, "logs": [f"Market snapshot -> {market.get('summary', 'no market data')}"]}
+
+    def news_signal_node(state: AdvisorGraphState) -> dict[str, Any]:
+        return {"news_signal": headline_sentiment(list(state.get("sources") or []))}
+
+    def synthesize_node(state: AdvisorGraphState) -> dict[str, Any]:
+        opinions = list(state.get("opinions") or [])
+        sources = list(state.get("sources") or [])
+        market = dict(state.get("market") or {})
+        local_consensus = consensus_from_opinions(opinions, market, sources)
+        remaining = int(state.get("budget") or 10) - (
+            time.perf_counter() - float(state.get("started_at") or time.perf_counter())
+        )
+        llm_summary = advisor_llm_synthesis(
+            str(state.get("question") or ""),
+            str(state.get("symbol") or DEFAULT_SYMBOL),
+            market,
+            sources,
+            opinions,
+            local_consensus,
+            remaining,
+        )
+        final_summary = llm_summary or (
+            f"{local_consensus['summary']} 方向={local_consensus['stance']}，"
+            f"置信度={local_consensus['confidence']:.0%}；执行前先让行情、风控、合规和执行交易员复核。"
+        )
+        return {
+            "local_consensus": local_consensus,
+            "consensus": final_summary,
+            "stance": local_consensus["stance"],
+            "confidence": local_consensus["confidence"],
+            "vote_counts": local_consensus["vote_counts"],
+            "logs": [f"Chief Advisor -> {local_consensus['stance']} confidence={local_consensus['confidence']:.0%}"],
+        }
+
+    graph.add_node("web_research", web_research_node)
+    graph.add_node("market_snapshot", market_snapshot_node)
+    graph.add_node("news_signal", news_signal_node)
+    for advisor in advisor_specs():
+        graph.add_node(advisor_node_name(advisor["id"]), make_langgraph_advisor_node(advisor))
+    graph.add_node("synthesize", synthesize_node)
+
+    graph.add_edge(START, "web_research")
+    graph.add_edge("web_research", "market_snapshot")
+    graph.add_edge("market_snapshot", "news_signal")
+    for advisor in advisor_specs():
+        node_name = advisor_node_name(advisor["id"])
+        graph.add_edge("news_signal", node_name)
+        graph.add_edge(node_name, "synthesize")
+    graph.add_edge("synthesize", END)
+    return graph.compile()
+
+
+def run_advisor_langgraph(
+    question: str,
+    symbol: str,
+    budget: int,
+    use_web: bool,
+    writer: Callable[[str], None] | None = None,
+) -> dict[str, Any] | None:
+    try:
+        app = build_advisor_langgraph()
+        return dict(
+            app.invoke(
+                {
+                    "question": question,
+                    "symbol": symbol,
+                    "budget": budget,
+                    "use_web": use_web,
+                    "language": current_lang(),
+                    "started_at": time.perf_counter(),
+                    "opinions": [],
+                    "logs": [],
+                }
+            )
+        )
+    except Exception as exc:
+        if writer:
+            writer(f"LangGraph unavailable, fallback to local council: {exc}")
+        push_runtime_event("langgraph", "Advisor Graph", "Fallback", str(exc))
+        return None
+
+
+def run_advisor_council(
+    question: str,
+    symbol: str,
+    time_budget_seconds: int,
+    use_web: bool,
+    writer: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    budget = max(4, min(int(time_budget_seconds), 25))
+    push_runtime_event("advisor", "Boss", "Advisor Council", f"question received: {question[:80]}")
+    if writer:
+        writer(f"Advisor Council START · budget={budget}s · symbol={symbol}")
+
+    graph_state = run_advisor_langgraph(question, symbol, budget, use_web, writer)
+    if graph_state:
+        sources = list(graph_state.get("sources") or [])
+        market = dict(graph_state.get("market") or {})
+        news_signal = dict(graph_state.get("news_signal") or {})
+        opinions = list(graph_state.get("opinions") or [])
+        final_summary = str(graph_state.get("consensus") or "")
+        stance = str(graph_state.get("stance") or "WAIT")
+        confidence = float(graph_state.get("confidence") or 0)
+        vote_counts = dict(graph_state.get("vote_counts") or {})
+        runtime = "langgraph"
+        persist_advisor_market_state(market)
+        for line in graph_state.get("logs") or []:
+            if writer:
+                writer(str(line))
+            push_runtime_event("langgraph", "Advisor Graph", "Log", str(line))
+    else:
+        sources = collect_advisor_web_context(question, symbol, budget, use_web, writer)
+        market = advisor_market_snapshot(symbol, started, budget, writer)
+        news_signal = headline_sentiment(sources)
+        opinions = [
+            local_advisor_opinion(advisor, question, market, sources, news_signal)
+            for advisor in advisor_specs()
+        ]
+        for opinion in opinions:
+            push_runtime_event("advisor", opinion["name"], "Chief Advisor", f"{opinion['stance']}: {opinion['rationale']}")
+            if writer:
+                writer(f"{opinion['name']} -> {opinion['stance']}: {opinion['rationale']}")
+
+        consensus = consensus_from_opinions(opinions, market, sources)
+        remaining = budget - (time.perf_counter() - started)
+        llm_summary = advisor_llm_synthesis(
+            question,
+            symbol,
+            market,
+            sources,
+            opinions,
+            consensus,
+            remaining,
+        )
+        final_summary = llm_summary or (
+            f"{consensus['summary']} 方向={consensus['stance']}，"
+            f"置信度={consensus['confidence']:.0%}；执行前先让行情、风控、合规和执行交易员复核。"
+        )
+        stance = consensus["stance"]
+        confidence = consensus["confidence"]
+        vote_counts = consensus["vote_counts"]
+        runtime = "local_fallback"
+
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    result = {
+        "ok": True,
+        "question": question,
+        "symbol": symbol,
+        "runtime": runtime,
+        "time_budget_seconds": budget,
+        "elapsed_ms": round(elapsed_ms, 1),
+        "used_web": bool(use_web),
+        "source_count": len(sources),
+        "sources": sources,
+        "market": market,
+        "news_signal": news_signal,
+        "opinions": opinions,
+        "consensus": final_summary,
+        "stance": stance,
+        "confidence": confidence,
+        "vote_counts": vote_counts,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if in_streamlit_runtime():
+        st.session_state.last_advisor_result = result
+        st.session_state.advisor_runs = [result] + st.session_state.get("advisor_runs", [])[:5]
+    save_advisor_run(result)
+    push_runtime_event(
+        "advisor",
+        "Chief Advisor",
+        "Boss",
+        f"{stance} confidence={confidence:.0%}",
+        {"elapsed_ms": elapsed_ms, "sources": len(sources)},
+    )
+    return result
+
+
 def run_async(coro: Any) -> Any:
-    return asyncio.run(coro)
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(lambda: asyncio.run(coro)).result()
 
 
 def parse_tool_response(raw: str) -> dict[str, Any]:
@@ -1819,6 +2893,8 @@ def push_runtime_event(
     message: str,
     payload: dict[str, Any] | None = None,
 ) -> None:
+    if not in_streamlit_runtime():
+        return
     event = {
         "time": datetime.now(LOCAL_TZ).strftime("%H:%M:%S.%f")[:-3],
         "kind": kind,
@@ -1848,6 +2924,8 @@ def record_api_trace(
     result: dict[str, Any] | None = None,
     elapsed_ms: float | None = None,
 ) -> None:
+    if not in_streamlit_runtime():
+        return
     safe_params = {
         key: ("***" if "token" in key.lower() else value)
         for key, value in params.items()
@@ -1905,6 +2983,44 @@ def call_deriv_tool(
         result = {"ok": False, "error": {"message": str(exc)}}
     elapsed = (time.perf_counter() - started) * 1000
     record_api_trace(tool_name, "DONE" if result.get("ok") else "FAILED", params, result, elapsed)
+    if writer:
+        writer(
+            f"API {tool_name} -> {'OK' if result.get('ok') else 'FAILED'} "
+            f"({elapsed:.0f}ms) {summarize_api_result(result)}"
+        )
+    return result
+
+
+def call_deriv_tool_before_deadline(
+    tool_name: str,
+    coro_factory: Callable[[], Any],
+    params: dict[str, Any],
+    deadline_at: float,
+    writer: Callable[[str], None] | None = None,
+    *,
+    trace_api: bool = True,
+) -> dict[str, Any]:
+    remaining = deadline_at - time.perf_counter()
+    if remaining < 0.8:
+        result = {"ok": False, "error": {"message": "advisor deadline reached before API call"}}
+        if trace_api:
+            record_api_trace(tool_name, "SKIPPED", params, result, 0)
+        if writer:
+            writer(f"API {tool_name} -> SKIPPED deadline reached")
+        return result
+
+    if trace_api:
+        record_api_trace(tool_name, "START", params)
+    started = time.perf_counter()
+    try:
+        result = parse_tool_response(run_async(asyncio.wait_for(coro_factory(), timeout=remaining)))
+    except TimeoutError:
+        result = {"ok": False, "error": {"message": "advisor deadline reached during API call"}}
+    except Exception as exc:
+        result = {"ok": False, "error": {"message": str(exc)}}
+    elapsed = (time.perf_counter() - started) * 1000
+    if trace_api:
+        record_api_trace(tool_name, "DONE" if result.get("ok") else "FAILED", params, result, elapsed)
     if writer:
         writer(
             f"API {tool_name} -> {'OK' if result.get('ok') else 'FAILED'} "
@@ -2605,7 +3721,7 @@ def manager_with_openai_tool_calling(
         client = OpenAI(**kwargs)
 
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": MANAGER_SYSTEM_PROMPT},
+            {"role": "system", "content": manager_system_prompt()},
             {"role": "user", "content": user_text},
         ]
         market_report = None
@@ -2692,7 +3808,7 @@ def manager_with_anthropic_tool_calling(
                 model=st.session_state.llm_model,
                 max_tokens=1400,
                 temperature=0.1,
-                system=MANAGER_SYSTEM_PROMPT,
+                system=manager_system_prompt(),
                 tools=anthropic_tools,
                 messages=messages,
             )
@@ -4216,6 +5332,176 @@ def render_direct_dispatch() -> None:
     st.session_state.direct_prompt_nonce += 1
 
 
+def render_advisor_result(result: dict[str, Any]) -> None:
+    st.markdown(
+        f"""
+        <div class="advisor-result">
+          <strong>{html.escape(t("advisor_consensus"))} · {html.escape(str(result.get("stance", "WAIT")))}</strong>
+          <div class="advisor-copy">{html.escape(str(result.get("consensus") or ""))}</div>
+          <div class="advisor-copy">{html.escape(t("advisor_disclaimer"))}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    cols = st.columns(4)
+    cols[0].metric(t("advisor_confidence"), f"{float(result.get('confidence') or 0):.0%}")
+    cols[1].metric(t("advisor_elapsed"), f"{float(result.get('elapsed_ms') or 0) / 1000:.1f}s")
+    cols[2].metric(t("advisor_sources"), int(result.get("source_count") or 0))
+    cols[3].metric("Runtime", str(result.get("runtime") or "local"))
+    st.caption(f"Votes: `{json.dumps(result.get('vote_counts') or {}, ensure_ascii=False)}`")
+
+    opinions = result.get("opinions") or []
+    cards = []
+    for opinion in opinions:
+        specs = advisor_specs()
+        spec = next((item for item in specs if item["id"] == opinion.get("advisor_id")), specs[0])
+        cards.append(
+            f"""
+<div class="advisor-card">
+  <div class="advisor-card-top">
+    <div class="advisor-code" style="border-color:{html.escape(spec['color'])};">{html.escape(spec['code'])}</div>
+    <div>
+      <div class="advisor-name">{html.escape(str(opinion.get("name") or ""))}</div>
+      <div class="advisor-role">{html.escape(str(opinion.get("role") or ""))}</div>
+    </div>
+  </div>
+  <span class="advisor-stance">{html.escape(str(opinion.get("stance") or "WAIT"))}</span>
+  <div class="advisor-copy">{html.escape(str(opinion.get("rationale") or ""))}</div>
+  <div class="advisor-copy"><strong>Invalidation:</strong> {html.escape(str(opinion.get("invalidation") or ""))}</div>
+</div>
+            """.strip()
+        )
+    if cards:
+        st.markdown(f'<div class="advisor-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+    with st.expander(t("advisor_sources"), expanded=bool(result.get("sources"))):
+        sources = result.get("sources") or []
+        if sources:
+            st.dataframe(
+                [
+                    {
+                        "title": item.get("title"),
+                        "source": item.get("source"),
+                        "published": item.get("published"),
+                        "url": item.get("url"),
+                    }
+                    for item in sources
+                ],
+                width="stretch",
+                height=240,
+                column_config={"url": st.column_config.LinkColumn("url")},
+            )
+        else:
+            st.caption(t("advisor_no_sources"))
+
+    with st.expander(t("advisor_transcript"), expanded=False):
+        st.json(
+            {
+                "question": result.get("question"),
+                "symbol": result.get("symbol"),
+                "market": result.get("market"),
+                "news_signal": result.get("news_signal"),
+                "opinions": result.get("opinions"),
+                "vote_counts": result.get("vote_counts"),
+            }
+        )
+    st.download_button(
+        t("advisor_download"),
+        data=json.dumps(result, ensure_ascii=False, indent=2, default=str).encode("utf-8"),
+        file_name=f"advisor-council-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json",
+        mime="application/json",
+        width="stretch",
+    )
+
+
+def render_advisor_council() -> None:
+    st.markdown(
+        f"""
+        <div class="advisor-room">
+          <div class="advisor-room-head">
+            <div>
+              <div class="advisor-title">{html.escape(t("advisor_council"))}</div>
+              <div class="advisor-caption">{html.escape(t("advisor_caption"))}</div>
+            </div>
+            <div class="advisor-deadline">FAST · WEB · COUNCIL</div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    input_key = f"advisor_question_{st.session_state.advisor_prompt_nonce}"
+    with st.form("advisor_council_form", border=True):
+        question = st.text_area(
+            t("advisor_question"),
+            key=input_key,
+            height=96,
+            placeholder=t("advisor_placeholder"),
+        )
+        controls = st.columns([0.24, 0.24, 0.22, 0.16, 0.14])
+        current_symbol = normalize_deriv_symbol(str(st.session_state.advisor_symbol))
+        symbol_options = COMMON_DERIV_SYMBOLS + ["自定义"]
+        current_symbol_index = (
+            symbol_options.index(current_symbol)
+            if current_symbol in symbol_options
+            else len(symbol_options) - 1
+        )
+        selected_symbol = controls[0].selectbox(
+            t("advisor_symbol"),
+            symbol_options,
+            index=current_symbol_index,
+        )
+        custom_symbol = controls[1].text_input(
+            "Custom Symbol",
+            value="" if selected_symbol != "自定义" else current_symbol,
+            placeholder="例如 R_75 / BOOM1000 / frxEURUSD",
+            disabled=selected_symbol != "自定义",
+        )
+        budget = controls[2].slider(
+            t("advisor_time_budget"),
+            min_value=4,
+            max_value=25,
+            value=int(st.session_state.advisor_time_budget),
+            step=1,
+        )
+        use_web = controls[3].toggle(
+            t("advisor_web_toggle"),
+            value=bool(st.session_state.advisor_use_web),
+        )
+        submitted = controls[4].form_submit_button(t("advisor_start"), type="primary", width="stretch")
+
+    if submitted:
+        cleaned_question = question.strip()
+        if not cleaned_question:
+            st.warning(t("advisor_empty"))
+            return
+        chosen_symbol = custom_symbol if selected_symbol == "自定义" else selected_symbol
+        st.session_state.advisor_symbol = normalize_deriv_symbol(
+            chosen_symbol.strip() or extract_symbol(cleaned_question) or DEFAULT_SYMBOL
+        )
+        st.session_state.advisor_time_budget = int(budget)
+        st.session_state.advisor_use_web = bool(use_web)
+        with st.status(t("advisor_processing"), expanded=True) as status:
+
+            def advisor_writer(line: str) -> None:
+                st.write(line)
+
+            result = run_advisor_council(
+                cleaned_question,
+                st.session_state.advisor_symbol,
+                int(budget),
+                bool(use_web),
+                advisor_writer,
+            )
+            status.update(label=t("advisor_done"), state="complete", expanded=True)
+        st.session_state.advisor_prompt_nonce += 1
+        render_advisor_result(result)
+        return
+
+    if st.session_state.get("last_advisor_result"):
+        st.markdown(f"#### {t('advisor_result')}")
+        render_advisor_result(st.session_state.last_advisor_result)
+
+
 def render_sync_bus() -> None:
     st.markdown(f"#### {t('sync_bus')}")
     st.caption(t("sync_bus_hint"))
@@ -4338,6 +5624,7 @@ def main() -> None:
     configure_page()
     render_sidebar()
     render_header()
+    render_advisor_council()
 
     left, right = st.columns([0.36, 0.64], gap="large")
     with left:
