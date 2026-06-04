@@ -6,6 +6,7 @@ This project implements the Deriv Smart Trading Gateway as both an MCP server an
 
 - `server.py` - FastMCP server with Deriv WebSocket tools.
 - `web_app.py` - Streamlit web UI for Chinese natural-language trading commands.
+- `agent_prompts.json` - Editable prompt registry for each manager, worker, and advisor agent.
 - `requirements.txt` - Python runtime dependencies.
 - `mcp_config.json` - MCP client configuration for Claude Desktop or Cursor.
 
@@ -95,7 +96,36 @@ cd /Users/wangkeyu/Documents/项目
 
 ## Agent Capabilities And Safety
 
-The web app uses a hierarchical team model:
+The web app uses a hierarchical team model. The trading execution path is still guarded by local safety checks and human confirmation, while the advisor council now runs through a LangGraph workflow when `langgraph` is installed:
+
+```text
+web_research -> market_snapshot -> news_signal -> advisor_* nodes -> synthesize
+```
+
+Advisor nodes run as separate LangGraph nodes. Their opinions are merged into graph state, then the chief advisor produces a final CALL / PUT / WAIT recommendation. If LangGraph is unavailable, the app falls back to the local council runner.
+
+Each agent has an editable prompt in:
+
+```text
+/Users/wangkeyu/Documents/项目/agent_prompts.json
+```
+
+To extend the advisor council, add a new `advisor.<id>` prompt entry. The web app will create a matching LangGraph advisor node automatically. The reserved `advisor.chief` prompt controls the final synthesizer.
+
+Example:
+
+```json
+{
+  "advisor.breakout": {
+    "name": "突破谋士",
+    "prompt": "你只寻找突破和假突破。必须说明突破确认价、止损失效点和是否等待。"
+  }
+}
+```
+
+To add a new execution-team agent such as a new risk or report worker, add its prompt entry first, then register its tool/node in `web_app.py`.
+
+Current execution-team agents:
 
 - Trading Manager: decomposes user goals and dispatches work.
 - Market Analyst, Strategy Researcher, Chart Engineer, Report Agent: read and analyze market or run data.
