@@ -1,82 +1,86 @@
 # Deriv Smart Trading Gateway
 
-This project implements the Deriv Smart Trading Gateway as both an MCP server and a Streamlit web interface.
+An AI-native trading gateway for Deriv that combines a FastMCP tool server, a Streamlit command center, and a LangGraph-powered advisor council for fast market decisions.
 
-## Files
+![Deriv Smart Trading Gateway advisor council](docs/assets/advisor-council-screenshot.png)
 
-- `server.py` - FastMCP server with Deriv WebSocket tools.
-- `web_app.py` - Streamlit web UI for Chinese natural-language trading commands.
-- `agent_prompts.json` - Editable prompt registry for each manager, worker, and advisor agent.
-- `requirements.txt` - Python runtime dependencies.
-- `mcp_config.json` - MCP client configuration for Claude Desktop or Cursor.
+## What It Is
 
-## Install
+Deriv Smart Trading Gateway turns natural-language trading intent into a coordinated multi-agent workflow. It can read live Deriv market data, build candle snapshots, simulate trades, review risk, and prepare execution through a human-confirmed safety gate.
+
+The newest layer is the **Boss Advisor Room**: a LangGraph council where multiple advisor agents read market context, optional web research, and short-horizon signals before producing one clear `CALL`, `PUT`, or `WAIT` recommendation.
+
+Streamlit is the operator UI. LangGraph is the agent orchestration engine. FastMCP exposes the Deriv tool layer for MCP-compatible clients.
+
+## Highlights
+
+- **LangGraph advisor council** with independent advisor nodes, merged graph state, and a chief synthesizer.
+- **Extensible agent prompts** through `agent_prompts.json`, including manager, execution workers, and advisor personas.
+- **Deriv WebSocket tools** for ticks, historical candles, account checks, simulated trades, open-contract status, and close-contract flows.
+- **Natural-language command center** for Chinese and English trading prompts.
+- **Human-in-the-loop execution gates** so write actions require explicit confirmation before Deriv order submission.
+- **Live-account protection** that blocks live trading unless both UI and backend explicitly allow it.
+- **Multi-symbol charting** for synthetic indices, jump indices, boom/crash, and forex symbols such as `R_100`, `R_75`, `BOOM1000`, and `frxEURUSD`.
+- **Local audit trail** for team runs, advisor decisions, role dialogue, API traces, and trade receipts.
+- **Smoke and pytest coverage** for agent configuration, symbol parsing, LangGraph compilation, advisor runtime, and safety gates.
+
+## Architecture
+
+```text
+User / Boss
+  |
+  v
+Streamlit Command Center
+  |
+  +--> LangGraph Advisor Council
+  |      web_research -> market_snapshot -> news_signal -> advisor_* -> synthesize
+  |
+  +--> Hierarchical Execution Team
+  |      manager -> market / strategy / chart / risk / compliance / execution / report
+  |
+  v
+FastMCP Deriv Tool Server
+  |
+  v
+Deriv WebSocket API
+```
+
+## Repository Layout
+
+```text
+.
+├── agent_prompts.json              # Editable prompt registry for manager, workers, and advisors
+├── docs/assets/                    # README and project media
+├── mcp_config.json                 # MCP client configuration
+├── requirements.txt                # Python dependencies
+├── server.py                       # FastMCP server with Deriv WebSocket tools
+├── smoke_test.py                   # End-to-end runtime smoke checks
+├── tests/                          # Pytest coverage for parsing, safety, prompts, and LangGraph
+└── web_app.py                      # Streamlit operator UI and multi-agent runtime
+```
+
+## Quick Start
 
 ```bash
 cd /Users/wangkeyu/Documents/项目
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-```
-
-## Run The Streamlit Web App
-
-```bash
-cd /Users/wangkeyu/Documents/项目
 .venv/bin/streamlit run web_app.py --server.port 8501
 ```
 
-Open:
+Open the app:
 
 ```text
 http://localhost:8501
 ```
 
-## Multi-Symbol Chart Examples
-
-The trading chart workbench is not limited to `R_100`. It accepts any Deriv symbol supported by the public WebSocket API, for example:
-
-```text
-画 R_75 最近 120 根 1分钟K线
-画 frxEURUSD 最近 60 根 5分钟K线
-Draw the latest 120 one-minute candles for R_100
-Draw frxEURUSD 60 candles at 5m
-```
-
-The Chart Engineer agent also creates separate chart snapshots, so multiple symbols can be compared and reviewed through the snapshot tabs.
-
-The web app stores Deriv and model-provider API keys only in Streamlit session state. They are not hardcoded in source files.
-
-## Open As A Local Desktop Launcher
-
-On macOS, double-click:
+On macOS you can also double-click:
 
 ```text
 /Users/wangkeyu/Documents/项目/Deriv Gateway.command
 ```
 
-The launcher creates `.venv` if needed, installs `requirements.txt`, and opens the Streamlit app on:
-
-```text
-http://localhost:8501
-```
-
-## Local Data
-
-The web app now stores team runs, role dialogue, execution logs, and trade receipts in a local SQLite database:
-
-```text
-/Users/wangkeyu/Documents/项目/local_data/gateway.sqlite3
-```
-
-The API keys are still session-only and are not written to this database.
-
-The model selector supports:
-
-- Local rule engine, no model API key required.
-- OpenAI.
-- DeepSeek, using the OpenAI-compatible base URL `https://api.deepseek.com`.
-- Anthropic.
-- OpenAI-Compatible custom providers with a configurable `Base URL`.
+The launcher creates `.venv` if needed, installs dependencies, and opens the Streamlit app.
 
 ## Run The MCP Server
 
@@ -85,7 +89,7 @@ cd /Users/wangkeyu/Documents/项目
 .venv/bin/python server.py
 ```
 
-## MCP Tools
+Available MCP tools:
 
 - `get_market_ticks`
 - `get_historical_candles`
@@ -94,54 +98,133 @@ cd /Users/wangkeyu/Documents/项目
 - `get_open_contract_status`
 - `close_open_contract`
 
-## Agent Capabilities And Safety
+## Agent System
 
-The web app uses a hierarchical team model. The trading execution path is still guarded by local safety checks and human confirmation, while the advisor council now runs through a LangGraph workflow when `langgraph` is installed:
+The app uses two complementary agent systems.
+
+**Execution Team**
+
+- Trading Manager decomposes the boss request and dispatches work.
+- Market Analyst, Strategy Researcher, Chart Engineer, and Report Agent gather context and produce artifacts.
+- Risk Sentinel and Compliance Reviewer block unsafe or incomplete trade requests.
+- Execution Trader is the only worker allowed to submit Deriv write operations.
+
+**Advisor Council**
+
+- Macro Advisor reads external catalysts and broad risk tone.
+- Quant Advisor focuses on short-window momentum and moving averages.
+- Flow Advisor watches rhythm, volatility, and execution windows.
+- Risk Advisor challenges overconfident trades.
+- Contrarian Advisor attacks the consensus before the chief advisor synthesizes the final view.
+
+When `langgraph` is installed, each advisor runs as a graph node. If LangGraph is unavailable, the app falls back to a local council runner so the UI remains usable.
+
+## Extend Agents
+
+All core prompts live in:
 
 ```text
-web_research -> market_snapshot -> news_signal -> advisor_* nodes -> synthesize
+agent_prompts.json
 ```
 
-Advisor nodes run as separate LangGraph nodes. Their opinions are merged into graph state, then the chief advisor produces a final CALL / PUT / WAIT recommendation. If LangGraph is unavailable, the app falls back to the local council runner.
-
-Each agent has an editable prompt in:
-
-```text
-/Users/wangkeyu/Documents/项目/agent_prompts.json
-```
-
-To extend the advisor council, add a new `advisor.<id>` prompt entry. The web app will create a matching LangGraph advisor node automatically. The reserved `advisor.chief` prompt controls the final synthesizer.
-
-Example:
+Add a new advisor by creating an `advisor.<id>` entry:
 
 ```json
 {
   "advisor.breakout": {
-    "name": "突破谋士",
-    "prompt": "你只寻找突破和假突破。必须说明突破确认价、止损失效点和是否等待。"
+    "name": "Breakout Advisor",
+    "prompt": "Only evaluate breakout and failed-breakout setups. Always include confirmation price, invalidation level, and whether to wait."
   }
 }
 ```
 
-To add a new execution-team agent such as a new risk or report worker, add its prompt entry first, then register its tool/node in `web_app.py`.
+The UI automatically creates a matching LangGraph advisor node for custom advisor prompts. The reserved `advisor.chief` prompt controls the final synthesizer.
 
-Current execution-team agents:
+To add a new execution worker, add its prompt first, then register the corresponding tool or node in `web_app.py`.
 
-- Trading Manager: decomposes user goals and dispatches work.
-- Market Analyst, Strategy Researcher, Chart Engineer, Report Agent: read and analyze market or run data.
-- Risk Sentinel and Compliance Reviewer: check trade size, token status, and unsafe instructions.
-- Execution Trader: the only sub-agent allowed to place or close Deriv contracts.
+## Safety Model
 
-By default, every write action is blocked until the user confirms the next order in the sidebar. Demo accounts are supported by default. Live-account execution is blocked unless the UI and backend both receive explicit `allow_live=true`.
+The gateway is designed to keep execution explicit:
 
-## Configuration
+- API keys are stored only in Streamlit session state, not hardcoded in source files.
+- Missing token, missing amount, missing direction, or unclear trade intent blocks execution.
+- Deriv write actions require human confirmation from the UI.
+- Demo accounts are supported by default.
+- Live-account execution is blocked unless `allow_live=true` is explicitly provided by both UI and backend paths.
+- Advisor recommendations never bypass the execution safety gate.
 
-Use `mcp_config.json` in an MCP-compatible client. The default Deriv app id is `1089`.
+## Local Data
 
-The historical Deriv `v1` WebSocket endpoint currently returns HTTP 404 in live tests, so this implementation defaults to the compatible `v3` endpoint:
+The app stores run history and audit records in a local SQLite database:
+
+```text
+local_data/gateway.sqlite3
+```
+
+Stored records include team runs, advisor runs, role dialogue, API traces, execution logs, and trade receipts. API keys are not written to this database.
+
+## Model Providers
+
+The model selector supports:
+
+- Local rule engine with no model API key.
+- OpenAI.
+- DeepSeek through the OpenAI-compatible base URL `https://api.deepseek.com`.
+- Anthropic.
+- Custom OpenAI-compatible providers with a configurable base URL.
+
+## Symbol Examples
+
+The chart and advisor workflows accept many Deriv symbols:
+
+```text
+Draw the latest 120 one-minute candles for R_100
+Draw frxEURUSD 60 candles at 5m
+Analyze R_75 for the next 5 minutes
+Check BOOM1000 momentum before execution
+```
+
+Common symbols include:
+
+```text
+R_10, R_25, R_50, R_75, R_100
+1HZ10V, 1HZ25V, 1HZ50V, 1HZ75V, 1HZ100V
+BOOM500, BOOM1000, CRASH500, CRASH1000
+JD10, JD25, JD50, JD75, JD100
+frxEURUSD, frxGBPUSD, frxUSDJPY
+```
+
+## Validation
+
+Run the checks:
+
+```bash
+.venv/bin/python -m py_compile web_app.py server.py smoke_test.py
+.venv/bin/python -m pytest -q
+.venv/bin/python smoke_test.py
+```
+
+Recent validation:
+
+```text
+13 passed
+dependencies: OK
+prompts_and_symbols: OK
+langgraph_compile: OK
+deriv_market_tools: OK
+advisor_runtime: OK
+```
+
+## Deriv Endpoint
+
+The implementation defaults to the compatible Deriv v3 WebSocket endpoint:
 
 ```text
 wss://ws.derivws.com/websockets/v3?app_id={app_id}
 ```
 
 Override it with `DERIV_WS_URL_TEMPLATE` if you need a different endpoint.
+
+## Disclaimer
+
+This project is a local trading assistant and research gateway. It is not financial advice. Always review advisor output, risk gates, account mode, and order parameters before placing trades.
