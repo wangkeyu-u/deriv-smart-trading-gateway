@@ -3245,6 +3245,7 @@ def active_agent_ids() -> set[str]:
 def render_swarm_graph() -> None:
     st.markdown(f"### {t('swarm_graph')}")
     st.markdown(f'<p class="small-muted">{html.escape(t("swarm_graph_caption"))}</p>', unsafe_allow_html=True)
+    is_en = current_lang() == "en"
     active = active_agent_ids()
     worker_ids = ["strategy", "market", "risk", "compliance", "chart", "execution", "report"]
     nodes = []
@@ -3271,17 +3272,20 @@ def render_swarm_graph() -> None:
             }
         )
 
+    def edge_label(en: str, zh: str) -> str:
+        return en if is_en else zh
+
     links = [
-        {"source": "manager", "target": "strategy", "label": "DECOMPOSES", "strength": 0.95},
-        {"source": "strategy", "target": "market", "label": "REQUESTS_SIGNAL", "strength": 0.86},
-        {"source": "strategy", "target": "risk", "label": "SETS_BOUNDARY", "strength": 0.78},
-        {"source": "risk", "target": "compliance", "label": "VALIDATES", "strength": 0.84},
-        {"source": "market", "target": "chart", "label": "VISUALIZES", "strength": 0.76},
-        {"source": "compliance", "target": "execution", "label": "APPROVES", "strength": 0.88},
-        {"source": "execution", "target": "report", "label": "RECEIPT_TO", "strength": 0.82},
-        {"source": "report", "target": "manager", "label": "SUMMARIZES", "strength": 0.72},
-        {"source": "manager", "target": "market", "label": "ASSIGNS", "strength": 0.7},
-        {"source": "manager", "target": "execution", "label": "AUTHORIZES", "strength": 0.7},
+        {"source": "manager", "target": "strategy", "label": edge_label("DECOMPOSES", "拆解任务"), "strength": 0.95},
+        {"source": "strategy", "target": "market", "label": edge_label("REQUESTS SIGNAL", "请求信号"), "strength": 0.86},
+        {"source": "strategy", "target": "risk", "label": edge_label("SETS BOUNDARY", "设置边界"), "strength": 0.78},
+        {"source": "risk", "target": "compliance", "label": edge_label("VALIDATES", "校验合规"), "strength": 0.84},
+        {"source": "market", "target": "chart", "label": edge_label("VISUALIZES", "生成图表"), "strength": 0.76},
+        {"source": "compliance", "target": "execution", "label": edge_label("APPROVES", "批准执行"), "strength": 0.88},
+        {"source": "execution", "target": "report", "label": edge_label("RECEIPT TO", "回传回执"), "strength": 0.82},
+        {"source": "report", "target": "manager", "label": edge_label("SUMMARIZES", "汇总复盘"), "strength": 0.72},
+        {"source": "manager", "target": "market", "label": edge_label("ASSIGNS", "派给行情"), "strength": 0.7},
+        {"source": "manager", "target": "execution", "label": edge_label("AUTHORIZES", "授权执行"), "strength": 0.7},
     ]
     graph = {
         "nodes": nodes,
@@ -3293,20 +3297,26 @@ def render_swarm_graph() -> None:
             "updated": datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S MYT"),
         },
     }
-    graph_json = json.dumps(graph, ensure_ascii=False)
+    graph_json = json.dumps(graph, ensure_ascii=True)
     title = html.escape(t("swarm_graph"))
-    status_nodes = "Nodes" if current_lang() == "en" else "节点"
-    status_links = "Relations" if current_lang() == "en" else "关系"
-    status_layout = "Layout: Active" if current_lang() == "en" else "布局：运行中"
-    details_title = "Node Details" if current_lang() == "en" else "节点详情"
+    status_nodes = "Nodes" if is_en else "节点"
+    status_links = "Relations" if is_en else "关系"
+    status_layout = "Layout: Active" if is_en else "布局：运行中"
+    details_title = "Node Details" if is_en else "节点详情"
     toolbar = {
-        "refresh": "Refresh Layout" if current_lang() == "en" else "刷新布局",
-        "reset": "Reset Zoom" if current_lang() == "en" else "重置缩放",
-        "labels": "Show Edge Labels" if current_lang() == "en" else "显示边标签",
-        "add": "Add Mock Node" if current_lang() == "en" else "新增模拟节点",
-        "fit": "Fit View" if current_lang() == "en" else "适配视图",
+        "refresh": "Refresh Layout" if is_en else "刷新布局",
+        "reset": "Reset Zoom" if is_en else "重置缩放",
+        "labels": "Show Edge Labels" if is_en else "显示边标签",
+        "add": "Add Mock Node" if is_en else "新增模拟节点",
+        "fit": "Fit View" if is_en else "适配视图",
     }
-    component = f"""
+    component = f"""<!doctype html>
+    <html lang="{html.escape('en' if is_en else 'zh-CN')}">
+    <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    </head>
+    <body>
     <div id="kg-root">
       <div class="kg-toolbar">
         <div class="kg-title">{title}</div>
@@ -3340,8 +3350,15 @@ def render_swarm_graph() -> None:
           linear-gradient(180deg, rgba(248,252,250,.96), rgba(236,245,241,.91));
         background-size: auto, auto, 18px 18px, auto;
         color: #10221d;
-        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         box-shadow: 0 22px 70px rgba(0,0,0,.22);
+      }}
+      html, body {{
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        background: transparent;
+        font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       }}
       #kg-canvas {{
         position: absolute;
@@ -3472,6 +3489,29 @@ def render_swarm_graph() -> None:
     <script>
     (() => {{
       const graph = {graph_json};
+      const ui = {{
+        selected: {json.dumps("Selected" if is_en else "选中", ensure_ascii=True)},
+        hovered: {json.dumps("Hovered" if is_en else "悬停", ensure_ascii=True)},
+        none: "-",
+        memorySync: {json.dumps("Memory Sync: Local" if is_en else "本地同步：已连接", ensure_ascii=True)},
+        directionOut: {json.dumps("OUT" if is_en else "发出", ensure_ascii=True)},
+        directionIn: {json.dumps("IN" if is_en else "接收", ensure_ascii=True)},
+        importance: {json.dumps("Importance" if is_en else "重要度", ensure_ascii=True)},
+        confidence: {json.dumps("Confidence" if is_en else "置信度", ensure_ascii=True)},
+        tags: {json.dumps("Tags" if is_en else "标签", ensure_ascii=True)},
+        metadata: {json.dumps("Metadata" if is_en else "元数据", ensure_ascii=True)},
+        connected: {json.dumps("Connected Relations" if is_en else "关联关系", ensure_ascii=True)},
+        mockNode: {json.dumps("Mock Node" if is_en else "模拟节点", ensure_ascii=True)},
+        mockDescription: {json.dumps("Simulated temporary graph node." if is_en else "临时模拟图谱节点。", ensure_ascii=True)},
+        mockRelation: {json.dumps("SIMULATES" if is_en else "模拟连接", ensure_ascii=True)},
+        typeLabels: {{
+          system: {json.dumps("system" if is_en else "系统", ensure_ascii=True)},
+          task: {json.dumps("task" if is_en else "任务", ensure_ascii=True)},
+          risk: {json.dumps("risk" if is_en else "风控", ensure_ascii=True)},
+          concept: {json.dumps("concept" if is_en else "概念", ensure_ascii=True)},
+          api: {json.dumps("api" if is_en else "接口", ensure_ascii=True)}
+        }}
+      }};
       const root = document.getElementById('kg-root');
       const canvas = document.getElementById('kg-canvas');
       const ctx = canvas.getContext('2d');
@@ -3586,7 +3626,7 @@ def render_swarm_graph() -> None:
           if (showLabels && active) {{
             const mx = (l.source.x + l.target.x) / 2;
             const my = (l.source.y + l.target.y) / 2;
-            ctx.font = `${{11 / zoom}}px system-ui`;
+            ctx.font = `${{11 / zoom}}px "PingFang SC", "Microsoft YaHei", system-ui`;
             const w = ctx.measureText(l.label).width + 12 / zoom;
             ctx.globalAlpha = .9;
             ctx.fillStyle = 'rgba(255,255,255,.82)';
@@ -3616,11 +3656,11 @@ def render_swarm_graph() -> None:
           ctx.lineWidth = 2 / zoom;
           ctx.stroke();
           ctx.fillStyle = '#fff';
-          ctx.font = `900 ${{13 / zoom}}px system-ui`;
+          ctx.font = `900 ${{13 / zoom}}px "PingFang SC", "Microsoft YaHei", system-ui`;
           ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
           ctx.fillText(n.code || n.label.slice(0, 2), n.x, n.y);
           ctx.fillStyle = '#17312b';
-          ctx.font = `800 ${{12 / zoom}}px system-ui`;
+          ctx.font = `800 ${{12 / zoom}}px "PingFang SC", "Microsoft YaHei", system-ui`;
           ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
           ctx.fillText(n.label, n.x + r + 8 / zoom, n.y);
         }});
@@ -3640,16 +3680,16 @@ def render_swarm_graph() -> None:
         selected = node;
         if (!node) {{ panel.classList.remove('open'); return; }}
         const rels = links.filter(l => l.source.id === node.id || l.target.id === node.id)
-          .map(l => `<li><strong>${{l.source.id === node.id ? 'OUT' : 'IN'}}</strong> ${{l.label}} · ${{l.source.id === node.id ? l.target.label : l.source.label}}</li>`).join('');
+          .map(l => `<li><strong>${{l.source.id === node.id ? ui.directionOut : ui.directionIn}}</strong> ${{l.label}} · ${{l.source.id === node.id ? l.target.label : l.source.label}}</li>`).join('');
         panelBody.innerHTML = `
-          <div class="kg-panel-type" style="background:${{node.color}}">${{node.type}}</div>
+          <div class="kg-panel-type" style="background:${{node.color}}">${{ui.typeLabels[node.type] || node.type}}</div>
           <h3>${{node.label}}</h3>
           <div class="kg-panel-section">${{node.description || ''}}</div>
-          <div class="kg-panel-section"><strong>Importance:</strong> ${{node.importance}}</div>
-          <div class="kg-panel-section"><strong>Confidence:</strong> ${{node.confidence}}</div>
-          <div class="kg-panel-section"><strong>Tags:</strong> ${{(node.tags || []).join(', ')}}</div>
-          <div class="kg-panel-section"><strong>Metadata:</strong><br>${{Object.entries(node.metadata || {{}}).map(([k,v]) => `${{k}}: ${{v}}`).join('<br>')}}</div>
-          <div class="kg-panel-section"><strong>Connected Relations:</strong><ul>${{rels}}</ul></div>
+          <div class="kg-panel-section"><strong>${{ui.importance}}:</strong> ${{node.importance}}</div>
+          <div class="kg-panel-section"><strong>${{ui.confidence}}:</strong> ${{node.confidence}}</div>
+          <div class="kg-panel-section"><strong>${{ui.tags}}:</strong> ${{(node.tags || []).join(', ')}}</div>
+          <div class="kg-panel-section"><strong>${{ui.metadata}}:</strong><br>${{Object.entries(node.metadata || {{}}).map(([k,v]) => `${{k}}: ${{v}}`).join('<br>')}}</div>
+          <div class="kg-panel-section"><strong>${{ui.connected}}:</strong><ul>${{rels}}</ul></div>
         `;
         panel.classList.add('open');
       }}
@@ -3657,11 +3697,11 @@ def render_swarm_graph() -> None:
         const counts = {{}};
         nodes.forEach(n => counts[n.type] = (counts[n.type] || 0) + 1);
         legend.innerHTML = Object.entries(counts).map(([type, count]) =>
-          `<div class="kg-legend-row"><span><i class="kg-dot" style="background:${{colors[type] || '#14b8a6'}}"></i>${{type}}</span><strong>${{count}}</strong></div>`
+          `<div class="kg-legend-row"><span><i class="kg-dot" style="background:${{colors[type] || '#14b8a6'}}"></i>${{ui.typeLabels[type] || type}}</span><strong>${{count}}</strong></div>`
         ).join('');
       }}
       function renderStatus() {{
-        status.innerHTML = `<span>{status_nodes}: ${{nodes.length}}</span><span>{status_links}: ${{links.length}}</span><span>${{selected ? 'Selected: ' + selected.label : 'Selected: -'}}</span><span>${{hovered ? 'Hovered: ' + hovered.label : 'Hovered: -'}}</span><span>{status_layout}</span><span>Memory Sync: Simulated</span><span>${{graph.status.updated}}</span>`;
+        status.innerHTML = `<span>{status_nodes}: ${{nodes.length}}</span><span>{status_links}: ${{links.length}}</span><span>${{ui.selected}}: ${{selected ? selected.label : ui.none}}</span><span>${{ui.hovered}}: ${{hovered ? hovered.label : ui.none}}</span><span>{status_layout}</span><span>${{ui.memorySync}}</span><span>${{graph.status.updated}}</span>`;
       }}
       canvas.addEventListener('mousemove', e => {{
         if (dragging) {{ const p = world(e.clientX, e.clientY); dragging.x = p.x; dragging.y = p.y; dragging.vx = 0; dragging.vy = 0; alpha = .55; return; }}
@@ -3688,17 +3728,19 @@ def render_swarm_graph() -> None:
       document.getElementById('kg-add').onclick = () => {{
         const parent = nodes[Math.floor(Math.random() * nodes.length)];
         const id = 'mock-' + Math.random().toString(16).slice(2, 7);
-        const node = {{ id, label: 'Mock Node ' + nodes.length, code: 'MN', type: 'concept', description: 'Simulated temporary graph node.', importance: .45, confidence: .74, color: '#06b6d4', tags: ['mock'], metadata: {{ status: 'simulated' }}, x: parent.x + 30, y: parent.y + 30, vx: 0, vy: 0, radius: 24 }};
-        nodes.push(node); byId.set(id, node); links.push({{ source: parent, target: node, label: 'SIMULATES', strength: .55 }});
+        const node = {{ id, label: ui.mockNode + ' ' + nodes.length, code: 'MN', type: 'concept', description: ui.mockDescription, importance: .45, confidence: .74, color: '#06b6d4', tags: ['mock'], metadata: {{ status: 'simulated' }}, x: parent.x + 30, y: parent.y + 30, vx: 0, vy: 0, radius: 24 }};
+        nodes.push(node); byId.set(id, node); links.push({{ source: parent, target: node, label: ui.mockRelation, strength: .55 }});
         alpha = 1; renderLegend();
       }};
       window.addEventListener('resize', resize);
       resize(); renderLegend(); draw();
     }})();
     </script>
+    </body>
+    </html>
     """
     encoded = base64.b64encode(component.encode("utf-8")).decode("ascii")
-    st.iframe(f"data:text/html;base64,{encoded}", height=540, width="stretch")
+    st.iframe(f"data:text/html;charset=utf-8;base64,{encoded}", height=540, width="stretch")
 
 
 def render_agent_roster() -> None:
