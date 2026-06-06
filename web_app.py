@@ -303,6 +303,11 @@ I18N = {
         "micro_symbol": "资产 / Symbol",
         "micro_asset_kind": "资产类型",
         "micro_prices": "近期收盘价",
+        "micro_data_source": "数据来源",
+        "micro_source_live": "Deriv 最新K线",
+        "micro_source_manual": "手动输入收盘价",
+        "micro_live_count": "实时K线数量",
+        "micro_live_granularity": "实时K线周期",
         "micro_budget": "小笔预算",
         "micro_amount": "单次金额",
         "micro_daily_budget": "日预算",
@@ -318,6 +323,9 @@ I18N = {
         "micro_decision": "当前信号",
         "micro_operator_brief": "员工视角结论",
         "micro_operator_recommendation": "行动建议",
+        "micro_trade_direction": "观察方向",
+        "micro_data_quality": "数据可信度",
+        "micro_paper_return": "纸面收益",
         "micro_risk_brief": "风险与预算",
         "micro_evidence": "信号证据",
         "micro_next_steps": "下一步",
@@ -544,6 +552,11 @@ I18N = {
         "micro_symbol": "Asset / Symbol",
         "micro_asset_kind": "Asset Kind",
         "micro_prices": "Recent Closes",
+        "micro_data_source": "Data Source",
+        "micro_source_live": "Latest Deriv Candles",
+        "micro_source_manual": "Manual Close Input",
+        "micro_live_count": "Live Candle Count",
+        "micro_live_granularity": "Live Granularity",
         "micro_budget": "Micro Budget",
         "micro_amount": "Trade Amount",
         "micro_daily_budget": "Daily Budget",
@@ -559,6 +572,9 @@ I18N = {
         "micro_decision": "Current Signal",
         "micro_operator_brief": "Operator Brief",
         "micro_operator_recommendation": "Recommendation",
+        "micro_trade_direction": "Observed Direction",
+        "micro_data_quality": "Data Quality",
+        "micro_paper_return": "Paper Return",
         "micro_risk_brief": "Risk And Budget",
         "micro_evidence": "Signal Evidence",
         "micro_next_steps": "Next Steps",
@@ -7246,6 +7262,8 @@ def micro_operator_brief(
     frame: pd.DataFrame,
     *,
     lang: str | None = None,
+    data_source: str = "manual",
+    symbol: str = "",
 ) -> dict[str, Any]:
     language = lang or current_lang()
     action = str(decision.get("action") or "WAIT")
@@ -7257,27 +7275,55 @@ def micro_operator_brief(
     win_rate = summary.get("win_rate")
     budget_ok = bool(budget_check.get("ok"))
     halt_reason = summary.get("halt_reason") or "none"
+    is_live = data_source == "live"
+    display_symbol = symbol or str(decision.get("symbol") or "")
+    weak_backtest = bool(
+        trade_count
+        and (
+            halt_reason != "none"
+            or total_pnl <= 0
+            or (win_rate is not None and float(win_rate) < 0.52)
+        )
+    )
 
     if not budget_ok:
-        recommendation = "DO_NOT_TRADE"
+        recommendation = "禁止交易" if language == "zh" else "Do Not Trade"
         headline = (
-            "预算闸门阻止本轮交易，先不要动本金。"
+            "预算闸门已经阻止本轮交易，员工建议：不要开仓，不要继续加码。"
             if language == "zh"
             else "Budget guard blocks this run. Keep capital untouched."
         )
     elif action in {"WAIT", "HOLD"}:
-        recommendation = "WAIT"
+        recommendation = "等待" if language == "zh" else "Wait"
         headline = (
-            "当前没有干净的小笔交易优势，先等更强信号。"
+            "当前信号不够干净，员工建议：继续观察，暂不下单。"
             if language == "zh"
             else "No clean small-trade edge yet. Wait for a stronger signal."
         )
-    else:
-        recommendation = "PAPER_ONLY"
+    elif not is_live:
+        recommendation = "仅测算法" if language == "zh" else "Algorithm Check Only"
         headline = (
-            f"当前可做 {action} 纸面验证，但真实执行必须继续走确认闸门。"
+            "你现在用的是手动/样例收盘价，这只能检查算法逻辑，不能代表当前市场。"
             if language == "zh"
-            else f"{action} is allowed for paper trading, but keep live execution behind confirmation."
+            else "Manual/sample closes only check the algorithm; they do not represent the live market."
+        )
+    elif weak_backtest:
+        recommendation = "暂不执行" if language == "zh" else "Do Not Execute Yet"
+        headline = (
+            f"实时方向偏 {action}，但纸面回测不支持执行："
+            f"胜率 {float(win_rate or 0):.0%}，PnL {total_pnl:+.5f}，熔断 {halt_reason}。"
+            if language == "zh"
+            else (
+                f"Live direction leans {action}, but the paper backtest does not support execution: "
+                f"win rate {float(win_rate or 0):.0%}, PnL {total_pnl:+.5f}, halt {halt_reason}."
+            )
+        )
+    else:
+        recommendation = "观察跟踪" if language == "zh" else "Watch"
+        headline = (
+            f"基于 {display_symbol} 最新K线，短线方向偏 {action}；回测没有触发熔断，可加入观察清单。"
+            if language == "zh"
+            else f"Latest candles lean {action}; no circuit halt was triggered, so keep it on the watch list."
         )
 
     risk_items = [
@@ -7287,25 +7333,42 @@ def micro_operator_brief(
     ]
     if blockers:
         risk_items.append("blockers=" + ", ".join(blockers))
+    risk_items.append(
+        ("数据=最新Deriv K线" if is_live else "数据=手动输入/样例，不能代表实时市场")
+        if language == "zh"
+        else ("data=latest Deriv candles" if is_live else "data=manual/sample closes, not live market")
+    )
 
     next_steps = []
-    if recommendation == "DO_NOT_TRADE":
+    if not budget_ok:
         next_steps.append(
             "先降低单次金额，或确认已用预算后再尝试。"
             if language == "zh"
             else "Reduce amount or reset spent budget before any new attempt."
         )
-    elif recommendation == "WAIT":
+    elif action in {"WAIT", "HOLD"}:
         next_steps.append(
             "先刷新/补充最新收盘价，再重新运行判断。"
             if language == "zh"
             else "Collect fresher closes and rerun before considering a trade."
         )
+    elif not is_live:
+        next_steps.append(
+            "切换到 Deriv 最新K线，再跑一次；不要用样例数据做交易判断。"
+            if language == "zh"
+            else "Switch to latest Deriv candles and rerun before making any trading decision."
+        )
+    elif weak_backtest:
+        next_steps.append(
+            "不要下单；等下一根或下一组K线出来后重跑，必须看到胜率、PnL、熔断同时改善。"
+            if language == "zh"
+            else "Do not trade; rerun after the next candles and require win rate, PnL, and circuit status to improve together."
+        )
     else:
         next_steps.append(
-            "先只当作纸面信号；等多轮胜率和 PnL 稳定后再考虑执行。"
+            "把这次方向放入观察清单；连续多轮一致时，再去主交易台生成待确认订单。"
             if language == "zh"
-            else "Use this only as a paper signal until repeated runs show stable win rate and PnL."
+            else "Track this direction; only draft a confirmed trade after repeated consistent runs."
         )
     next_steps.append(
         "不要绕过主交易台的人工确认闸门。"
@@ -7316,6 +7379,7 @@ def micro_operator_brief(
     return {
         "headline": headline,
         "recommendation": recommendation,
+        "data_quality": "实时K线" if is_live and language == "zh" else "Live candles" if is_live else "样例/手动" if language == "zh" else "Manual/sample",
         "action": action,
         "confidence": confidence,
         "latest_price": decision.get("latest_price"),
@@ -7399,7 +7463,27 @@ def render_micro_strategy_page() -> None:
         asset_kind = top[2].selectbox(t("micro_asset_kind"), ["deriv", "fund", "equity", "crypto", "forex"])
         trade_amount = top[3].number_input(t("micro_amount"), min_value=0.35, max_value=100.0, value=1.0, step=0.25)
 
-        prices_text = st.text_area(t("micro_prices"), value=default_micro_prices(), height=104)
+        source_cols = st.columns([0.34, 0.22, 0.44])
+        source_label = source_cols[0].selectbox(
+            t("micro_data_source"),
+            [t("micro_source_live"), t("micro_source_manual")],
+        )
+        live_count = source_cols[1].number_input(t("micro_live_count"), min_value=20, max_value=1000, value=120, step=20)
+        live_granularity = source_cols[2].selectbox(
+            t("micro_live_granularity"),
+            [60, 120, 300, 900, 3600],
+            format_func=lambda value: f"{int(value)}s",
+        )
+        data_source = "live" if source_label == t("micro_source_live") else "manual"
+        if data_source == "manual":
+            prices_text = st.text_area(t("micro_prices"), value=default_micro_prices(), height=104)
+        else:
+            prices_text = default_micro_prices()
+            st.caption(
+                "运行时会抓取 Deriv 最新K线；下面的手动价格不会参与本轮判断。"
+                if current_lang() == "zh"
+                else "The run will use latest Deriv candles; manual closes are ignored for this run."
+            )
         budget_cols = st.columns(4)
         daily_budget = budget_cols[0].number_input(t("micro_daily_budget"), min_value=0.35, max_value=500.0, value=5.0, step=0.5)
         total_budget = budget_cols[1].number_input(t("micro_total_budget"), min_value=0.35, max_value=500.0, value=5.0, step=0.5)
@@ -7421,7 +7505,6 @@ def render_micro_strategy_page() -> None:
             st.dataframe(recent_table, width="stretch", height=min(340, 72 + len(recent_table) * 32))
         return
 
-    frame = micro_price_frame_from_text(prices_text)
     config = MicroTradeConfig(
         symbol=normalize_deriv_symbol(symbol) if asset_kind == "deriv" else symbol.strip(),
         asset_kind=asset_kind,  # type: ignore[arg-type]
@@ -7429,6 +7512,35 @@ def render_micro_strategy_page() -> None:
         min_confidence=0.58,
         max_volatility_pct=2.8 if asset_kind != "fund" else 2.2,
     )
+    actual_data_source = data_source
+    if data_source == "live" and asset_kind == "deriv":
+        live_result = fetch_compare_candles(config.symbol, int(live_granularity), int(live_count))
+        if not live_result.get("ok"):
+            st.error(
+                "实时K线抓取失败，本轮不会生成交易建议。"
+                if current_lang() == "zh"
+                else "Live candle fetch failed; no trading suggestion is produced."
+            )
+            st.json(live_result)
+            return
+        live_frame = candles_frame_from_result(live_result)
+        frame = normalize_price_frame(live_frame[["timestamp", "close"]])
+        push_runtime_event(
+            "micro_strategy",
+            "Deriv Candles",
+            "Micro Strategy",
+            f"{config.symbol} live candles loaded",
+            {"symbol": config.symbol, "granularity": int(live_granularity), "count": len(frame)},
+        )
+    else:
+        frame = micro_price_frame_from_text(prices_text)
+        actual_data_source = "manual"
+        if data_source == "live" and asset_kind != "deriv":
+            st.warning(
+                "非 Deriv 资产暂时没有实时行情接入，本轮按手动输入模式处理。"
+                if current_lang() == "zh"
+                else "Live data is not wired for non-Deriv assets yet; this run uses manual input."
+            )
     budget_check = budget_guard_check(
         action="execute_simulated_trade" if asset_kind == "deriv" else "spot_paper_trade",
         amount=trade_amount,
@@ -7477,15 +7589,23 @@ def render_micro_strategy_page() -> None:
     )
     st.success(t("micro_saved"))
 
-    operator_brief = micro_operator_brief(decision, budget_check, backtest, frame)
+    operator_brief = micro_operator_brief(
+        decision,
+        budget_check,
+        backtest,
+        frame,
+        data_source=actual_data_source,
+        symbol=config.symbol,
+    )
     st.markdown(f"#### {t('micro_operator_brief')}")
     st.info(operator_brief["headline"])
-    brief_cols = st.columns(5)
+    brief_cols = st.columns(6)
     brief_cols[0].metric(t("micro_operator_recommendation"), operator_brief["recommendation"])
-    brief_cols[1].metric("Action", operator_brief["action"])
+    brief_cols[1].metric(t("micro_trade_direction"), operator_brief["action"])
     brief_cols[2].metric("Confidence", f"{operator_brief['confidence']:.0%}")
-    brief_cols[3].metric("Paper PnL", f"{operator_brief['total_pnl']:+.5f}")
+    brief_cols[3].metric(t("micro_paper_return"), f"{operator_brief['total_pnl']:+.5f}")
     brief_cols[4].metric("Trades", int(operator_brief["trade_count"]))
+    brief_cols[5].metric(t("micro_data_quality"), operator_brief["data_quality"])
 
     info_cols = st.columns([0.34, 0.33, 0.33])
     with info_cols[0]:
