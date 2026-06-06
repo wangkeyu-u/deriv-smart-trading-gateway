@@ -95,6 +95,13 @@ DB_PATH = DATA_DIR / "gateway.sqlite3"
 AGENT_PROMPTS_PATH = APP_DIR / "agent_prompts.json"
 LOCAL_TZ = ZoneInfo("Asia/Kuala_Lumpur")
 
+
+def display_local_path(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(APP_DIR))
+    except ValueError:
+        return path.name
+
 I18N = {
     "zh": {
         "sidebar_title": "Deriv Gateway",
@@ -2623,8 +2630,8 @@ def render_sidebar() -> None:
             f"{t('model_key')}: `{mask_secret(st.session_state.llm_api_key) if st.session_state.llm_api_key else t('not_configured_or_not_needed')}`"
         )
         st.write(f"{t('model_name')}: `{st.session_state.llm_model}`")
-        st.caption(f"{t('db_path')}: `{DB_PATH}`")
-        st.caption(f"Agent prompts: `{AGENT_PROMPTS_PATH}`")
+        st.caption(f"{t('db_path')}: `{display_local_path(DB_PATH)}`")
+        st.caption(f"Agent prompts: `{display_local_path(AGENT_PROMPTS_PATH)}`")
 
         st.divider()
         st.subheader(t("history"))
@@ -6118,7 +6125,7 @@ def system_health_snapshot(state: dict[str, Any]) -> dict[str, Any]:
         init_local_db()
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute("SELECT 1").fetchone()
-        checks["db"] = {"ok": True, "detail": str(DB_PATH)}
+        checks["db"] = {"ok": True, "detail": "sqlite ready"}
     except Exception as exc:
         checks["db"] = {"ok": False, "detail": str(exc)}
 
