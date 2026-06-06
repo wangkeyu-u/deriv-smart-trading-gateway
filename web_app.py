@@ -329,8 +329,8 @@ I18N = {
         "micro_risk_brief": "风险与预算",
         "micro_evidence": "信号证据",
         "micro_next_steps": "下一步",
-        "micro_trade_log": "Paper Trading 明细",
-        "micro_backtest": "Paper Trading 回测",
+        "micro_trade_log": "回测明细",
+        "micro_backtest": "纸面回测",
         "micro_no_trade": "当前预算或熔断条件不允许交易。",
         "micro_recent_runs": "最近小笔策略记录",
         "micro_saved": "已保存本轮小笔策略记录",
@@ -1304,6 +1304,8 @@ def save_micro_strategy_run(
     decision: dict[str, Any],
     budget_check: dict[str, Any],
     backtest: dict[str, Any],
+    operator_brief: dict[str, Any] | None = None,
+    data_source: str = "manual",
 ) -> None:
     init_local_db()
     summary = backtest.get("summary") or {}
@@ -1324,6 +1326,8 @@ def save_micro_strategy_run(
         "decision": decision,
         "budget_guard": budget_check,
         "backtest": backtest,
+        "operator_brief": operator_brief or {},
+        "data_source": data_source,
     }
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
@@ -1357,14 +1361,23 @@ def load_recent_micro_strategy_runs(limit: int = 8) -> list[dict[str, Any]]:
             """
             SELECT
                 id, created_at, goal, symbol, asset_kind, action, confidence,
-                budget_ok, trade_count, total_pnl, halted
+                budget_ok, trade_count, total_pnl, halted, run_json
             FROM micro_strategy_runs
             ORDER BY id DESC
             LIMIT ?
             """,
             (limit,),
         ).fetchall()
-    return [dict(row) for row in rows]
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        record = dict(row)
+        try:
+            payload = json.loads(str(record.get("run_json") or "{}"))
+        except json.JSONDecodeError:
+            payload = {}
+        record["payload"] = payload if isinstance(payload, dict) else {}
+        records.append(record)
+    return records
 
 
 SYSTEM_PROMPT = """
@@ -7255,6 +7268,101 @@ def micro_price_frame_from_text(raw: str) -> pd.DataFrame:
     return normalize_price_frame(values)
 
 
+def micro_budget_reason_label(reason: Any, *, lang: str | None = None) -> str:
+    language = lang or current_lang()
+    text = str(reason or "unknown")
+    zh = {
+        "within_budget": "未超预算",
+        "single_trade_limit_exceeded": "单笔金额超过限制",
+        "daily_budget_exceeded": "今日预算不足",
+        "total_budget_exceeded": "总预算不足",
+        "missing_amount": "缺少金额",
+        "invalid_amount": "金额无效",
+        "unknown": "未知",
+    }
+    en = {
+        "within_budget": "Within budget",
+        "single_trade_limit_exceeded": "Single-trade limit exceeded",
+        "daily_budget_exceeded": "Daily budget exceeded",
+        "total_budget_exceeded": "Total budget exceeded",
+        "missing_amount": "Missing amount",
+        "invalid_amount": "Invalid amount",
+        "unknown": "Unknown",
+    }
+    labels = zh if language == "zh" else en
+    return labels.get(text, text.replace("_", " "))
+
+
+def micro_halt_reason_label(reason: Any, *, lang: str | None = None) -> str:
+    language = lang or current_lang()
+    text = str(reason or "none")
+    zh = {
+        "none": "无熔断",
+        "max_consecutive_losses": "连续亏损熔断",
+        "max_total_loss_amount": "累计亏损熔断",
+        "max_drawdown_pct": "回撤熔断",
+        "max_trade_count": "交易次数上限",
+    }
+    en = {
+        "none": "No halt",
+        "max_consecutive_losses": "Consecutive-loss halt",
+        "max_total_loss_amount": "Total-loss halt",
+        "max_drawdown_pct": "Drawdown halt",
+        "max_trade_count": "Trade-count limit",
+    }
+    labels = zh if language == "zh" else en
+    return labels.get(text, text.replace("_", " "))
+
+
+def micro_action_label(action: Any, *, lang: str | None = None) -> str:
+    language = lang or current_lang()
+    text = str(action or "WAIT").upper()
+    zh = {
+        "CALL": "看涨",
+        "PUT": "看跌",
+        "WAIT": "等待",
+        "BUY": "买入",
+        "SELL": "卖出",
+        "HOLD": "持有/等待",
+    }
+    en = {
+        "CALL": "CALL",
+        "PUT": "PUT",
+        "WAIT": "Wait",
+        "BUY": "Buy",
+        "SELL": "Sell",
+        "HOLD": "Hold",
+    }
+    labels = zh if language == "zh" else en
+    label = labels.get(text, text)
+    return f"{label} ({text})" if language == "zh" and text in {"CALL", "PUT"} else label
+
+
+def micro_blocker_label(blocker: Any, *, lang: str | None = None) -> str:
+    language = lang or current_lang()
+    text = str(blocker or "")
+    zh = {
+        "weak_momentum": "动量太弱",
+        "excess_volatility": "波动过高",
+        "low_confidence": "置信度不足",
+        "cost_edge_too_small": "扣除成本后优势太小",
+        "single_trade_limit_exceeded": "单笔金额超过限制",
+        "daily_budget_exceeded": "今日预算不足",
+        "total_budget_exceeded": "总预算不足",
+    }
+    en = {
+        "weak_momentum": "Weak momentum",
+        "excess_volatility": "Excess volatility",
+        "low_confidence": "Low confidence",
+        "cost_edge_too_small": "Cost-adjusted edge too small",
+        "single_trade_limit_exceeded": "Single-trade limit exceeded",
+        "daily_budget_exceeded": "Daily budget exceeded",
+        "total_budget_exceeded": "Total budget exceeded",
+    }
+    labels = zh if language == "zh" else en
+    return labels.get(text, text.replace("_", " "))
+
+
 def micro_operator_brief(
     decision: dict[str, Any],
     budget_check: dict[str, Any],
@@ -7310,33 +7418,44 @@ def micro_operator_brief(
     elif weak_backtest:
         recommendation = "暂不执行" if language == "zh" else "Do Not Execute Yet"
         headline = (
-            f"实时方向偏 {action}，但纸面回测不支持执行："
-            f"胜率 {float(win_rate or 0):.0%}，PnL {total_pnl:+.5f}，熔断 {halt_reason}。"
+            f"实时方向偏 {micro_action_label(action, lang=language)}，但纸面回测不支持执行："
+            f"胜率 {float(win_rate or 0):.0%}，盈亏 {total_pnl:+.5f}，{micro_halt_reason_label(halt_reason, lang=language)}。"
             if language == "zh"
             else (
                 f"Live direction leans {action}, but the paper backtest does not support execution: "
-                f"win rate {float(win_rate or 0):.0%}, PnL {total_pnl:+.5f}, halt {halt_reason}."
+                f"win rate {float(win_rate or 0):.0%}, P/L {total_pnl:+.5f}, {micro_halt_reason_label(halt_reason, lang=language)}."
             )
         )
     else:
         recommendation = "观察跟踪" if language == "zh" else "Watch"
         headline = (
-            f"基于 {display_symbol} 最新K线，短线方向偏 {action}；回测没有触发熔断，可加入观察清单。"
+            f"基于 {display_symbol} 最新K线，短线方向偏 {micro_action_label(action, lang=language)}；回测没有触发熔断，可加入观察清单。"
             if language == "zh"
             else f"Latest candles lean {action}; no circuit halt was triggered, so keep it on the watch list."
         )
 
-    risk_items = [
-        f"single_trade_amount={decision.get('risk', {}).get('max_trade_amount', 'N/A')}",
-        f"budget={budget_check.get('reason', 'unknown')}",
-        f"halt={halt_reason}",
-    ]
-    if blockers:
-        risk_items.append("blockers=" + ", ".join(blockers))
-    risk_items.append(
-        ("数据=最新Deriv K线" if is_live else "数据=手动输入/样例，不能代表实时市场")
+    risk_items = (
+        [
+            f"单次金额：{decision.get('risk', {}).get('max_trade_amount', 'N/A')}",
+            f"预算状态：{micro_budget_reason_label(budget_check.get('reason'), lang=language)}",
+            f"熔断状态：{micro_halt_reason_label(halt_reason, lang=language)}",
+        ]
         if language == "zh"
-        else ("data=latest Deriv candles" if is_live else "data=manual/sample closes, not live market")
+        else [
+            f"Trade amount: {decision.get('risk', {}).get('max_trade_amount', 'N/A')}",
+            f"Budget: {micro_budget_reason_label(budget_check.get('reason'), lang=language)}",
+            f"Circuit breaker: {micro_halt_reason_label(halt_reason, lang=language)}",
+        ]
+    )
+    if blockers:
+        risk_items.append(
+            ("阻断项：" if language == "zh" else "Blockers: ")
+            + ", ".join(micro_blocker_label(item, lang=language) for item in blockers)
+        )
+    risk_items.append(
+        ("数据来源：Deriv 最新K线" if is_live else "数据来源：手动/样例，不能代表实时市场")
+        if language == "zh"
+        else ("Data source: latest Deriv candles" if is_live else "Data source: manual/sample closes, not live market")
     )
 
     next_steps = []
@@ -7360,7 +7479,7 @@ def micro_operator_brief(
         )
     elif weak_backtest:
         next_steps.append(
-            "不要下单；等下一根或下一组K线出来后重跑，必须看到胜率、PnL、熔断同时改善。"
+            "不要下单；等下一根或下一组K线出来后重跑，必须看到胜率、盈亏、熔断同时改善。"
             if language == "zh"
             else "Do not trade; rerun after the next candles and require win rate, PnL, and circuit status to improve together."
         )
@@ -7381,6 +7500,7 @@ def micro_operator_brief(
         "recommendation": recommendation,
         "data_quality": "实时K线" if is_live and language == "zh" else "Live candles" if is_live else "样例/手动" if language == "zh" else "Manual/sample",
         "action": action,
+        "action_label": micro_action_label(action, lang=language),
         "confidence": confidence,
         "latest_price": decision.get("latest_price"),
         "bars": len(frame),
@@ -7401,56 +7521,108 @@ def micro_operator_brief(
     }
 
 
-def micro_trades_table(trades: list[dict[str, Any]]) -> pd.DataFrame:
+def micro_trades_table(trades: list[dict[str, Any]], *, lang: str | None = None) -> pd.DataFrame:
     if not trades:
         return pd.DataFrame()
+    language = lang or current_lang()
     frame = pd.DataFrame(trades)
+    if "action" in frame.columns:
+        frame["action"] = frame["action"].apply(lambda value: micro_action_label(value, lang=language))
+    frame["verdict"] = frame.apply(
+        lambda row: (
+            "通过"
+            if language == "zh" and not row.get("blockers")
+            else "Pass"
+            if not row.get("blockers")
+            else "阻断: " + ", ".join(micro_blocker_label(item, lang=language) for item in (row.get("blockers") or []))
+            if language == "zh"
+            else "Blocked: " + ", ".join(micro_blocker_label(item, lang=language) for item in (row.get("blockers") or []))
+        ),
+        axis=1,
+    )
     columns = [
         "index",
         "action",
         "entry_price",
         "exit_price",
-        "amount",
         "return_pct",
         "pnl",
         "equity",
         "confidence",
-        "blockers",
+        "verdict",
     ]
     frame = frame[[column for column in columns if column in frame.columns]].copy()
-    if "blockers" in frame.columns:
-        frame["blockers"] = frame["blockers"].apply(lambda value: ", ".join(value) if isinstance(value, list) else value)
-    return frame.rename(
-        columns={
-            "index": "bar",
-            "entry_price": "entry",
-            "exit_price": "exit",
-            "return_pct": "return_%",
+    for column in ("entry_price", "exit_price", "return_pct", "pnl", "equity", "confidence"):
+        if column in frame.columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce").round(5)
+    labels = (
+        {
+            "index": "K线序号",
+            "action": "方向",
+            "entry_price": "入场价",
+            "exit_price": "出场价",
+            "return_pct": "收益率%",
+            "pnl": "盈亏",
+            "equity": "权益",
+            "confidence": "置信度",
+            "verdict": "结果",
+        }
+        if language == "zh"
+        else {
+            "index": "Bar",
+            "action": "Direction",
+            "entry_price": "Entry",
+            "exit_price": "Exit",
+            "return_pct": "Return %",
+            "pnl": "P/L",
+            "equity": "Equity",
+            "confidence": "Confidence",
+            "verdict": "Result",
         }
     )
+    return frame.rename(columns=labels)
 
 
-def micro_recent_runs_table(rows: list[dict[str, Any]]) -> pd.DataFrame:
+def micro_run_record_view(record: dict[str, Any], *, lang: str | None = None) -> dict[str, Any]:
+    language = lang or current_lang()
+    payload = record.get("payload") or {}
+    brief = payload.get("operator_brief") or {}
+    backtest = payload.get("backtest") or {}
+    summary = backtest.get("summary") or {}
+    data_source = payload.get("data_source") or "unknown"
+    win_rate = summary.get("win_rate")
+    headline = brief.get("headline") or (
+        "旧记录缺少员工结论，请重新运行。"
+        if language == "zh"
+        else "Legacy run without operator brief; rerun it."
+    )
+    return {
+        ("时间" if language == "zh" else "Time"): local_time_label(record.get("created_at"), "%m-%d %H:%M MYT"),
+        ("资产" if language == "zh" else "Symbol"): record.get("symbol"),
+        ("数据" if language == "zh" else "Data"): (
+            "实时K线"
+            if data_source == "live" and language == "zh"
+            else "Live candles"
+            if data_source == "live"
+            else "手动/样例"
+            if language == "zh"
+            else "Manual/sample"
+        ),
+        ("建议" if language == "zh" else "Recommendation"): brief.get("recommendation")
+        or ("旧记录" if language == "zh" else "Legacy"),
+        ("方向" if language == "zh" else "Direction"): brief.get("action_label")
+        or micro_action_label(brief.get("action") or record.get("action"), lang=language),
+        ("胜率" if language == "zh" else "Win Rate"): "N/A" if win_rate is None else f"{float(win_rate):.0%}",
+        ("盈亏" if language == "zh" else "P/L"): f"{float(summary.get('total_pnl') if summary else record.get('total_pnl') or 0):+.5f}",
+        ("熔断" if language == "zh" else "Halt"): micro_halt_reason_label(summary.get("halt_reason"), lang=language),
+        ("结论" if language == "zh" else "Brief"): headline,
+    }
+
+
+def micro_recent_runs_table(rows: list[dict[str, Any]], *, lang: str | None = None) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
-    frame = pd.DataFrame(rows)
-    columns = [
-        "created_at",
-        "symbol",
-        "asset_kind",
-        "action",
-        "confidence",
-        "budget_ok",
-        "trade_count",
-        "total_pnl",
-        "halted",
-        "goal",
-    ]
-    frame = frame[[column for column in columns if column in frame.columns]].copy()
-    for column in ("budget_ok", "halted"):
-        if column in frame.columns:
-            frame[column] = frame[column].map({1: "yes", 0: "no", True: "yes", False: "no"}).fillna(frame[column])
-    return frame
+    return pd.DataFrame([micro_run_record_view(row, lang=lang) for row in rows])
 
 
 def render_micro_strategy_page() -> None:
@@ -7568,27 +7740,6 @@ def render_micro_strategy_page() -> None:
         ),
         lookback_bars=8,
     )
-    save_micro_strategy_run(
-        goal=goal,
-        config=config,
-        decision=decision,
-        budget_check=budget_check,
-        backtest=backtest,
-    )
-    push_runtime_event(
-        "micro_strategy",
-        "Micro Strategy",
-        "Sync Bus",
-        f"{config.symbol} {decision.get('action')} run saved",
-        {
-            "symbol": config.symbol,
-            "action": decision.get("action"),
-            "budget_ok": budget_check.get("ok"),
-            "trade_count": (backtest.get("summary") or {}).get("trade_count"),
-        },
-    )
-    st.success(t("micro_saved"))
-
     operator_brief = micro_operator_brief(
         decision,
         budget_check,
@@ -7597,14 +7748,38 @@ def render_micro_strategy_page() -> None:
         data_source=actual_data_source,
         symbol=config.symbol,
     )
+    save_micro_strategy_run(
+        goal=goal,
+        config=config,
+        decision=decision,
+        budget_check=budget_check,
+        backtest=backtest,
+        operator_brief=operator_brief,
+        data_source=actual_data_source,
+    )
+    push_runtime_event(
+        "micro_strategy",
+        "Micro Strategy",
+        "Sync Bus",
+        f"{config.symbol} {operator_brief.get('recommendation')} run saved",
+        {
+            "symbol": config.symbol,
+            "recommendation": operator_brief.get("recommendation"),
+            "action": decision.get("action"),
+            "budget_ok": budget_check.get("ok"),
+            "trade_count": (backtest.get("summary") or {}).get("trade_count"),
+        },
+    )
+    st.success(t("micro_saved"))
+
     st.markdown(f"#### {t('micro_operator_brief')}")
     st.info(operator_brief["headline"])
     brief_cols = st.columns(6)
     brief_cols[0].metric(t("micro_operator_recommendation"), operator_brief["recommendation"])
-    brief_cols[1].metric(t("micro_trade_direction"), operator_brief["action"])
-    brief_cols[2].metric("Confidence", f"{operator_brief['confidence']:.0%}")
+    brief_cols[1].metric(t("micro_trade_direction"), operator_brief["action_label"])
+    brief_cols[2].metric("置信度" if current_lang() == "zh" else "Confidence", f"{operator_brief['confidence']:.0%}")
     brief_cols[3].metric(t("micro_paper_return"), f"{operator_brief['total_pnl']:+.5f}")
-    brief_cols[4].metric("Trades", int(operator_brief["trade_count"]))
+    brief_cols[4].metric("回测次数" if current_lang() == "zh" else "Trades", int(operator_brief["trade_count"]))
     brief_cols[5].metric(t("micro_data_quality"), operator_brief["data_quality"])
 
     info_cols = st.columns([0.34, 0.33, 0.33])
@@ -7614,7 +7789,32 @@ def render_micro_strategy_page() -> None:
             st.markdown(f"- `{item}`")
     with info_cols[1]:
         st.markdown(f"##### {t('micro_evidence')}")
-        evidence_rows = [{"signal": key, "value": value} for key, value in operator_brief["evidence"].items()]
+        evidence_names = (
+            {
+                "momentum_3_pct": "最近3根动量%",
+                "momentum_7_pct": "最近7根动量%",
+                "volatility_pct": "波动率%",
+                "gross_edge_pct": "扣成本后优势%",
+                "short_ema": "短均线",
+                "long_ema": "长均线",
+            }
+            if current_lang() == "zh"
+            else {
+                "momentum_3_pct": "3-bar Momentum %",
+                "momentum_7_pct": "7-bar Momentum %",
+                "volatility_pct": "Volatility %",
+                "gross_edge_pct": "Cost-adjusted Edge %",
+                "short_ema": "Short EMA",
+                "long_ema": "Long EMA",
+            }
+        )
+        evidence_rows = [
+            {
+                ("指标" if current_lang() == "zh" else "Signal"): evidence_names.get(key, key),
+                ("数值" if current_lang() == "zh" else "Value"): value,
+            }
+            for key, value in operator_brief["evidence"].items()
+        ]
         st.dataframe(evidence_rows, width="stretch", hide_index=True, height=248)
     with info_cols[2]:
         st.markdown(f"##### {t('micro_next_steps')}")
@@ -7623,22 +7823,22 @@ def render_micro_strategy_page() -> None:
 
     st.markdown(f"#### {t('micro_decision')}")
     cols = st.columns(5)
-    cols[0].metric("Action", str(decision.get("action")))
-    cols[1].metric("Confidence", f"{float(decision.get('confidence') or 0):.0%}")
-    cols[2].metric("Volatility", f"{float(decision.get('volatility_pct') or 0):.3f}%")
-    cols[3].metric("Budget", str(budget_check.get("reason")))
-    cols[4].metric("Bars", len(frame))
-    with st.expander("Raw decision payload", expanded=False):
+    cols[0].metric("方向" if current_lang() == "zh" else "Direction", micro_action_label(decision.get("action")))
+    cols[1].metric("置信度" if current_lang() == "zh" else "Confidence", f"{float(decision.get('confidence') or 0):.0%}")
+    cols[2].metric("波动率" if current_lang() == "zh" else "Volatility", f"{float(decision.get('volatility_pct') or 0):.3f}%")
+    cols[3].metric("预算" if current_lang() == "zh" else "Budget", micro_budget_reason_label(budget_check.get("reason")))
+    cols[4].metric("数据条数" if current_lang() == "zh" else "Bars", len(frame))
+    with st.expander("原始数据（排错用）" if current_lang() == "zh" else "Raw Data For Debugging", expanded=False):
         st.json({"decision": decision, "budget_guard": budget_check})
 
     st.markdown(f"#### {t('micro_backtest')}")
     summary = backtest.get("summary") or {}
     backtest_cols = st.columns(5)
-    backtest_cols[0].metric("Trades", int(summary.get("trade_count") or 0))
-    backtest_cols[1].metric("Win Rate", "N/A" if summary.get("win_rate") is None else f"{float(summary['win_rate']):.0%}")
-    backtest_cols[2].metric("PnL", f"{float(summary.get('total_pnl') or 0):+.5f}")
-    backtest_cols[3].metric("Equity", f"{float(summary.get('ending_equity') or 100):.5f}")
-    backtest_cols[4].metric("Halt", str(summary.get("halt_reason") or "none"))
+    backtest_cols[0].metric("回测次数" if current_lang() == "zh" else "Trades", int(summary.get("trade_count") or 0))
+    backtest_cols[1].metric("胜率" if current_lang() == "zh" else "Win Rate", "N/A" if summary.get("win_rate") is None else f"{float(summary['win_rate']):.0%}")
+    backtest_cols[2].metric("盈亏" if current_lang() == "zh" else "P/L", f"{float(summary.get('total_pnl') or 0):+.5f}")
+    backtest_cols[3].metric("权益" if current_lang() == "zh" else "Equity", f"{float(summary.get('ending_equity') or 100):.5f}")
+    backtest_cols[4].metric("熔断" if current_lang() == "zh" else "Halt", micro_halt_reason_label(summary.get("halt_reason")))
     trades = backtest.get("trades") or []
     trade_table = micro_trades_table(trades)
     if not trade_table.empty:
