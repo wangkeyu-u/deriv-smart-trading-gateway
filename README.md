@@ -2,7 +2,7 @@
 
 An AI-native trading gateway for Deriv that combines a native desktop shell, a FastMCP tool server, a LangGraph-powered advisor council, and a fast micro-strategy engine for short-horizon decision support.
 
-![Deriv Smart Trading Gateway advisor council](docs/assets/advisor-council-screenshot.png)
+![Deriv Smart Trading Gateway operator workspace](docs/assets/operator-workspace-preview.png)
 
 ## What It Is
 
@@ -28,7 +28,7 @@ The project is moving toward a **native desktop operator app** with background r
 - **Trading-desk safety panel** that makes token, human-confirmation, live-execution, and pending-order state visible before execution.
 - **Native desktop shell** through PySide6 with system health, background tray behavior, and micro-strategy analysis.
 - **Micro trading strategy engine** for small, frequent paper-trade decisions using momentum, EMA separation, volatility, cost edge, and risk limits.
-- **Paper trading workbench** for the micro strategy module with budget checks, trade logs, win rate, PnL, equity, and circuit-breaker halts.
+- **Paper trading workbench** for the micro strategy module with persisted strategy runs, budget checks, trade logs, win rate, PnL, equity, and circuit-breaker halts.
 - **Advisor-to-trade draft bridge** that can turn a `CALL` or `PUT` advisor result into a pending trade draft without submitting an order.
 - **Audit export** for the current decision chain, excluding API tokens.
 - **Local audit trail** for team runs, advisor decisions, role dialogue, API traces, and trade receipts.
@@ -65,11 +65,15 @@ Deriv WebSocket API
 ├── agent_prompts.json              # Editable prompt registry for manager, workers, and advisors
 ├── advisor_evaluation.py           # Paper evaluation logic for advisor outcomes and horizons
 ├── desktop_app.py                  # Native PySide6 desktop shell
+├── desktop_packaging_requirements.txt # Optional PyInstaller dependency set
 ├── desktop_requirements.txt        # Optional desktop UI dependency set
 ├── docs/assets/                    # README and project media
 ├── mcp_config.json                 # MCP client configuration
 ├── micro_trading.py                # Small-trade strategy analysis engine
+├── packaging/pyinstaller/          # Desktop app packaging spec
+├── paper_trading.py                # Paper-trading backtest and circuit-breaker utilities
 ├── requirements.txt                # Python dependencies
+├── scripts/build_desktop_app.sh     # macOS desktop build helper
 ├── server.py                       # FastMCP server with Deriv WebSocket tools
 ├── smoke_test.py                   # End-to-end runtime smoke checks
 ├── tests/                          # Pytest coverage for parsing, safety, prompts, and LangGraph
@@ -102,6 +106,16 @@ Current desktop modules:
 - **Micro Strategy**: quick small-trade analysis from recent closes for Deriv, funds, equities, crypto, or forex-style instruments. This module has its own small-budget guard and does not change the general trading desk behavior.
 - **Background**: close-to-tray behavior where supported.
 
+Build a macOS desktop app bundle:
+
+```bash
+cd /Users/wangkeyu/Documents/项目
+scripts/build_desktop_app.sh
+open "dist/Deriv Smart Trading Gateway.app"
+```
+
+The build script installs the regular runtime, desktop UI dependencies, and PyInstaller packaging dependencies into `.venv`, then creates a local app bundle under `dist/`.
+
 ## Streamlit Operator Console
 
 The Streamlit UI remains available as a full operator console and is organized into focused pages:
@@ -120,7 +134,7 @@ The Trading Desk also surfaces the execution safety gate as a compact panel, whi
 
 ## Micro Strategy And Paper Trading
 
-The micro strategy module is separate from the main trading desk. It can analyze recent closes, apply a small-budget guard, run paper-trading backtests, and halt simulations through circuit breakers such as consecutive losses, total loss, drawdown, or trade-count limits.
+The micro strategy module is separate from the main trading desk. It can analyze recent closes, apply a small-budget guard, run paper-trading backtests, persist recent strategy runs, and halt simulations through circuit breakers such as consecutive losses, total loss, drawdown, or trade-count limits.
 
 This module is intentionally non-executing by default. It produces analysis, paper results, and risk context; it does not bypass the trading desk, human confirmation, or MCP execution safety model.
 
@@ -238,7 +252,7 @@ The app stores run history and audit records in a local SQLite database:
 local_data/gateway.sqlite3
 ```
 
-Stored records include team runs, advisor runs, role dialogue, API traces, execution logs, and trade receipts. API keys are not written to this database.
+Stored records include team runs, advisor runs, micro-strategy runs, role dialogue, API traces, execution logs, and trade receipts. API keys are not written to this database.
 
 ## Model Providers
 

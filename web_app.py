@@ -313,10 +313,13 @@ I18N = {
         "micro_max_losses": "连续亏损上限",
         "micro_max_loss_amount": "最大亏损金额",
         "micro_max_drawdown": "最大回撤 %",
+        "micro_max_trades": "最大纸面交易数",
         "micro_run": "运行分析和回测",
         "micro_decision": "当前信号",
         "micro_backtest": "Paper Trading 回测",
         "micro_no_trade": "当前预算或熔断条件不允许交易。",
+        "micro_recent_runs": "最近小笔策略记录",
+        "micro_saved": "已保存本轮小笔策略记录",
     },
     "en": {
         "sidebar_title": "Deriv Gateway",
@@ -536,10 +539,13 @@ I18N = {
         "micro_max_losses": "Max Loss Streak",
         "micro_max_loss_amount": "Max Loss Amount",
         "micro_max_drawdown": "Max Drawdown %",
+        "micro_max_trades": "Max Paper Trades",
         "micro_run": "Run Analysis & Backtest",
         "micro_decision": "Current Signal",
         "micro_backtest": "Paper Trading Backtest",
         "micro_no_trade": "Budget or circuit conditions do not allow a trade.",
+        "micro_recent_runs": "Recent Micro Strategy Runs",
+        "micro_saved": "Saved this micro strategy run",
     },
 }
 
@@ -1098,6 +1104,24 @@ def init_local_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS micro_strategy_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                goal TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                asset_kind TEXT NOT NULL,
+                action TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                budget_ok INTEGER NOT NULL,
+                trade_count INTEGER NOT NULL,
+                total_pnl REAL NOT NULL,
+                halted INTEGER NOT NULL,
+                run_json TEXT NOT NULL
+            )
+            """
+        )
 
 
 def save_team_run(user_prompt: str, result: TeamRunResult) -> None:
@@ -1225,6 +1249,76 @@ def load_advisor_run_records(limit: int = 12) -> list[dict[str, Any]]:
         record["result"] = payload if isinstance(payload, dict) else {}
         records.append(record)
     return records
+
+
+def save_micro_strategy_run(
+    *,
+    goal: str,
+    config: MicroTradeConfig,
+    decision: dict[str, Any],
+    budget_check: dict[str, Any],
+    backtest: dict[str, Any],
+) -> None:
+    init_local_db()
+    summary = backtest.get("summary") or {}
+    payload = {
+        "goal": goal,
+        "config": {
+            "symbol": config.symbol,
+            "asset_kind": config.asset_kind,
+            "cadence_seconds": config.cadence_seconds,
+            "max_trade_amount": config.max_trade_amount,
+            "min_confidence": config.min_confidence,
+            "max_volatility_pct": config.max_volatility_pct,
+            "fee_bps": config.fee_bps,
+            "slippage_bps": config.slippage_bps,
+            "cooldown_seconds": config.cooldown_seconds,
+            "max_daily_loss_pct": config.max_daily_loss_pct,
+        },
+        "decision": decision,
+        "budget_guard": budget_check,
+        "backtest": backtest,
+    }
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO micro_strategy_runs (
+                created_at, goal, symbol, asset_kind, action, confidence,
+                budget_ok, trade_count, total_pnl, halted, run_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now(timezone.utc).isoformat(),
+                goal,
+                config.symbol,
+                config.asset_kind,
+                str(decision.get("action") or ""),
+                float(decision.get("confidence") or 0),
+                1 if budget_check.get("ok") else 0,
+                int(summary.get("trade_count") or 0),
+                float(summary.get("total_pnl") or 0),
+                1 if summary.get("halted") else 0,
+                json.dumps(payload, ensure_ascii=False, default=str),
+            ),
+        )
+
+
+def load_recent_micro_strategy_runs(limit: int = 8) -> list[dict[str, Any]]:
+    init_local_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT
+                id, created_at, goal, symbol, asset_kind, action, confidence,
+                budget_ok, trade_count, total_pnl, halted
+            FROM micro_strategy_runs
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 SYSTEM_PROMPT = """
@@ -7066,10 +7160,14 @@ def render_micro_strategy_page() -> None:
         max_losses = circuit_cols[0].number_input(t("micro_max_losses"), min_value=1, max_value=10, value=3, step=1)
         max_loss_amount = circuit_cols[1].number_input(t("micro_max_loss_amount"), min_value=0.1, max_value=100.0, value=2.0, step=0.25)
         max_drawdown = circuit_cols[2].number_input(t("micro_max_drawdown"), min_value=0.1, max_value=50.0, value=3.0, step=0.25)
-        max_trades = circuit_cols[3].number_input("Max Trades", min_value=1, max_value=200, value=30, step=1)
+        max_trades = circuit_cols[3].number_input(t("micro_max_trades"), min_value=1, max_value=200, value=30, step=1)
         run_clicked = st.button(t("micro_run"), type="primary", width="stretch")
 
     if not run_clicked:
+        recent_runs = load_recent_micro_strategy_runs()
+        if recent_runs:
+            st.markdown(f"#### {t('micro_recent_runs')}")
+            st.dataframe(recent_runs, width="stretch", height=min(340, 72 + len(recent_runs) * 32))
         return
 
     frame = micro_price_frame_from_text(prices_text)
@@ -7107,6 +7205,14 @@ def render_micro_strategy_page() -> None:
         ),
         lookback_bars=8,
     )
+    save_micro_strategy_run(
+        goal=goal,
+        config=config,
+        decision=decision,
+        budget_check=budget_check,
+        backtest=backtest,
+    )
+    st.success(t("micro_saved"))
 
     st.markdown(f"#### {t('micro_decision')}")
     cols = st.columns(5)
@@ -7130,6 +7236,11 @@ def render_micro_strategy_page() -> None:
         st.dataframe(trades, width="stretch", height=min(320, 72 + len(trades) * 32))
     else:
         st.info(t("micro_no_trade"))
+
+    recent_runs = load_recent_micro_strategy_runs()
+    if recent_runs:
+        st.markdown(f"#### {t('micro_recent_runs')}")
+        st.dataframe(recent_runs, width="stretch", height=min(340, 72 + len(recent_runs) * 32))
 
 
 def render_trading_page() -> None:
