@@ -28,6 +28,7 @@ The project is moving toward a **native desktop operator app** with background r
 - **Trading-desk safety panel** that makes token, human-confirmation, live-execution, and pending-order state visible before execution.
 - **Native desktop shell** through PySide6 with system health, background tray behavior, and micro-strategy analysis.
 - **Micro trading strategy engine** for small, frequent paper-trade decisions using momentum, EMA separation, volatility, cost edge, and risk limits.
+- **Paper trading workbench** for the micro strategy module with budget checks, trade logs, win rate, PnL, equity, and circuit-breaker halts.
 - **Advisor-to-trade draft bridge** that can turn a `CALL` or `PUT` advisor result into a pending trade draft without submitting an order.
 - **Audit export** for the current decision chain, excluding API tokens.
 - **Local audit trail** for team runs, advisor decisions, role dialogue, API traces, and trade receipts.
@@ -106,6 +107,7 @@ Current desktop modules:
 The Streamlit UI remains available as a full operator console and is organized into focused pages:
 
 - **Advisor Room**: advisor council, source review, transcripts, and paper evaluation.
+- **Micro Strategy**: standalone small-budget strategy lab with budget checks, paper trading, and circuit breakers.
 - **Trading Desk**: natural-language trading manager, direct agent dispatch, and execution log.
 - **Charts**: candle snapshots, comparison overlays, measurement, data export, and latest ticks.
 - **Monitor**: live agent graph, agent roster, sync bus, and API trace.
@@ -115,6 +117,12 @@ The console uses a terminal-style module navigator with clear route cards for ea
 Every page shares one global status strip so the operator can see current symbol, latest advisor stance, entry reference, API call count, sync version, and pending-trade state without switching context.
 
 The Trading Desk also surfaces the execution safety gate as a compact panel, while Charts can overlay the latest matching advisor reference price on the active candlestick view.
+
+## Micro Strategy And Paper Trading
+
+The micro strategy module is separate from the main trading desk. It can analyze recent closes, apply a small-budget guard, run paper-trading backtests, and halt simulations through circuit breakers such as consecutive losses, total loss, drawdown, or trade-count limits.
+
+This module is intentionally non-executing by default. It produces analysis, paper results, and risk context; it does not bypass the trading desk, human confirmation, or MCP execution safety model.
 
 ## Streamlit Quick Start
 

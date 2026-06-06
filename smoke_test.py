@@ -14,6 +14,7 @@ from typing import Any
 import web_app
 from budget_guard import BudgetLimits, budget_guard_check
 from micro_trading import MicroTradeConfig, analyze_micro_trade
+from paper_trading import CircuitBreakerConfig, backtest_micro_strategy
 from server import get_historical_candles, get_market_ticks
 
 
@@ -99,6 +100,18 @@ def check_budget_guard() -> None:
     print("budget_guard: OK")
 
 
+def check_paper_trading() -> None:
+    result = backtest_micro_strategy(
+        [{"close": value} for value in [100, 100.03, 100.06, 100.1, 100.15, 100.22, 100.3, 100.39, 100.49]],
+        MicroTradeConfig(symbol="R_75", min_confidence=0.5, max_volatility_pct=5.0),
+        CircuitBreakerConfig(max_trade_count=3),
+        lookback_bars=8,
+    )
+    assert_true(result.get("ok") is True, "paper trading backtest failed")
+    assert_true("summary" in result, "paper trading summary missing")
+    print("paper_trading: OK")
+
+
 async def check_deriv_market_tools() -> None:
     tick = json.loads(await get_market_ticks("R_75", False))
     candles = json.loads(await get_historical_candles("R_75", 60, 5))
@@ -133,6 +146,7 @@ async def main() -> None:
     check_langgraph_compile()
     check_micro_trading_engine()
     check_budget_guard()
+    check_paper_trading()
     await check_deriv_market_tools()
     result = check_advisor_runtime()
     print(
