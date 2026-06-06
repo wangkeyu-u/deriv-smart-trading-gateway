@@ -41,3 +41,20 @@ def test_safe_agent_id_and_node_name() -> None:
     assert web_app.safe_agent_id("Breakout Master!") == "breakout_master"
     assert web_app.safe_agent_id("   ") == "custom"
     assert web_app.advisor_node_name("Breakout Master!") == "advisor_breakout_master"
+
+
+def test_agent_ai_brief_is_disabled_outside_streamlit_runtime() -> None:
+    report: dict[str, object] = {}
+    events: list[web_app.AgentEvent] = []
+
+    result = web_app.attach_agent_ai_brief(
+        report,
+        "market",
+        task="检查 R_100",
+        context={"symbol": "R_100"},
+        events=events,
+    )
+
+    assert result["ai_enabled"] is False
+    assert "ai_brief" not in result
+    assert events == []

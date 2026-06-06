@@ -146,7 +146,7 @@ I18N = {
         "api_trace": "API 调用 Trace",
         "sync_version": "同步版本",
         "chat_title": "交易经理指令台",
-        "chat_caption": "输入自然语言目标，经理会自动派活给两个子 Agent。",
+        "chat_caption": "输入自然语言目标；经理用大模型决策派活，每个子 Agent 会用自己的 prompt 和模型 Key 产出判断。",
         "command_title": "交易指令工作台",
         "command_hint": "Enter 只用于中文输入法确认或换行；点击发送按钮才会提交。",
         "send": "发送指令",
@@ -405,7 +405,7 @@ I18N = {
         "api_trace": "API Trace",
         "sync_version": "Sync Version",
         "chat_title": "Trading Manager Console",
-        "chat_caption": "Enter a natural-language goal; the manager delegates work to two sub-agents.",
+        "chat_caption": "Enter a natural-language goal; the manager uses the model to delegate work, and each sub-agent uses its own prompt plus your model key for judgment.",
         "command_title": "Order Command Pad",
         "command_hint": "Enter only confirms IME text or inserts a new line; click Send to submit.",
         "send": "Send Order",
@@ -2826,6 +2826,7 @@ def has_trade_intent(text: str) -> bool:
         "建仓",
         "开仓",
         "平仓",
+        "买",
         "买入",
         "交易",
         "买涨",
@@ -2860,6 +2861,9 @@ def normalize_deriv_symbol(symbol: str) -> str:
     if not raw:
         return DEFAULT_SYMBOL
     upper = raw.upper()
+    compact_volatility = re.fullmatch(r"R(\d+)", upper)
+    if compact_volatility:
+        return f"R_{compact_volatility.group(1)}"
     if upper == "STPRNG":
         return "stpRNG"
     if upper.startswith("FRX") and len(upper) == 9:
@@ -2883,7 +2887,7 @@ def chart_granularity_label(seconds: int) -> str:
 
 def extract_symbol(text: str) -> str:
     symbol_match = re.search(
-        r"\b(?:R_\d+|1HZ\d+V|BOOM\d+|CRASH\d+|JD\d+|RDBULL|RDBEAR|stpRNG|frx[A-Za-z]{6})\b",
+        r"\b(?:R_?\d+|1HZ\d+V|BOOM\d+|CRASH\d+|JD\d+|RDBULL|RDBEAR|stpRNG|frx[A-Za-z]{6})\b",
         text,
         flags=re.IGNORECASE,
     )
@@ -3335,6 +3339,100 @@ Symbol: {symbol}
     except Exception:
         return None
     return None
+
+
+def llm_provider_ready() -> bool:
+    if not in_streamlit_runtime():
+        return False
+    provider: Provider = st.session_state.llm_provider
+    if provider == "本地规则" or not st.session_state.llm_api_key:
+        return False
+    if provider == "OpenAI-Compatible" and not st.session_state.custom_base_url.strip():
+        return False
+    return True
+
+
+def agent_ai_brief(
+    agent_id: str,
+    *,
+    task: str,
+    context: dict[str, Any],
+    max_tokens: int = 220,
+) -> str | None:
+    if not llm_provider_ready():
+        return None
+    provider: Provider = st.session_state.llm_provider
+    prompt = f"""
+你是一个多 Agent 交易系统里的独立子 Agent。
+你的身份 prompt：
+{agent_prompt(agent_id)}
+
+请只基于给定上下文输出你的专业结论。
+要求：
+- 用中文，80-160 字。
+- 说清楚你看到的数据、你的判断、下一步。
+- 如果是执行/风控/合规相关，不允许建议绕过人工确认、Token 检查、demo/live 安全边界。
+- 不要输出 Markdown 表格，不要输出隐藏推理。
+
+任务: {task}
+上下文 JSON:
+{json.dumps(context, ensure_ascii=False, default=str)[:4000]}
+""".strip()
+    try:
+        if provider in {"OpenAI", "DeepSeek", "OpenAI-Compatible"}:
+            from openai import OpenAI
+
+            base_url = OPENAI_COMPATIBLE_BASE_URLS.get(provider)
+            if provider == "OpenAI-Compatible":
+                base_url = st.session_state.custom_base_url.strip() or None
+            kwargs: dict[str, Any] = {"api_key": st.session_state.llm_api_key, "timeout": 8.0}
+            if base_url:
+                kwargs["base_url"] = base_url
+            client = OpenAI(**kwargs)
+            response = client.chat.completions.create(
+                model=st.session_state.llm_model,
+                messages=[
+                    {"role": "system", "content": "你是交易系统里的专业子 Agent，只输出可审计的中文行动结论。"},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.15,
+                max_tokens=max_tokens,
+            )
+            return (response.choices[0].message.content or "").strip() or None
+        if provider == "Anthropic":
+            from anthropic import Anthropic
+
+            client = Anthropic(api_key=st.session_state.llm_api_key, timeout=8.0)
+            response = client.messages.create(
+                model=st.session_state.llm_model,
+                max_tokens=max_tokens,
+                temperature=0.15,
+                system="你是交易系统里的专业子 Agent，只输出可审计的中文行动结论。",
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return "\n".join(
+                block.text for block in response.content if getattr(block, "type", None) == "text"
+            ).strip() or None
+    except Exception as exc:
+        return f"AI 子 Agent 调用失败，已使用本地安全逻辑兜底：{exc}"
+    return None
+
+
+def attach_agent_ai_brief(
+    report: dict[str, Any],
+    agent_id: str,
+    *,
+    task: str,
+    context: dict[str, Any],
+    events: list[AgentEvent],
+    writer: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    brief = agent_ai_brief(agent_id, task=task, context=context)
+    report["ai_enabled"] = llm_provider_ready()
+    if brief:
+        report["ai_brief"] = brief
+        append_team_event(events, agent_name(agent_id), "经理", f"AI判断：{brief}", writer)
+    return report
 
 
 def advisor_langgraph_available() -> bool:
@@ -3956,6 +4054,14 @@ def market_analyst_agent(
         )
     report["summary"] = summary
     append_team_event(events, "行情分析师", "经理", summary, writer)
+    attach_agent_ai_brief(
+        report,
+        "market",
+        task=task,
+        context={"symbol": symbol, "tick_analysis": tick_analysis, "candle_result": candle_result},
+        events=events,
+        writer=writer,
+    )
     remember_agent_report("market", report)
     return report
 
@@ -3984,6 +4090,14 @@ def strategy_agent(
         f"我把目标拆成 5 步：先看 {symbol} 行情，再做风控和合规检查，条件满足才交给执行交易员。"
     )
     append_team_event(events, "策略研究员", "经理", summary, writer)
+    attach_agent_ai_brief(
+        plan,
+        "strategy",
+        task=task,
+        context={"symbol": symbol, "market": market, "local_plan": plan},
+        events=events,
+        writer=writer,
+    )
     remember_agent_report("strategy", plan)
     return plan
 
@@ -4005,6 +4119,14 @@ def risk_sentinel_agent(
             "reason": "missing_deriv_api_token",
         }
         append_team_event(events, "风控官", "经理", "我无法检查账户：还没有配置 Deriv API Token。", writer)
+        attach_agent_ai_brief(
+            report,
+            "risk",
+            task=task,
+            context={"symbol": symbol, "amount": amount, "risk_status": report},
+            events=events,
+            writer=writer,
+        )
         remember_agent_report("risk", report)
         return report
     account_result = call_deriv_tool(
@@ -4022,6 +4144,14 @@ def risk_sentinel_agent(
         "status": "cleared" if account_result.get("ok") else "blocked",
     }
     append_team_event(events, "风控官", "经理", "账户检查完成。若金额和方向明确，可进入合规审查和执行。", writer)
+    attach_agent_ai_brief(
+        report,
+        "risk",
+        task=task,
+        context={"symbol": symbol, "amount": amount, "account_result": account_result, "risk_status": report},
+        events=events,
+        writer=writer,
+    )
     remember_agent_report("risk", report)
     return report
 
@@ -4053,6 +4183,14 @@ def compliance_agent(
     else:
         summary = "合规检查通过：指令边界清楚，可以继续。"
     append_team_event(events, "合规审查员", "经理", summary, writer)
+    attach_agent_ai_brief(
+        report,
+        "compliance",
+        task=task,
+        context={"amount": amount, "contract_type": contract_type, "local_compliance": report},
+        events=events,
+        writer=writer,
+    )
     remember_agent_report("compliance", report)
     return report
 
@@ -4092,6 +4230,14 @@ def chart_engineer_agent(
         else f"图表生成失败：{(result.get('error') or {}).get('message', 'unknown error')}",
         writer,
     )
+    attach_agent_ai_brief(
+        report,
+        "chart",
+        task=task,
+        context={"symbol": symbol, "granularity": granularity, "count": count, "chart_result": result},
+        events=events,
+        writer=writer,
+    )
     remember_agent_report("chart", report)
     return report
 
@@ -4111,6 +4257,14 @@ def report_agent(
         "chart_snapshots": len(st.session_state.chart_snapshots),
         "latest_receipt": ((st.session_state.last_trade_receipt or {}).get("data") or {}).get("receipt"),
     }
+    attach_agent_ai_brief(
+        report,
+        "report",
+        task=task,
+        context={"events": [event.line() for event in events], "report": report},
+        events=events,
+        writer=writer,
+    )
     append_team_event(events, "报告员", "经理", "我已整理执行时间线、活跃 Agent 和本地可审计记录。", writer)
     remember_agent_report("report", report)
     return report
@@ -4153,6 +4307,22 @@ def execution_agent(
             "无法执行：左侧未配置 Deriv API Token。请使用 demo token 后再下单。",
             writer,
         )
+        attach_agent_ai_brief(
+            report,
+            "execution",
+            task=task,
+            context={
+                "symbol": symbol,
+                "amount": amount,
+                "contract_type": contract_type,
+                "duration": duration,
+                "duration_unit": duration_unit,
+                "execution_status": report,
+            },
+            events=events,
+            writer=writer,
+        )
+        remember_agent_report("execution", report)
         return report
 
     close_intent = has_close_intent(task)
@@ -4177,6 +4347,14 @@ def execution_agent(
             "pending_trade": pending,
         }
         append_team_event(events, "执行交易员", "经理", "已拦截写操作：需要老板在侧边栏确认下一笔订单。", writer)
+        attach_agent_ai_brief(
+            report,
+            "execution",
+            task=task,
+            context={"pending_trade": pending, "execution_status": report},
+            events=events,
+            writer=writer,
+        )
         remember_agent_report("execution", report)
         return report
 
@@ -4197,6 +4375,14 @@ def execution_agent(
             "account": account_result.get("data"),
         }
         append_team_event(events, "执行交易员", "经理", "已拦截 live 账户写操作：默认只允许 demo token。", writer)
+        attach_agent_ai_brief(
+            report,
+            "execution",
+            task=task,
+            context={"pending_trade": pending, "account_result": account_result, "execution_status": report},
+            events=events,
+            writer=writer,
+        )
         remember_agent_report("execution", report)
         return report
 
@@ -4218,6 +4404,14 @@ def execution_agent(
                 "open_contract_status": status_result.get("data"),
             }
             append_team_event(events, "执行交易员", "经理", "平仓需要明确 contract_id。我已读取持仓状态供老板选择。", writer)
+            attach_agent_ai_brief(
+                report,
+                "execution",
+                task=task,
+                context={"pending_trade": pending, "account_result": account_result, "open_contract_status": status_result},
+                events=events,
+                writer=writer,
+            )
             remember_agent_report("execution", report)
             return report
         receipt_result = call_deriv_tool(
@@ -4285,6 +4479,14 @@ def execution_agent(
             ),
             writer,
         )
+        attach_agent_ai_brief(
+            report,
+            "execution",
+            task=task,
+            context={"pending_trade": pending, "account_result": account_result, "receipt_result": receipt_result},
+            events=events,
+            writer=writer,
+        )
         remember_agent_report("execution", report)
         return report
 
@@ -4297,6 +4499,14 @@ def execution_agent(
         "error": error_message,
     }
     append_team_event(events, "执行交易员", "经理", f"下单失败：{error_message}", writer)
+    attach_agent_ai_brief(
+        report,
+        "execution",
+        task=task,
+        context={"pending_trade": pending, "account_result": account_result, "receipt_result": receipt_result},
+        events=events,
+        writer=writer,
+    )
     remember_agent_report("execution", report)
     return report
 
