@@ -185,8 +185,15 @@ def test_system_health_snapshot_checks_local_runtime_without_requiring_token() -
     )
 
     assert snapshot["checks"]["db"]["ok"] is True
+    assert snapshot["checks"]["db"]["detail"] == "sqlite ready"
+    assert "/Users/" not in str(snapshot["checks"]["db"])
     assert snapshot["checks"]["langgraph"]["ok"] is True
     assert snapshot["checks"]["token"]["ok"] is False
     assert snapshot["ok"] is True
     assert snapshot["api_trace_count"] == 1
     assert snapshot["runtime_event_count"] == 1
+
+
+def test_display_local_path_avoids_absolute_user_paths() -> None:
+    assert web_app.display_local_path(web_app.DB_PATH) == "local_data/gateway.sqlite3"
+    assert "/Users/" not in web_app.display_local_path(web_app.DB_PATH)
