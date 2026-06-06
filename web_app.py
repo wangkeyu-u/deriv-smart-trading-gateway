@@ -39,6 +39,9 @@ from advisor_evaluation import (
     summarize_advisor_evaluations,
     summarize_advisor_performance,
 )
+from budget_guard import BudgetLimits, budget_guard_check
+from micro_trading import MicroTradeConfig, analyze_micro_trade, normalize_price_frame
+from paper_trading import CircuitBreakerConfig, backtest_micro_strategy
 from server import (
     check_account_status,
     close_open_contract,
@@ -239,10 +242,12 @@ I18N = {
         "advisor_horizon_scores": "多窗口评分",
         "workspace": "工作台",
         "page_advisor": "谋士室",
+        "page_micro": "小笔策略",
         "page_trading": "交易台",
         "page_charts": "图表",
         "page_monitor": "监控",
         "page_advisor_caption": "限时谋士讨论、网页/行情分析和多窗口纸面复盘。",
+        "page_micro_caption": "小额频繁策略、预算闸门、paper trading 回测和熔断器。",
         "page_trading_caption": "交易经理调度执行团队，处理自然语言交易任务和人工确认。",
         "page_charts_caption": "K 线快照、对比走势、测量和最新 Tick。",
         "page_monitor_caption": "Agent 图谱、角色状态、API trace 和同步总线。",
@@ -292,6 +297,26 @@ I18N = {
         "health_langgraph": "LangGraph",
         "health_token": "Token",
         "health_pending": "待确认",
+        "micro_strategy": "小笔频繁策略",
+        "micro_strategy_caption": "独立策略实验室：只做分析、回测和预算检查，不影响普通交易台。",
+        "micro_goal": "策略目标",
+        "micro_symbol": "资产 / Symbol",
+        "micro_asset_kind": "资产类型",
+        "micro_prices": "近期收盘价",
+        "micro_budget": "小笔预算",
+        "micro_amount": "单次金额",
+        "micro_daily_budget": "日预算",
+        "micro_total_budget": "总预算",
+        "micro_spent_today": "今日已用",
+        "micro_spent_total": "总已用",
+        "micro_circuit": "熔断器",
+        "micro_max_losses": "连续亏损上限",
+        "micro_max_loss_amount": "最大亏损金额",
+        "micro_max_drawdown": "最大回撤 %",
+        "micro_run": "运行分析和回测",
+        "micro_decision": "当前信号",
+        "micro_backtest": "Paper Trading 回测",
+        "micro_no_trade": "当前预算或熔断条件不允许交易。",
     },
     "en": {
         "sidebar_title": "Deriv Gateway",
@@ -440,10 +465,12 @@ I18N = {
         "advisor_horizon_scores": "Horizon Scores",
         "workspace": "Workspace",
         "page_advisor": "Advisor Room",
+        "page_micro": "Micro Strategy",
         "page_trading": "Trading Desk",
         "page_charts": "Charts",
         "page_monitor": "Monitor",
         "page_advisor_caption": "Time-boxed advisor debate, market/web context, and multi-horizon paper evaluation.",
+        "page_micro_caption": "Small-budget frequent strategy, budget guard, paper trading, and circuit breakers.",
         "page_trading_caption": "The trading manager routes natural-language work through the execution team and safety gates.",
         "page_charts_caption": "Candlestick snapshots, comparison overlays, measurement, and latest ticks.",
         "page_monitor_caption": "Agent graph, role state, API traces, and live sync bus.",
@@ -493,6 +520,26 @@ I18N = {
         "health_langgraph": "LangGraph",
         "health_token": "Token",
         "health_pending": "Pending",
+        "micro_strategy": "Micro Strategy",
+        "micro_strategy_caption": "Standalone strategy lab: analysis, paper trading, and budget checks only. It does not change the main trading desk.",
+        "micro_goal": "Strategy Goal",
+        "micro_symbol": "Asset / Symbol",
+        "micro_asset_kind": "Asset Kind",
+        "micro_prices": "Recent Closes",
+        "micro_budget": "Micro Budget",
+        "micro_amount": "Trade Amount",
+        "micro_daily_budget": "Daily Budget",
+        "micro_total_budget": "Total Budget",
+        "micro_spent_today": "Spent Today",
+        "micro_spent_total": "Spent Total",
+        "micro_circuit": "Circuit Breaker",
+        "micro_max_losses": "Max Loss Streak",
+        "micro_max_loss_amount": "Max Loss Amount",
+        "micro_max_drawdown": "Max Drawdown %",
+        "micro_run": "Run Analysis & Backtest",
+        "micro_decision": "Current Signal",
+        "micro_backtest": "Paper Trading Backtest",
+        "micro_no_trade": "Budget or circuit conditions do not allow a trade.",
     },
 }
 
@@ -1810,7 +1857,7 @@ def configure_page() -> None:
         }
         .nav-grid {
             display: grid;
-            grid-template-columns: repeat(4, minmax(0, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
             gap: .55rem;
             margin-bottom: .55rem;
         }
@@ -6914,9 +6961,10 @@ def render_chat() -> None:
         st.session_state.prompt_nonce += 1
 
 
-PAGE_KEYS = ["advisor", "trading", "charts", "monitor"]
+PAGE_KEYS = ["advisor", "micro", "trading", "charts", "monitor"]
 PAGE_NAV_CODES = {
     "advisor": "AD",
+    "micro": "MI",
     "trading": "EX",
     "charts": "CH",
     "monitor": "MO",
@@ -6981,6 +7029,109 @@ def render_advisor_page() -> None:
     render_advisor_council()
 
 
+def default_micro_prices() -> str:
+    return "100,100.03,100.06,100.10,100.15,100.22,100.30,100.39,100.49,100.61,100.74,100.88,101.03,101.19,101.36,101.54"
+
+
+def micro_price_frame_from_text(raw: str) -> pd.DataFrame:
+    values: list[dict[str, float]] = []
+    for chunk in re.split(r"[\n,，\s]+", raw.strip()):
+        if not chunk:
+            continue
+        try:
+            values.append({"close": float(chunk)})
+        except ValueError:
+            continue
+    return normalize_price_frame(values)
+
+
+def render_micro_strategy_page() -> None:
+    st.markdown(f"### {t('micro_strategy')}")
+    st.markdown(f'<p class="small-muted">{html.escape(t("micro_strategy_caption"))}</p>', unsafe_allow_html=True)
+    with st.container(border=True):
+        top = st.columns([0.34, 0.22, 0.2, 0.24])
+        goal = top[0].text_input(t("micro_goal"), value="高频小额交易，先做纸面策略")
+        symbol = top[1].text_input(t("micro_symbol"), value="R_75")
+        asset_kind = top[2].selectbox(t("micro_asset_kind"), ["deriv", "fund", "equity", "crypto", "forex"])
+        trade_amount = top[3].number_input(t("micro_amount"), min_value=0.35, max_value=100.0, value=1.0, step=0.25)
+
+        prices_text = st.text_area(t("micro_prices"), value=default_micro_prices(), height=104)
+        budget_cols = st.columns(4)
+        daily_budget = budget_cols[0].number_input(t("micro_daily_budget"), min_value=0.35, max_value=500.0, value=5.0, step=0.5)
+        total_budget = budget_cols[1].number_input(t("micro_total_budget"), min_value=0.35, max_value=500.0, value=5.0, step=0.5)
+        spent_today = budget_cols[2].number_input(t("micro_spent_today"), min_value=0.0, max_value=500.0, value=0.0, step=0.5)
+        spent_total = budget_cols[3].number_input(t("micro_spent_total"), min_value=0.0, max_value=500.0, value=0.0, step=0.5)
+
+        circuit_cols = st.columns(4)
+        max_losses = circuit_cols[0].number_input(t("micro_max_losses"), min_value=1, max_value=10, value=3, step=1)
+        max_loss_amount = circuit_cols[1].number_input(t("micro_max_loss_amount"), min_value=0.1, max_value=100.0, value=2.0, step=0.25)
+        max_drawdown = circuit_cols[2].number_input(t("micro_max_drawdown"), min_value=0.1, max_value=50.0, value=3.0, step=0.25)
+        max_trades = circuit_cols[3].number_input("Max Trades", min_value=1, max_value=200, value=30, step=1)
+        run_clicked = st.button(t("micro_run"), type="primary", width="stretch")
+
+    if not run_clicked:
+        return
+
+    frame = micro_price_frame_from_text(prices_text)
+    config = MicroTradeConfig(
+        symbol=normalize_deriv_symbol(symbol) if asset_kind == "deriv" else symbol.strip(),
+        asset_kind=asset_kind,  # type: ignore[arg-type]
+        max_trade_amount=float(trade_amount),
+        min_confidence=0.58,
+        max_volatility_pct=2.8 if asset_kind != "fund" else 2.2,
+    )
+    budget_check = budget_guard_check(
+        action="execute_simulated_trade" if asset_kind == "deriv" else "spot_paper_trade",
+        amount=trade_amount,
+        limits=BudgetLimits(
+            max_single_trade_amount=float(trade_amount),
+            max_daily_trade_budget=float(daily_budget),
+            max_total_trade_budget=float(total_budget),
+        ),
+        daily_spent=float(spent_today),
+        total_spent=float(spent_total),
+    )
+    decision = analyze_micro_trade(frame, config)
+    if not budget_check.get("ok"):
+        decision["action"] = "WAIT" if asset_kind == "deriv" else "HOLD"
+        decision["blockers"] = list(decision.get("blockers") or []) + [str(budget_check.get("reason"))]
+
+    backtest = backtest_micro_strategy(
+        frame,
+        config,
+        CircuitBreakerConfig(
+            max_consecutive_losses=int(max_losses),
+            max_total_loss_amount=float(max_loss_amount),
+            max_drawdown_pct=float(max_drawdown),
+            max_trade_count=int(max_trades),
+        ),
+        lookback_bars=8,
+    )
+
+    st.markdown(f"#### {t('micro_decision')}")
+    cols = st.columns(5)
+    cols[0].metric("Action", str(decision.get("action")))
+    cols[1].metric("Confidence", f"{float(decision.get('confidence') or 0):.0%}")
+    cols[2].metric("Volatility", f"{float(decision.get('volatility_pct') or 0):.3f}%")
+    cols[3].metric("Budget", str(budget_check.get("reason")))
+    cols[4].metric("Bars", len(frame))
+    st.json({"decision": decision, "budget_guard": budget_check})
+
+    st.markdown(f"#### {t('micro_backtest')}")
+    summary = backtest.get("summary") or {}
+    backtest_cols = st.columns(5)
+    backtest_cols[0].metric("Trades", int(summary.get("trade_count") or 0))
+    backtest_cols[1].metric("Win Rate", "N/A" if summary.get("win_rate") is None else f"{float(summary['win_rate']):.0%}")
+    backtest_cols[2].metric("PnL", f"{float(summary.get('total_pnl') or 0):+.5f}")
+    backtest_cols[3].metric("Equity", f"{float(summary.get('ending_equity') or 100):.5f}")
+    backtest_cols[4].metric("Halt", str(summary.get("halt_reason") or "none"))
+    trades = backtest.get("trades") or []
+    if trades:
+        st.dataframe(trades, width="stretch", height=min(320, 72 + len(trades) * 32))
+    else:
+        st.info(t("micro_no_trade"))
+
+
 def render_trading_page() -> None:
     render_safety_gate_panel()
     render_pending_trade_panel(show_raw=False)
@@ -7010,6 +7161,8 @@ def main() -> None:
     active_page = render_page_nav()
     if active_page == "advisor":
         render_advisor_page()
+    elif active_page == "micro":
+        render_micro_strategy_page()
     elif active_page == "trading":
         render_trading_page()
     elif active_page == "charts":
