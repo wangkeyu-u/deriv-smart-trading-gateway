@@ -88,6 +88,7 @@ COMMON_DERIV_SYMBOLS = [
     "frxGBPUSD",
     "frxUSDJPY",
 ]
+CHART_GRANULARITY_OPTIONS = [60, 120, 300, 900, 1800, 3600]
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "local_data"
 DB_PATH = DATA_DIR / "gateway.sqlite3"
@@ -128,8 +129,18 @@ I18N = {
         "direct_done": "已完成直派任务",
         "chart_snapshots": "图表快照",
         "new_chart": "新建图表",
-        "no_chart_snapshots": "还没有图表快照。可以让图表工程师生成，也可以直接加载默认图表。",
+        "no_chart_snapshots": "还没有图表快照。请选择市场、周期和K线数量后加载。",
         "snapshot_time": "生成时间",
+        "chart_loader_title": "加载市场图表",
+        "chart_loader_caption": "不用写命令，直接选择市场、周期和K线数量。",
+        "chart_symbol_select": "选择市场",
+        "chart_custom_symbol": "自定义 Symbol（可选）",
+        "chart_custom_placeholder": "例如 frxEURUSD / BOOM1000 / R_75",
+        "chart_granularity": "K线周期",
+        "chart_candle_count": "K线数量",
+        "chart_load_selected": "加载所选图表",
+        "chart_loaded": "图表已加载",
+        "chart_load_failed": "图表加载失败",
         "sync_bus": "实时同步总线",
         "sync_bus_hint": "API 调用、Agent 事件、图谱状态、图表快照都写入这里。",
         "api_trace": "API 调用 Trace",
@@ -145,7 +156,7 @@ I18N = {
         "agent_log": "智能体自动执行日志",
         "results": "实时交易工作台",
         "results_hint": "K 线图、订单回执、子 Agent 状态和最新 tick 会在这里显示。",
-        "load_default": "加载 R_100 最近 120 根 1分钟K线",
+        "load_default": "加载所选图表",
         "history": "本地历史",
         "active": "运行中",
         "standby": "待命",
@@ -164,7 +175,7 @@ I18N = {
         "local_db": "本地数据",
         "db_path": "SQLite 保存路径",
         "chart_workbench": "交易图工作台",
-        "no_candles": "还没有 K 线数据。可以通过聊天指令生成，也可以直接加载默认 R_100 图表。",
+        "no_candles": "还没有 K 线数据。可以通过聊天指令生成，也可以在图表页选择市场后加载。",
         "latest_tick": "最新 Tick",
         "live_results": "实时结果",
         "initial_message": "你好，我可以帮你查 Deriv 行情、画 K 线，或基于已配置的 Deriv Token 执行模拟交易。",
@@ -203,7 +214,7 @@ I18N = {
         "download_ohlcv": "下载 OHLCV CSV",
         "download_log": "下载执行日志",
         "success_badge": "绿色成功勋章 · Deriv 订单回执已确认",
-        "chart_empty_info": "还没有可绘制的 K 线数据。先输入：画 R_100 最近 60 根 1分钟K线",
+        "chart_empty_info": "没有拿到可绘制的 K 线数据。请换一个市场、周期或减少 K 线数量后重试。",
         "chart_title_suffix": "K 线交易图",
         "chart_advisor_overlay": "谋士参考",
         "local_provider_label": "本地规则",
@@ -377,8 +388,18 @@ I18N = {
         "direct_done": "Direct task completed",
         "chart_snapshots": "Chart Snapshots",
         "new_chart": "New Chart",
-        "no_chart_snapshots": "No chart snapshots yet. Ask the Chart Engineer to create one or load the default chart.",
+        "no_chart_snapshots": "No chart snapshots yet. Choose a market, timeframe, and candle count to load one.",
         "snapshot_time": "Generated",
+        "chart_loader_title": "Load Market Chart",
+        "chart_loader_caption": "No command needed. Choose the market, timeframe, and candle count.",
+        "chart_symbol_select": "Market",
+        "chart_custom_symbol": "Custom Symbol (optional)",
+        "chart_custom_placeholder": "Example: frxEURUSD / BOOM1000 / R_75",
+        "chart_granularity": "Candle Timeframe",
+        "chart_candle_count": "Candle Count",
+        "chart_load_selected": "Load Selected Chart",
+        "chart_loaded": "Chart loaded",
+        "chart_load_failed": "Chart load failed",
         "sync_bus": "Live Sync Bus",
         "sync_bus_hint": "API calls, agent events, graph state, and chart snapshots all write here.",
         "api_trace": "API Trace",
@@ -394,7 +415,7 @@ I18N = {
         "agent_log": "Agent Execution Log",
         "results": "Live Trading Workbench",
         "results_hint": "Candles, receipts, sub-agent state, and latest ticks appear here.",
-        "load_default": "Load R_100 · 120 candles · 1m",
+        "load_default": "Load Selected Chart",
         "history": "Local History",
         "active": "Active",
         "standby": "Standby",
@@ -413,7 +434,7 @@ I18N = {
         "local_db": "Local Data",
         "db_path": "SQLite path",
         "chart_workbench": "Trading Chart Workbench",
-        "no_candles": "No candle data yet. Ask in chat or load the default R_100 chart.",
+        "no_candles": "No candle data yet. Ask in chat or choose a market on the Charts page.",
         "latest_tick": "Latest Tick",
         "live_results": "Live Results",
         "initial_message": "Hi. I can check Deriv markets, draw candlestick charts, or execute demo trades with your configured Deriv token.",
@@ -452,7 +473,7 @@ I18N = {
         "download_ohlcv": "Download OHLCV CSV",
         "download_log": "Download Execution Log",
         "success_badge": "Success badge · Deriv order receipt confirmed",
-        "chart_empty_info": "No drawable candle data yet. Try: Draw the latest 60 one-minute candles for R_100.",
+        "chart_empty_info": "No drawable candle data was returned. Try another market, timeframe, or a smaller candle count.",
         "chart_title_suffix": "Candlestick Trading Chart",
         "chart_advisor_overlay": "Advisor Reference",
         "local_provider_label": "Local Rules",
@@ -1631,6 +1652,10 @@ def init_state() -> None:
         "last_plan": None,
         "prompt_nonce": 0,
         "chart_height": 620,
+        "chart_loader_symbol": DEFAULT_SYMBOL,
+        "chart_custom_symbol": "",
+        "chart_loader_granularity": DEFAULT_GRANULARITY,
+        "chart_loader_count": 120,
         "compare_symbol": "R_75",
         "compare_result": None,
         "agent_execution_log": text_for("zh", "default_log"),
@@ -2840,6 +2865,20 @@ def normalize_deriv_symbol(symbol: str) -> str:
     if upper.startswith("FRX") and len(upper) == 9:
         return "frx" + upper[3:]
     return upper
+
+
+def selected_chart_symbol(selection: str, custom_symbol: str) -> str:
+    raw = (custom_symbol or "").strip() or (selection or "").strip() or DEFAULT_SYMBOL
+    return normalize_deriv_symbol(raw)
+
+
+def chart_granularity_label(seconds: int) -> str:
+    seconds = int(seconds)
+    if seconds >= 3600 and seconds % 3600 == 0:
+        hours = seconds // 3600
+        return f"{hours}小时" if current_lang() == "zh" else f"{hours}h"
+    minutes = max(1, seconds // 60)
+    return f"{minutes}分钟" if current_lang() == "zh" else f"{minutes}m"
 
 
 def extract_symbol(text: str) -> str:
@@ -6296,9 +6335,19 @@ def fetch_compare_candles(symbol: str, granularity: int, count: int) -> dict[str
     )
 
 
+def candle_result_count(result: dict[str, Any] | None) -> int:
+    data = (result or {}).get("data") or {}
+    try:
+        returned_count = int(data.get("returned_count") or 0)
+    except (TypeError, ValueError):
+        returned_count = 0
+    return max(returned_count, len(data.get("ohlcv") or []))
+
+
 def fetch_and_store_candles(symbol: str, granularity: int, count: int, source: str) -> dict[str, Any]:
     result = fetch_compare_candles(symbol, granularity, count)
-    add_chart_snapshot(result, source=source)
+    if result.get("ok") and candle_result_count(result) > 0:
+        add_chart_snapshot(result, source=source)
     return result
 
 
@@ -6519,6 +6568,73 @@ def render_trading_chart_workbench(result: dict[str, Any]) -> None:
         )
 
 
+def render_chart_loader_controls() -> None:
+    current_symbol = selected_chart_symbol(
+        str(st.session_state.get("chart_loader_symbol", DEFAULT_SYMBOL)),
+        "",
+    )
+    if current_symbol not in COMMON_DERIV_SYMBOLS:
+        current_symbol = DEFAULT_SYMBOL
+    current_granularity = int(st.session_state.get("chart_loader_granularity", DEFAULT_GRANULARITY) or DEFAULT_GRANULARITY)
+    if current_granularity not in CHART_GRANULARITY_OPTIONS:
+        current_granularity = DEFAULT_GRANULARITY
+    current_count = int(st.session_state.get("chart_loader_count", 120) or 120)
+    current_count = min(1000, max(20, current_count))
+
+    st.session_state.chart_loader_symbol = current_symbol
+    st.session_state.chart_loader_granularity = current_granularity
+    st.session_state.chart_loader_count = current_count
+
+    with st.container(border=True):
+        st.subheader(t("chart_loader_title"))
+        st.caption(t("chart_loader_caption"))
+        cols = st.columns([0.25, 0.25, 0.25, 0.25])
+        cols[0].selectbox(
+            t("chart_symbol_select"),
+            COMMON_DERIV_SYMBOLS,
+            index=COMMON_DERIV_SYMBOLS.index(current_symbol),
+            key="chart_loader_symbol",
+        )
+        cols[1].text_input(
+            t("chart_custom_symbol"),
+            key="chart_custom_symbol",
+            placeholder=t("chart_custom_placeholder"),
+        )
+        cols[2].selectbox(
+            t("chart_granularity"),
+            CHART_GRANULARITY_OPTIONS,
+            index=CHART_GRANULARITY_OPTIONS.index(current_granularity),
+            key="chart_loader_granularity",
+            format_func=chart_granularity_label,
+        )
+        cols[3].number_input(
+            t("chart_candle_count"),
+            min_value=20,
+            max_value=1000,
+            step=20,
+            key="chart_loader_count",
+        )
+
+        if st.button(t("chart_load_selected"), type="primary", width="stretch"):
+            symbol = selected_chart_symbol(
+                str(st.session_state.chart_loader_symbol),
+                str(st.session_state.chart_custom_symbol),
+            )
+            result = fetch_and_store_candles(
+                symbol,
+                int(st.session_state.chart_loader_granularity),
+                int(st.session_state.chart_loader_count),
+                source="chart_loader",
+            )
+            if result.get("ok") and candle_result_count(result) > 0:
+                st.success(f"{t('chart_loaded')}: {symbol}")
+            elif result.get("ok"):
+                st.warning(t("chart_empty_info"))
+            else:
+                st.error(f"{t('chart_load_failed')}: {symbol}")
+                st.json(result)
+
+
 def render_last_artifacts() -> None:
     if st.session_state.last_trade_receipt and st.session_state.last_trade_receipt.get("ok"):
         receipt = ((st.session_state.last_trade_receipt.get("data") or {}).get("receipt") or {})
@@ -6551,9 +6667,6 @@ def render_last_artifacts() -> None:
         with st.container(border=True):
             st.subheader(t("chart_workbench"))
             st.caption(t("no_chart_snapshots"))
-            if st.button(t("load_default"), type="primary", width="stretch"):
-                fetch_and_store_candles("R_100", 60, 120, source="default_loader")
-                st.rerun()
 
     if st.session_state.last_tick and st.session_state.last_tick.get("ok"):
         tick = ((st.session_state.last_tick.get("data") or {}).get("tick") or {})
@@ -7863,6 +7976,7 @@ def render_trading_page() -> None:
 def render_charts_page() -> None:
     st.markdown(f"### {t('live_results')}")
     st.markdown(f'<p class="small-muted">{html.escape(t("results_hint"))}</p>', unsafe_allow_html=True)
+    render_chart_loader_controls()
     render_last_artifacts()
 
 

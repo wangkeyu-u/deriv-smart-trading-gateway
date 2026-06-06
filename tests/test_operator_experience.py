@@ -170,6 +170,17 @@ def test_local_time_label_converts_utc_to_myt() -> None:
     assert web_app.local_time_label("2026-06-06T15:08:00Z") == "2026-06-06 23:08:00 MYT"
 
 
+def test_chart_loader_accepts_multiple_deriv_markets() -> None:
+    assert web_app.selected_chart_symbol("R_75", "") == "R_75"
+    assert web_app.selected_chart_symbol("R_100", "boom1000") == "BOOM1000"
+    assert web_app.selected_chart_symbol("R_100", "frxeurusd") == "frxEURUSD"
+
+
+def test_candle_result_count_requires_drawable_data() -> None:
+    assert web_app.candle_result_count({"ok": True, "data": {"returned_count": 0, "ohlcv": []}}) == 0
+    assert web_app.candle_result_count({"ok": True, "data": {"ohlcv": [{"close": 1.0}]}}) == 1
+
+
 def test_append_runtime_event_to_state_increments_sync_version() -> None:
     state = {"runtime_events": [], "sync_version": 7}
 
