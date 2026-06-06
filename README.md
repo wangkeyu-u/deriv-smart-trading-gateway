@@ -14,6 +14,7 @@ The project is moving toward a **native desktop operator app** with background r
 
 ## Highlights
 
+- **LangGraph trading team runtime** with supervisor routing, graph nodes, handoff-style routing, guardrails, shared state, and per-agent memory.
 - **LangGraph advisor council** with independent advisor nodes, merged graph state, and a chief synthesizer.
 - **Extensible agent prompts** through `agent_prompts.json`, including manager, execution workers, and advisor personas.
 - **Deriv WebSocket tools** for ticks, historical candles, account checks, simulated trades, open-contract status, and close-contract flows.
@@ -48,8 +49,8 @@ Native Desktop Operator App / Streamlit Console
   +--> Micro Strategy Engine
   |      recent prices -> momentum/EMA/volatility/cost checks -> CALL/PUT/WAIT or BUY/SELL/HOLD
   |
-  +--> Hierarchical Execution Team
-  |      manager -> market / strategy / chart / risk / compliance / execution / report
+  +--> LangGraph Trading Team
+  |      supervisor -> routed worker nodes -> guardrails -> report
   |
   v
 FastMCP Deriv Tool Server
@@ -183,10 +184,11 @@ The app uses two complementary agent systems.
 
 **Execution Team**
 
-- Trading Manager decomposes the boss request and dispatches work.
-- Market Analyst, Strategy Researcher, Chart Engineer, and Report Agent gather context and produce artifacts.
-- Risk Sentinel and Compliance Reviewer block unsafe or incomplete trade requests.
-- Execution Trader is the only worker allowed to submit Deriv write operations.
+- A LangGraph supervisor builds a route for each user request instead of blindly running every worker.
+- Strategy, Market, Risk, Compliance, Chart, Execution, and Report are separate graph nodes with their own prompts and memory.
+- Every node writes to shared graph state, the UI timeline, and its own short-term session memory.
+- Guardrails keep incomplete or unsafe trade requests away from the Execution Trader.
+- Execution Trader is still the only worker allowed to submit Deriv write operations, and it remains blocked by token, demo/live, and human-confirmation gates.
 
 **Advisor Council**
 
@@ -196,7 +198,16 @@ The app uses two complementary agent systems.
 - Risk Advisor challenges overconfident trades.
 - Contrarian Advisor attacks the consensus before the chief advisor synthesizes the final view.
 
-When `langgraph` is installed, each advisor runs as a graph node. If LangGraph is unavailable, the app falls back to a local council runner so the UI remains usable.
+When `langgraph` is installed, both the trading team and advisor council run as graphs. If LangGraph is unavailable, the app falls back to local runners so the UI remains usable.
+
+The current architecture follows the same broad patterns used by strong open-source multi-agent projects:
+
+- **LangGraph Swarm / Supervisor style**: route control through graph state and handoff-like node transitions.
+- **OpenAI Agents SDK style**: agents have instructions, tools, guardrails, human-in-the-loop boundaries, and traceable runs.
+- **CrewAI style**: agents have roles, goals, tools, process, and memory.
+- **AutoGen style**: worker agents can collaborate through shared conversation context rather than one monolithic prompt.
+
+The practical result is that a vague request such as `帮我买r100` is routed to Strategy, Risk, Compliance, and Report, then asks for missing amount/direction. A complete request such as `用 1 美金买 R_100 看涨 5 ticks` enters the full Strategy -> Market -> Risk -> Compliance -> Execution -> Report chain.
 
 ## Extend Agents
 

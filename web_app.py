@@ -666,6 +666,25 @@ class TeamRunResult:
     agent_reports: dict[str, Any] | None = None
 
 
+class TeamGraphState(TypedDict, total=False):
+    user_text: str
+    symbol: str
+    amount: float
+    contract_type: str
+    duration: int
+    duration_unit: str
+    route: list[str]
+    cursor: int
+    missing_fields: list[str]
+    guardrails: list[str]
+    events: list[AgentEvent]
+    market_report: dict[str, Any] | None
+    execution_report: dict[str, Any] | None
+    agent_reports: dict[str, Any]
+    final_answer: str
+    ok: bool
+
+
 AGENT_SPECS: dict[str, dict[str, str]] = {
     "manager": {
         "code": "PM",
@@ -2983,6 +3002,72 @@ def extract_duration_unit(text: str) -> str:
     return "m"
 
 
+def trade_missing_fields(user_text: str) -> list[str]:
+    missing = []
+    if extract_amount(user_text) <= 0:
+        missing.append("金额 amount")
+    if extract_contract_type(user_text) not in {"CALL", "PUT"}:
+        missing.append("方向 CALL/PUT")
+    return missing
+
+
+def determine_agent_route(user_text: str) -> dict[str, Any]:
+    symbol = extract_symbol(user_text)
+    amount = extract_amount(user_text)
+    contract_type = extract_contract_type(user_text)
+    duration = extract_duration(user_text)
+    duration_unit = extract_duration_unit(user_text)
+    if duration <= 0:
+        duration = 5
+        duration_unit = "t"
+
+    trade_intent = has_trade_intent(user_text)
+    missing = trade_missing_fields(user_text) if trade_intent else []
+    wants_chart = any(keyword in user_text for keyword in ["图", "K线", "k线", "chart", "表格", "走势", "蜡烛"])
+    wants_market = any(
+        keyword in user_text for keyword in ["走势", "Tick", "tick", "行情", "价格", "报价", "连续", "最新价"]
+    )
+
+    route = ["strategy"]
+    if wants_chart:
+        route.append("chart")
+    if trade_intent:
+        if missing:
+            route.extend(["risk", "compliance"])
+        else:
+            route.extend(["market", "risk", "compliance", "execution"])
+    elif wants_market and "chart" not in route:
+        route.append("market")
+    route.append("report")
+
+    compact_route = []
+    for agent_id in route:
+        if agent_id not in compact_route:
+            compact_route.append(agent_id)
+
+    guardrails = []
+    if trade_intent and missing:
+        guardrails.append("missing_trade_parameters")
+    if any(word in user_text.lower() for word in ["all in", "满仓", "梭哈"]):
+        guardrails.append("excessive_risk_language")
+
+    return {
+        "symbol": symbol,
+        "amount": amount,
+        "contract_type": contract_type,
+        "duration": duration,
+        "duration_unit": duration_unit,
+        "route": compact_route,
+        "missing_fields": missing,
+        "guardrails": guardrails,
+    }
+
+
+def team_graph_route_label(route: list[str]) -> str:
+    names = [agent_name(agent_id) if agent_id in AGENT_SPECS else agent_id for agent_id in route]
+    return " -> ".join(names)
+
+
 def extract_condition(text: str) -> dict[str, Any] | None:
     patterns = [
         (r"(?:价格|报价|最新价|tick)?\s*(?:大于等于|不低于|高于等于)\s*(\d+(?:\.\d+)?)", ">="),
@@ -4996,6 +5081,193 @@ def deterministic_manager_summary(
     return "经理总结：当前指令没有形成可执行交易任务。"
 
 
+def trading_team_langgraph_available() -> bool:
+    try:
+        import langgraph  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+def initial_team_graph_state(user_text: str) -> TeamGraphState:
+    route_plan = determine_agent_route(user_text)
+    return {
+        "user_text": user_text,
+        "symbol": route_plan["symbol"],
+        "amount": route_plan["amount"],
+        "contract_type": route_plan["contract_type"],
+        "duration": route_plan["duration"],
+        "duration_unit": route_plan["duration_unit"],
+        "route": route_plan["route"],
+        "cursor": 0,
+        "missing_fields": route_plan["missing_fields"],
+        "guardrails": route_plan["guardrails"],
+        "events": [],
+        "market_report": None,
+        "execution_report": None,
+        "agent_reports": {},
+        "final_answer": "",
+        "ok": True,
+    }
+
+
+def team_graph_next_node(state: TeamGraphState) -> str:
+    route = list(state.get("route") or [])
+    cursor = int(state.get("cursor") or 0)
+    if cursor >= len(route):
+        from langgraph.graph import END
+
+        return END
+    return route[cursor]
+
+
+def team_graph_supervisor_node(state: TeamGraphState) -> dict[str, Any]:
+    events = list(state.get("events") or [])
+    if not events:
+        append_team_event(events, "用户", "经理", str(state.get("user_text") or ""), None)
+    route = list(state.get("route") or [])
+    append_team_event(
+        events,
+        "经理",
+        "Graph",
+        f"LangGraph 路由：{team_graph_route_label(route)}",
+        None,
+    )
+    if state.get("guardrails"):
+        append_team_event(events, "经理", "Guardrail", "已启用安全闸门：" + ", ".join(state.get("guardrails") or []), None)
+    return {"events": events, "cursor": int(state.get("cursor") or 0)}
+
+
+def team_graph_agent_args(agent_id: str, state: TeamGraphState) -> dict[str, Any]:
+    user_text = str(state.get("user_text") or "")
+    symbol = str(state.get("symbol") or extract_symbol(user_text))
+    if agent_id == "strategy":
+        return {"task": user_text, "symbol": symbol}
+    if agent_id == "market":
+        return {
+            "task": "按用户目标读取必要行情并判断触发条件。",
+            "symbol": symbol,
+            "tick_count": 10,
+            "granularity": extract_granularity(user_text),
+            "candle_count": extract_count(user_text),
+            "analysis_goal": "consecutive_down" if "跌" in user_text else "consecutive_up" if "涨" in user_text else "tick_trend",
+        }
+    if agent_id == "risk":
+        return {"task": user_text, "symbol": symbol, "amount": float(state.get("amount") or 0)}
+    if agent_id == "compliance":
+        return {
+            "task": user_text,
+            "amount": float(state.get("amount") or 0),
+            "contract_type": str(state.get("contract_type") or ""),
+        }
+    if agent_id == "chart":
+        return {
+            "task": "生成 K 线图表快照。",
+            "symbol": symbol,
+            "granularity": extract_granularity(user_text),
+            "count": extract_count(user_text) if extract_count(user_text) > 0 else 120,
+        }
+    if agent_id == "execution":
+        return {
+            "task": "条件、风控和合规均通过后执行模拟盘订单。",
+            "symbol": symbol,
+            "amount": float(state.get("amount") or 0),
+            "contract_type": str(state.get("contract_type") or "CALL").upper(),
+            "duration": int(state.get("duration") or 5),
+            "duration_unit": str(state.get("duration_unit") or "t"),
+            "risk_note": "LangGraph guardrail approved route; still requires human confirmation if enabled.",
+        }
+    return {"task": "整理 LangGraph 团队协作复盘。"}
+
+
+def team_graph_final_answer(state: TeamGraphState) -> str:
+    missing = list(state.get("missing_fields") or [])
+    if missing:
+        return f"经理总结：我识别到交易意图和 {state.get('symbol')}，但缺少交易参数：{', '.join(missing)}。请补充后我再让执行 Agent 进入确认闸门。"
+    execution_report = state.get("execution_report")
+    market_report = state.get("market_report")
+    if execution_report:
+        return deterministic_manager_summary(market_report, execution_report)
+    if market_report:
+        return f"经理总结：{market_report.get('summary')}"
+    route = team_graph_route_label(list(state.get("route") or []))
+    return f"经理总结：LangGraph 团队已按路线完成协作：{route}。"
+
+
+def make_team_graph_agent_node(agent_id: str) -> Callable[[TeamGraphState], dict[str, Any]]:
+    def node(state: TeamGraphState) -> dict[str, Any]:
+        events = list(state.get("events") or [])
+        reports = dict(state.get("agent_reports") or {})
+        args = team_graph_agent_args(agent_id, state)
+        if agent_id == "execution" and state.get("missing_fields"):
+            result = {
+                "role": "Execution Trader",
+                "ok": False,
+                "status": "blocked",
+                "reason": "missing_trade_parameters",
+                "missing_fields": list(state.get("missing_fields") or []),
+            }
+            append_team_event(events, "Guardrail", "执行交易员", "缺少关键交易参数，执行节点未放行。", None)
+        else:
+            result = manager_tool_dispatch(f"assign_task_to_{agent_id}_agent", args, events, None)
+        reports[agent_id] = result
+        updates: dict[str, Any] = {
+            "events": events,
+            "agent_reports": reports,
+            "cursor": int(state.get("cursor") or 0) + 1,
+        }
+        if agent_id == "market":
+            updates["market_report"] = result
+        if agent_id == "execution":
+            updates["execution_report"] = result
+            updates["ok"] = bool(result.get("ok"))
+        if agent_id == "report":
+            final_answer = team_graph_final_answer({**state, **updates})
+            append_team_event(events, "经理", "用户", final_answer, None)
+            publish_team_log(events, build_team_extra_lines(updates.get("market_report") or state.get("market_report"), updates.get("execution_report") or state.get("execution_report")))
+            updates["events"] = events
+            updates["final_answer"] = final_answer
+        return updates
+
+    return node
+
+
+def build_trading_team_langgraph() -> Any:
+    from langgraph.graph import START, StateGraph
+
+    graph = StateGraph(TeamGraphState)
+    graph.add_node("supervisor", team_graph_supervisor_node)
+    for agent_id in ["strategy", "market", "risk", "compliance", "chart", "execution", "report"]:
+        graph.add_node(agent_id, make_team_graph_agent_node(agent_id))
+    graph.add_edge(START, "supervisor")
+    graph.add_conditional_edges("supervisor", team_graph_next_node)
+    for agent_id in ["strategy", "market", "risk", "compliance", "chart", "execution", "report"]:
+        graph.add_conditional_edges(agent_id, team_graph_next_node)
+    return graph.compile()
+
+
+def run_trading_team_langgraph(
+    user_text: str,
+    writer: Callable[[str], None] | None = None,
+) -> TeamRunResult:
+    app = build_trading_team_langgraph()
+    state = app.invoke(initial_team_graph_state(user_text))
+    events = list(state.get("events") or [])
+    if writer:
+        for event in events:
+            writer(localized_event_line(event))
+    final_answer = str(state.get("final_answer") or team_graph_final_answer(state))
+    return TeamRunResult(
+        final_answer=final_answer,
+        events=events,
+        market_report=state.get("market_report"),
+        execution_report=state.get("execution_report"),
+        ok=bool(state.get("ok", True)),
+        agent_reports=state.get("agent_reports") or {},
+    )
+
+
 def deterministic_manager_state_machine(
     user_text: str,
     events: list[AgentEvent],
@@ -5142,6 +5414,13 @@ def run_hierarchical_trading_team(
     writer: Callable[[str], None] | None = None,
 ) -> TeamRunResult:
     events: list[AgentEvent] = []
+    if trading_team_langgraph_available():
+        try:
+            result = run_trading_team_langgraph(user_text, writer)
+            remember_manager_memory(user_text, result)
+            return result
+        except Exception as exc:
+            append_team_event(events, "系统", "经理", f"LangGraph 交易团队失败，切换兜底运行时：{exc}", writer)
     provider: Provider = st.session_state.llm_provider
     if provider in {"OpenAI", "DeepSeek", "OpenAI-Compatible"} and st.session_state.llm_api_key:
         result = manager_with_openai_tool_calling(user_text, events, writer)
@@ -5810,8 +6089,9 @@ def system_health_snapshot(state: dict[str, Any]) -> dict[str, Any]:
         checks["db"] = {"ok": False, "detail": str(exc)}
 
     try:
+        build_trading_team_langgraph()
         build_advisor_langgraph()
-        checks["langgraph"] = {"ok": True, "detail": "compiled"}
+        checks["langgraph"] = {"ok": True, "detail": "trading+advisor compiled"}
     except Exception as exc:
         checks["langgraph"] = {"ok": False, "detail": str(exc)}
 
