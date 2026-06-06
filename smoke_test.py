@@ -12,6 +12,8 @@ import json
 from typing import Any
 
 import web_app
+from budget_guard import BudgetLimits, budget_guard_check
+from micro_trading import MicroTradeConfig, analyze_micro_trade
 from server import get_historical_candles, get_market_ticks
 
 
@@ -52,11 +54,49 @@ def check_prompts_and_symbols() -> None:
     print("prompts_and_symbols: OK")
 
 
+def check_advisor_evaluation_logic() -> None:
+    outcome = web_app.evaluate_advisor_outcome("CALL", 100.0, 101.0, 0.7)
+    assert_true(outcome["status"] == "evaluated", "advisor evaluation did not complete")
+    assert_true(outcome["outcome"] == "correct", "CALL outcome should be correct")
+    summary = web_app.summarize_advisor_evaluations([outcome])
+    assert_true(summary["direction_accuracy"] == 1.0, "direction accuracy should be 100%")
+    horizons = web_app.evaluate_advisor_horizons("CALL", 100.0, [101.0, 102.0, 103.0, 104.0, 105.0])
+    assert_true(horizons["status"] == "evaluated", "advisor horizon evaluation did not complete")
+    assert_true(horizons["horizons"]["5m"]["paper_return_pct"] == 5.0, "5m horizon score mismatch")
+    print("advisor_evaluation: OK")
+
+
 def check_langgraph_compile() -> None:
     assert_true(web_app.advisor_langgraph_available(), "LangGraph is not available")
     graph = web_app.build_advisor_langgraph()
     assert_true(type(graph).__name__ == "CompiledStateGraph", "advisor graph did not compile")
     print("langgraph_compile: OK")
+
+
+def check_micro_trading_engine() -> None:
+    result = analyze_micro_trade(
+        [{"close": value} for value in [100, 100.03, 100.06, 100.1, 100.15, 100.22, 100.3, 100.39]],
+        MicroTradeConfig(symbol="R_75", min_confidence=0.5, max_volatility_pct=5.0),
+    )
+    assert_true(result.get("ok") is True, "micro trading engine failed")
+    assert_true(result.get("action") in {"CALL", "PUT", "WAIT"}, "invalid micro trading action")
+    print("micro_trading_engine: OK")
+
+
+def check_budget_guard() -> None:
+    allowed = budget_guard_check(
+        action="execute_simulated_trade",
+        amount=1,
+        limits=BudgetLimits(max_single_trade_amount=1, max_daily_trade_budget=5, max_total_trade_budget=5),
+    )
+    blocked = budget_guard_check(
+        action="execute_simulated_trade",
+        amount=2,
+        limits=BudgetLimits(max_single_trade_amount=1, max_daily_trade_budget=5, max_total_trade_budget=5),
+    )
+    assert_true(allowed["ok"] is True, "budget guard should allow one-dollar trade")
+    assert_true(blocked["reason"] == "single_trade_limit_exceeded", "budget guard should block oversize trade")
+    print("budget_guard: OK")
 
 
 async def check_deriv_market_tools() -> None:
@@ -89,7 +129,10 @@ def check_advisor_runtime() -> dict[str, Any]:
 async def main() -> None:
     check_dependencies()
     check_prompts_and_symbols()
+    check_advisor_evaluation_logic()
     check_langgraph_compile()
+    check_micro_trading_engine()
+    check_budget_guard()
     await check_deriv_market_tools()
     result = check_advisor_runtime()
     print(

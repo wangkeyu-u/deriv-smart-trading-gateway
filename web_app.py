@@ -29,6 +29,16 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from advisor_evaluation import (
+    advisor_entry_price,
+    advisor_evaluation_ready,
+    advisor_horizon_readiness,
+    evaluate_advisor_horizons,
+    evaluate_advisor_outcome,
+    future_closes_after_created_at,
+    summarize_advisor_evaluations,
+    summarize_advisor_performance,
+)
 from server import (
     check_account_status,
     close_open_contract,
@@ -46,6 +56,11 @@ Action = Literal["get_market_ticks", "get_historical_candles", "execute_simulate
 DEFAULT_SYMBOL = "R_100"
 DEFAULT_GRANULARITY = 60
 DEFAULT_COUNT = 60
+FRESHNESS_LIMITS_SECONDS = {
+    "tick": 15,
+    "chart": 180,
+    "advisor": 300,
+}
 COMMON_DERIV_SYMBOLS = [
     "R_10",
     "R_25",
@@ -187,6 +202,7 @@ I18N = {
         "success_badge": "绿色成功勋章 · Deriv 订单回执已确认",
         "chart_empty_info": "还没有可绘制的 K 线数据。先输入：画 R_100 最近 60 根 1分钟K线",
         "chart_title_suffix": "K 线交易图",
+        "chart_advisor_overlay": "谋士参考",
         "local_provider_label": "本地规则",
         "example_tick": "查 R_100 最新价",
         "example_candles": "画 R_100 最近 120 根 1分钟K线",
@@ -211,6 +227,71 @@ I18N = {
         "advisor_confidence": "置信度",
         "advisor_elapsed": "耗时",
         "advisor_disclaimer": "谋士结论不会绕过交易安全闸门；下单仍需走执行交易员和人工确认。",
+        "advisor_evaluation": "谋士评估",
+        "advisor_evaluation_caption": "用当前最新价和 1m/5m/10m K 线窗口复盘最近谋士判断，只做纸面评估，不代表真实成交。",
+        "advisor_entry_price": "入场参考价",
+        "advisor_exit_price": "复盘价",
+        "advisor_direction_accuracy": "方向准确率",
+        "advisor_paper_return": "纸面收益",
+        "advisor_mark_recent": "复盘最近谋士判断",
+        "advisor_no_evaluations": "还没有可评估的谋士记录。",
+        "advisor_outcome": "结果",
+        "advisor_horizon_scores": "多窗口评分",
+        "workspace": "工作台",
+        "page_advisor": "谋士室",
+        "page_trading": "交易台",
+        "page_charts": "图表",
+        "page_monitor": "监控",
+        "page_advisor_caption": "限时谋士讨论、网页/行情分析和多窗口纸面复盘。",
+        "page_trading_caption": "交易经理调度执行团队，处理自然语言交易任务和人工确认。",
+        "page_charts_caption": "K 线快照、对比走势、测量和最新 Tick。",
+        "page_monitor_caption": "Agent 图谱、角色状态、API trace 和同步总线。",
+        "status_symbol": "Symbol",
+        "status_advisor": "谋士结论",
+        "status_entry": "入场价",
+        "status_freshness": "数据时效",
+        "status_api_calls": "API 调用",
+        "status_sync": "同步",
+        "status_pending": "待确认",
+        "status_none": "无",
+        "status_yes": "有",
+        "advisor_performance": "谋士表现汇总",
+        "safety_gate_panel": "执行安全闸门",
+        "safety_token": "Token",
+        "safety_confirmation": "人工确认",
+        "safety_live": "Live 执行",
+        "safety_pending_order": "待确认订单",
+        "safety_freshness": "数据时效",
+        "safety_ready": "就绪",
+        "safety_blocked": "阻断",
+        "safety_required": "需要确认",
+        "safety_disabled": "关闭",
+        "safety_enabled": "开启",
+        "pending_action": "动作",
+        "pending_direction": "方向",
+        "pending_amount": "金额",
+        "pending_duration": "时长",
+        "pending_advisor_alignment": "谋士一致性",
+        "pending_freshness": "数据时效",
+        "pending_flags": "风险提示",
+        "pending_raw_payload": "原始参数",
+        "advisor_trade_draft": "生成交易草稿",
+        "advisor_trade_draft_caption": "只生成待确认交易，不会自动下单。",
+        "advisor_trade_amount": "草稿金额",
+        "advisor_trade_duration": "草稿时长",
+        "advisor_trade_created": "已生成待确认交易草稿，请到交易台/侧边栏确认。",
+        "advisor_trade_wait_blocked": "当前谋士结论是 WAIT，不生成交易草稿。",
+        "audit_export": "审计导出",
+        "audit_export_caption": "导出当前决策链状态，不包含 API Token。",
+        "download_audit": "下载审计 JSON",
+        "system_health": "系统健康",
+        "system_health_caption": "本地运行状态检查，不触发网络交易调用。",
+        "health_ready": "正常",
+        "health_attention": "需关注",
+        "health_db": "本地数据库",
+        "health_langgraph": "LangGraph",
+        "health_token": "Token",
+        "health_pending": "待确认",
     },
     "en": {
         "sidebar_title": "Deriv Gateway",
@@ -322,6 +403,7 @@ I18N = {
         "success_badge": "Success badge · Deriv order receipt confirmed",
         "chart_empty_info": "No drawable candle data yet. Try: Draw the latest 60 one-minute candles for R_100.",
         "chart_title_suffix": "Candlestick Trading Chart",
+        "chart_advisor_overlay": "Advisor Reference",
         "local_provider_label": "Local Rules",
         "example_tick": "R_100 latest tick",
         "example_candles": "R_100 · 120 candles · 1m",
@@ -346,6 +428,71 @@ I18N = {
         "advisor_confidence": "Confidence",
         "advisor_elapsed": "Elapsed",
         "advisor_disclaimer": "Advisor output does not bypass the execution safety gate; orders still require the execution agent and human confirmation.",
+        "advisor_evaluation": "Advisor Evaluation",
+        "advisor_evaluation_caption": "Mark recent advisor calls against the latest price and 1m/5m/10m candle horizons. Paper evaluation only; not real execution.",
+        "advisor_entry_price": "Entry Reference",
+        "advisor_exit_price": "Mark Price",
+        "advisor_direction_accuracy": "Direction Accuracy",
+        "advisor_paper_return": "Paper Return",
+        "advisor_mark_recent": "Evaluate Recent Advisors",
+        "advisor_no_evaluations": "No evaluable advisor records yet.",
+        "advisor_outcome": "Outcome",
+        "advisor_horizon_scores": "Horizon Scores",
+        "workspace": "Workspace",
+        "page_advisor": "Advisor Room",
+        "page_trading": "Trading Desk",
+        "page_charts": "Charts",
+        "page_monitor": "Monitor",
+        "page_advisor_caption": "Time-boxed advisor debate, market/web context, and multi-horizon paper evaluation.",
+        "page_trading_caption": "The trading manager routes natural-language work through the execution team and safety gates.",
+        "page_charts_caption": "Candlestick snapshots, comparison overlays, measurement, and latest ticks.",
+        "page_monitor_caption": "Agent graph, role state, API traces, and live sync bus.",
+        "status_symbol": "Symbol",
+        "status_advisor": "Advisor",
+        "status_entry": "Entry",
+        "status_freshness": "Freshness",
+        "status_api_calls": "API Calls",
+        "status_sync": "Sync",
+        "status_pending": "Pending",
+        "status_none": "None",
+        "status_yes": "Yes",
+        "advisor_performance": "Advisor Performance",
+        "safety_gate_panel": "Execution Safety Gate",
+        "safety_token": "Token",
+        "safety_confirmation": "Human Confirm",
+        "safety_live": "Live Execution",
+        "safety_pending_order": "Pending Order",
+        "safety_freshness": "Data Freshness",
+        "safety_ready": "Ready",
+        "safety_blocked": "Blocked",
+        "safety_required": "Required",
+        "safety_disabled": "Disabled",
+        "safety_enabled": "Enabled",
+        "pending_action": "Action",
+        "pending_direction": "Direction",
+        "pending_amount": "Amount",
+        "pending_duration": "Duration",
+        "pending_advisor_alignment": "Advisor Alignment",
+        "pending_freshness": "Data Freshness",
+        "pending_flags": "Risk Flags",
+        "pending_raw_payload": "Raw Payload",
+        "advisor_trade_draft": "Create Trade Draft",
+        "advisor_trade_draft_caption": "Creates a pending trade only. It does not submit an order.",
+        "advisor_trade_amount": "Draft Amount",
+        "advisor_trade_duration": "Draft Duration",
+        "advisor_trade_created": "Pending trade draft created. Review it in the trading desk/sidebar.",
+        "advisor_trade_wait_blocked": "Advisor stance is WAIT, so no trade draft was created.",
+        "audit_export": "Audit Export",
+        "audit_export_caption": "Export the current decision-chain state. API tokens are not included.",
+        "download_audit": "Download Audit JSON",
+        "system_health": "System Health",
+        "system_health_caption": "Local runtime checks without network trading calls.",
+        "health_ready": "Ready",
+        "health_attention": "Attention",
+        "health_db": "Local DB",
+        "health_langgraph": "LangGraph",
+        "health_token": "Token",
+        "health_pending": "Pending",
     },
 }
 
@@ -1007,6 +1154,32 @@ def load_recent_advisor_runs(limit: int = 3) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def load_advisor_run_records(limit: int = 12) -> list[dict[str, Any]]:
+    init_local_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT id, created_at, question, symbol, consensus, confidence, elapsed_ms, result_json
+            FROM advisor_runs
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        record = dict(row)
+        try:
+            payload = json.loads(str(record.get("result_json") or "{}"))
+        except json.JSONDecodeError:
+            payload = {}
+        record["result"] = payload if isinstance(payload, dict) else {}
+        records.append(record)
+    return records
+
+
 SYSTEM_PROMPT = """
 你是 Deriv Smart Trading Gateway 的中文自动交易执行智能体。你的任务是把用户自然语言转换成严格 JSON，并优先支持交易执行闭环。
 只能输出 JSON，不要输出 Markdown。
@@ -1273,7 +1446,9 @@ def init_state() -> None:
         "advisor_use_web": True,
         "advisor_symbol": DEFAULT_SYMBOL,
         "advisor_runs": [],
+        "advisor_evaluations": [],
         "last_advisor_result": None,
+        "active_page": "advisor",
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -1304,26 +1479,30 @@ def configure_page() -> None:
         """
         <style>
         :root {
-            --bg: #08110f;
+            --bg: #07100f;
             --panel: #101a17;
-            --panel-2: #13231f;
-            --line: #263b34;
-            --text: #e8f2ed;
+            --panel-2: #15231f;
+            --panel-3: #0b1513;
+            --line: #2a3a36;
+            --line-strong: #3f5650;
+            --text: #eef6f2;
             --muted: #91a49b;
-            --soft: #c6d7cf;
+            --soft: #c8d7d1;
             --green: #00b894;
             --green-2: #7dffcb;
+            --cyan: #71d7ff;
             --red: #ff5d5d;
             --amber: #f5b84b;
             --blue: #7aa7ff;
+            --accent: #71d7ff;
         }
         .stApp {
             background:
-                linear-gradient(90deg, rgba(0,184,148,.055) 1px, transparent 1px),
-                linear-gradient(0deg, rgba(122,167,255,.04) 1px, transparent 1px),
-                radial-gradient(circle at 78% -10%, rgba(0,184,148,.18), transparent 34%),
+                linear-gradient(135deg, rgba(0,184,148,.06), transparent 32%, rgba(245,184,75,.035) 68%, transparent),
+                linear-gradient(90deg, rgba(113,215,255,.04) 1px, transparent 1px),
+                linear-gradient(0deg, rgba(0,184,148,.035) 1px, transparent 1px),
                 var(--bg);
-            background-size: 44px 44px, 44px 44px, auto;
+            background-size: auto, 44px 44px, 44px 44px;
             color: var(--text);
         }
         [data-testid="stAppViewContainer"],
@@ -1347,8 +1526,11 @@ def configure_page() -> None:
             max-width: 1500px;
         }
         [data-testid="stSidebar"] {
-            background: #06100d;
+            background: linear-gradient(180deg, #06100d, #091714);
             border-right: 1px solid var(--line);
+        }
+        [data-testid="stSidebar"] > div:first-child {
+            padding-top: 1rem;
         }
         [data-testid="stSidebar"] label,
         [data-testid="stSidebar"] p,
@@ -1362,10 +1544,24 @@ def configure_page() -> None:
         }
         .terminal-hero {
             border: 1px solid var(--line);
-            background: linear-gradient(135deg, rgba(16,26,23,.98), rgba(19,35,31,.94));
-            padding: 1.05rem 1.15rem;
+            background:
+                linear-gradient(135deg, rgba(17,28,25,.98), rgba(11,21,19,.98) 58%, rgba(19,28,24,.98)),
+                repeating-linear-gradient(90deg, rgba(255,255,255,.035) 0, rgba(255,255,255,.035) 1px, transparent 1px, transparent 16px);
+            padding: 1rem 1.1rem;
             margin-bottom: 1rem;
-            box-shadow: 0 22px 70px rgba(0,0,0,.25);
+            border-radius: 8px;
+            box-shadow: 0 16px 42px rgba(0,0,0,.24);
+            position: relative;
+            overflow: hidden;
+        }
+        .terminal-hero::after {
+            content: "";
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            background: linear-gradient(120deg, transparent 0%, rgba(255,255,255,.045) 42%, transparent 64%);
+            transform: translateX(-46%);
+            animation: panelSheen 9s ease-in-out infinite;
         }
         .terminal-hero-top {
             display: flex;
@@ -1376,7 +1572,7 @@ def configure_page() -> None:
         .terminal-kicker {
             color: var(--green-2) !important;
             font-size: .74rem;
-            letter-spacing: .12em;
+            letter-spacing: .08em;
             text-transform: uppercase;
             font-weight: 900;
             margin-bottom: .25rem;
@@ -1394,13 +1590,14 @@ def configure_page() -> None:
             max-width: 780px;
         }
         .live-chip {
-            border: 1px solid rgba(0,184,148,.45);
-            background: rgba(0,184,148,.12);
-            color: var(--green-2) !important;
+            border: 1px solid rgba(113,215,255,.42);
+            background: rgba(113,215,255,.1);
+            color: var(--cyan) !important;
             padding: .4rem .6rem;
             font-size: .78rem;
             font-weight: 900;
             white-space: nowrap;
+            border-radius: 7px;
         }
         .agent-stage {
             display: grid;
@@ -1413,7 +1610,14 @@ def configure_page() -> None:
             background: linear-gradient(180deg, rgba(19,35,31,.96), rgba(9,18,16,.98));
             padding: .9rem;
             min-height: 150px;
-            box-shadow: 0 18px 50px rgba(0,0,0,.22);
+            border-radius: 8px;
+            box-shadow: 0 14px 36px rgba(0,0,0,.2);
+            transition: transform .16s ease, border-color .16s ease, background .16s ease;
+        }
+        .agent-card:hover {
+            transform: translateY(-1px);
+            border-color: rgba(125,255,203,.34);
+            background: linear-gradient(180deg, rgba(23,43,38,.97), rgba(10,20,17,.98));
         }
         .agent-head {
             display: flex;
@@ -1430,7 +1634,8 @@ def configure_page() -> None:
             background: rgba(0,184,148,.12);
             color: var(--green-2) !important;
             font-weight: 950;
-            animation: agentPulse 1.9s ease-in-out infinite;
+            border-radius: 8px;
+            box-shadow: inset 0 0 18px rgba(0,184,148,.1), 0 0 0 1px rgba(0,184,148,.06);
         }
         .agent-icon.exec {
             border-color: rgba(245,184,75,.55);
@@ -1440,6 +1645,11 @@ def configure_page() -> None:
         @keyframes agentPulse {
             0%, 100% { box-shadow: 0 0 0 0 rgba(0,184,148,.3); }
             50% { box-shadow: 0 0 0 8px rgba(0,184,148,0); }
+        }
+        @keyframes panelSheen {
+            0%, 72%, 100% { transform: translateX(-48%); opacity: 0; }
+            82% { opacity: .7; }
+            92% { transform: translateX(54%); opacity: 0; }
         }
         .agent-name {
             font-weight: 900;
@@ -1464,6 +1674,7 @@ def configure_page() -> None:
             color: var(--green-2) !important;
             padding: .18rem .42rem;
             text-transform: uppercase;
+            border-radius: 999px;
         }
         .agent-chip.exec {
             border-color: rgba(245,184,75,.45);
@@ -1477,6 +1688,7 @@ def configure_page() -> None:
             padding: .65rem .7rem;
             font-size: .86rem;
             line-height: 1.45;
+            border-radius: 8px;
         }
         .agent-bubble strong {
             color: var(--green-2) !important;
@@ -1485,7 +1697,8 @@ def configure_page() -> None:
         [data-testid="stChatMessage"] {
             border-color: var(--line) !important;
             background: rgba(16,26,23,.92) !important;
-            box-shadow: 0 20px 60px rgba(0,0,0,.22);
+            border-radius: 8px !important;
+            box-shadow: 0 14px 38px rgba(0,0,0,.2);
         }
         [data-testid="stChatMessage"] p,
         [data-testid="stChatMessage"] span,
@@ -1499,6 +1712,7 @@ def configure_page() -> None:
             padding: .85rem 1rem;
             font-weight: 900;
             font-size: 1rem;
+            border-radius: 8px;
         }
         .small-muted {
             color: var(--muted) !important;
@@ -1510,6 +1724,7 @@ def configure_page() -> None:
             padding: 1rem;
             margin: .55rem 0 1rem;
             box-shadow: inset 0 1px 0 rgba(255,255,255,.04);
+            border-radius: 8px;
         }
         .command-title {
             color: var(--text) !important;
@@ -1536,18 +1751,246 @@ def configure_page() -> None:
             padding: .28rem .55rem;
             font-size: .78rem;
             font-weight: 700;
+            border-radius: 999px;
         }
         .send-note {
             color: var(--muted) !important;
             font-size: .82rem;
             padding-top: .45rem;
         }
+        div[role="radiogroup"] {
+            gap: .45rem;
+        }
+        div[role="radiogroup"] label {
+            border: 1px solid rgba(145,164,155,.26);
+            background: rgba(12,24,20,.74);
+            padding: .35rem .75rem;
+            min-height: 2.25rem;
+            border-radius: 8px;
+        }
+        div[role="radiogroup"] label:hover {
+            border-color: rgba(125,255,203,.52);
+            background: rgba(28,55,48,.82);
+        }
+        .page-context {
+            border: 1px solid rgba(113,215,255,.22);
+            border-left: 3px solid var(--accent);
+            background: linear-gradient(90deg, rgba(113,215,255,.09), rgba(15,28,24,.62));
+            padding: .72rem .9rem;
+            margin: .6rem 0 1rem;
+            border-radius: 8px;
+        }
+        .page-context strong {
+            color: var(--text);
+            font-weight: 950;
+            margin-right: .7rem;
+        }
+        .page-context span {
+            color: var(--muted);
+            font-size: .88rem;
+        }
+        .workspace-head {
+            display: flex;
+            align-items: end;
+            justify-content: space-between;
+            gap: 1rem;
+            margin: .25rem 0 .55rem;
+        }
+        .workspace-title {
+            color: var(--text) !important;
+            font-size: 1rem;
+            font-weight: 950;
+            text-transform: uppercase;
+            letter-spacing: .06em;
+        }
+        .workspace-route {
+            color: var(--muted) !important;
+            font-size: .78rem;
+            font-weight: 800;
+        }
+        .nav-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: .55rem;
+            margin-bottom: .55rem;
+        }
+        .nav-card {
+            border: 1px solid rgba(145,164,155,.2);
+            background: linear-gradient(180deg, rgba(16,30,26,.82), rgba(8,17,15,.88));
+            border-radius: 8px;
+            padding: .68rem .72rem;
+            min-height: 94px;
+            box-shadow: 0 10px 26px rgba(0,0,0,.16);
+        }
+        .nav-card.active {
+            border-color: rgba(113,215,255,.54);
+            background: linear-gradient(180deg, rgba(22,42,38,.95), rgba(9,20,18,.95));
+            box-shadow: inset 0 1px 0 rgba(255,255,255,.06), 0 14px 34px rgba(0,0,0,.2);
+        }
+        .nav-top {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: .5rem;
+            margin-bottom: .42rem;
+        }
+        .nav-code {
+            width: 30px;
+            height: 30px;
+            display: grid;
+            place-items: center;
+            border: 1px solid rgba(113,215,255,.34);
+            background: rgba(113,215,255,.1);
+            color: var(--cyan) !important;
+            border-radius: 8px;
+            font-weight: 950;
+            font-size: .78rem;
+        }
+        .nav-state {
+            color: var(--muted) !important;
+            font-size: .68rem;
+            font-weight: 900;
+            text-transform: uppercase;
+        }
+        .nav-card.active .nav-state {
+            color: var(--green-2) !important;
+        }
+        .nav-label {
+            color: var(--text) !important;
+            font-size: .94rem;
+            font-weight: 950;
+            line-height: 1.15;
+        }
+        .nav-caption {
+            color: var(--muted) !important;
+            font-size: .74rem;
+            line-height: 1.35;
+            margin-top: .25rem;
+        }
+        .global-status {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: .55rem;
+            margin: -.2rem 0 1rem;
+        }
+        .status-cell {
+            border: 1px solid rgba(145,164,155,.22);
+            background: linear-gradient(180deg, rgba(18,31,28,.86), rgba(7,16,14,.9));
+            border-radius: 8px;
+            padding: .58rem .7rem;
+            min-height: 58px;
+            box-shadow: 0 10px 24px rgba(0,0,0,.14);
+        }
+        .status-cell span {
+            display: block;
+            color: var(--muted) !important;
+            font-size: .72rem;
+            font-weight: 850;
+            text-transform: uppercase;
+            margin-bottom: .15rem;
+        }
+        .status-cell strong {
+            color: var(--text) !important;
+            font-size: .98rem;
+            font-weight: 950;
+            line-height: 1.18;
+        }
+        .status-cell.attention {
+            border-color: rgba(245,184,75,.5);
+            background: linear-gradient(180deg, rgba(72,53,20,.72), rgba(22,18,10,.84));
+        }
+        .safety-panel {
+            border: 1px solid rgba(145,164,155,.24);
+            background: linear-gradient(180deg, rgba(13,27,23,.88), rgba(7,15,13,.9));
+            border-radius: 8px;
+            padding: .85rem;
+            margin: 0 0 1rem;
+            box-shadow: 0 14px 34px rgba(0,0,0,.18);
+        }
+        .safety-title {
+            color: var(--text) !important;
+            font-weight: 950;
+            margin-bottom: .65rem;
+        }
+        .safety-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+            gap: .55rem;
+        }
+        .safety-cell {
+            border: 1px solid rgba(145,164,155,.22);
+            background: rgba(255,255,255,.045);
+            border-radius: 8px;
+            padding: .55rem .65rem;
+        }
+        .safety-cell.ok {
+            border-color: rgba(0,184,148,.34);
+        }
+        .safety-cell.warn {
+            border-color: rgba(245,184,75,.45);
+            background: rgba(245,184,75,.08);
+        }
+        .safety-cell span {
+            display: block;
+            color: var(--muted) !important;
+            font-size: .72rem;
+            font-weight: 850;
+            text-transform: uppercase;
+        }
+        .safety-cell strong {
+            color: var(--text) !important;
+            font-size: .95rem;
+            font-weight: 950;
+        }
+        .pending-panel {
+            border: 1px solid rgba(245,184,75,.34);
+            background: linear-gradient(180deg, rgba(54,41,19,.62), rgba(15,14,10,.88));
+            border-radius: 8px;
+            padding: .85rem;
+            margin: 0 0 1rem;
+        }
+        .pending-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: .5rem;
+        }
+        .pending-grid > div {
+            border: 1px solid rgba(255,255,255,.12);
+            background: rgba(255,255,255,.045);
+            border-radius: 8px;
+            padding: .52rem .62rem;
+            min-width: 0;
+        }
+        .pending-grid > div.ok {
+            border-color: rgba(0,184,148,.34);
+        }
+        .pending-grid > div.warn {
+            border-color: rgba(245,184,75,.5);
+            background: rgba(245,184,75,.09);
+        }
+        .pending-grid span {
+            display: block;
+            color: var(--muted) !important;
+            font-size: .7rem;
+            font-weight: 850;
+            text-transform: uppercase;
+            margin-bottom: .15rem;
+        }
+        .pending-grid strong {
+            display: block;
+            color: var(--text) !important;
+            font-size: .9rem;
+            font-weight: 900;
+            line-height: 1.18;
+            overflow-wrap: anywhere;
+        }
         .advisor-room {
             border: 1px solid var(--line);
             background: linear-gradient(135deg, rgba(17,30,27,.98), rgba(9,18,16,.98));
             padding: 1rem;
             margin: 0 0 1rem;
-            box-shadow: 0 22px 70px rgba(0,0,0,.26);
+            border-radius: 8px;
+            box-shadow: 0 16px 44px rgba(0,0,0,.22);
         }
         .advisor-room-head {
             display: flex;
@@ -1575,6 +2018,7 @@ def configure_page() -> None:
             font-size: .76rem;
             font-weight: 900;
             white-space: nowrap;
+            border-radius: 7px;
         }
         .advisor-grid {
             display: grid;
@@ -1587,6 +2031,7 @@ def configure_page() -> None:
             background: rgba(255,255,255,.045);
             padding: .75rem;
             min-height: 150px;
+            border-radius: 8px;
         }
         .advisor-card-top {
             display: flex;
@@ -1603,6 +2048,7 @@ def configure_page() -> None:
             background: rgba(122,167,255,.12);
             color: var(--text) !important;
             font-weight: 950;
+            border-radius: 8px;
         }
         .advisor-name {
             font-weight: 900;
@@ -1623,6 +2069,7 @@ def configure_page() -> None:
             background: rgba(0,184,148,.11);
             font-size: .76rem;
             font-weight: 950;
+            border-radius: 999px;
         }
         .advisor-copy {
             color: var(--soft) !important;
@@ -1634,6 +2081,7 @@ def configure_page() -> None:
             background: rgba(0,184,148,.1);
             padding: .85rem;
             margin-top: .75rem;
+            border-radius: 8px;
         }
         .advisor-result strong {
             color: var(--green-2) !important;
@@ -1655,11 +2103,16 @@ def configure_page() -> None:
             box-shadow: 0 0 0 3px rgba(0,184,148,.16);
         }
         .stButton > button {
-            border-radius: 0;
+            border-radius: 8px;
             border: 1px solid var(--line);
             background: #13231f;
             color: var(--text);
             font-weight: 900;
+            transition: transform .14s ease, border-color .14s ease, background .14s ease;
+        }
+        .stButton > button:hover {
+            transform: translateY(-1px);
+            border-color: rgba(125,255,203,.42);
         }
         .stButton > button[kind="primary"] {
             background: var(--green);
@@ -1671,7 +2124,8 @@ def configure_page() -> None:
             background: linear-gradient(180deg, #111c18, #0a1411);
             color: var(--text);
             padding: 1rem;
-            box-shadow: 0 22px 70px rgba(0,0,0,.28);
+            border-radius: 8px;
+            box-shadow: 0 16px 44px rgba(0,0,0,.22);
             margin-bottom: 1rem;
         }
         .chart-workbench strong,
@@ -1691,6 +2145,7 @@ def configure_page() -> None:
             background: rgba(16,26,23,.92);
             padding: .75rem .85rem;
             min-height: 78px;
+            border-radius: 8px;
         }
         .chart-stat span {
             display: block;
@@ -1709,6 +2164,7 @@ def configure_page() -> None:
             background: #050b09 !important;
             border: 1px solid var(--line);
             color: var(--green-2) !important;
+            border-radius: 8px;
         }
         div[data-baseweb="select"] * {
             color: var(--text) !important;
@@ -1722,12 +2178,38 @@ def configure_page() -> None:
                 grid-template-columns: 1fr;
                 display: grid;
             }
+            .workspace-head {
+                display: block;
+            }
+            .nav-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
             .terminal-title {
                 font-size: 1.55rem;
             }
             .block-container {
                 padding-left: .85rem;
                 padding-right: .85rem;
+            }
+            .global-status {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+            .safety-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+        }
+        @media (max-width: 560px) {
+            .nav-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            .terminal-hero::after {
+                animation: none;
+            }
+            .agent-card,
+            .stButton > button {
+                transition: none;
             }
         }
         </style>
@@ -1797,9 +2279,7 @@ def render_sidebar() -> None:
             value=bool(st.session_state.allow_live_execution),
             help="默认关闭。开启后服务端仍会要求显式 allow_live=true。",
         )
-        if st.session_state.pending_trade:
-            with st.expander(t("pending_trade"), expanded=True):
-                st.json(st.session_state.pending_trade)
+        render_pending_trade_panel(show_raw=True)
 
         if selected_provider == "本地规则":
             st.session_state.llm_api_key = ""
@@ -2820,6 +3300,7 @@ def run_advisor_council(
         runtime = "local_fallback"
 
     elapsed_ms = (time.perf_counter() - started) * 1000
+    entry_price = advisor_entry_price(market)
     result = {
         "ok": True,
         "question": question,
@@ -2837,6 +3318,8 @@ def run_advisor_council(
         "stance": stance,
         "confidence": confidence,
         "vote_counts": vote_counts,
+        "entry_price": entry_price,
+        "evaluation": evaluate_advisor_outcome(stance, entry_price, None, confidence),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     if in_streamlit_runtime():
@@ -4154,6 +4637,32 @@ def execute_trade_closed_loop(plan: ToolPlan) -> tuple[dict[str, Any], str]:
         return result, "条件没有满足，智能体没有触发模拟下单。执行链条已写入自动执行日志。"
 
     log.append("4. 自动触发下单: READY")
+    pending = {
+        "action": "execute_simulated_trade",
+        "symbol": params["symbol"],
+        "amount": float(params["amount"]),
+        "contract_type": params["contract_type"],
+        "duration": int(params["duration"]),
+        "duration_unit": params["duration_unit"],
+        "contract_id": None,
+        "allow_live": bool(st.session_state.allow_live_execution),
+        "source": "closed_loop",
+    }
+    if st.session_state.require_trade_confirmation and not st.session_state.confirm_next_trade:
+        st.session_state.pending_trade = pending
+        result = {
+            "ok": False,
+            "error": {
+                "message": "写操作已进入待确认队列。请先确认下一笔模拟盘订单。",
+                "reason": "pending_human_confirmation",
+                "pending_trade": pending,
+            },
+        }
+        log.append("   order_status=WAITING_CONFIRMATION")
+        log.append("   reason=pending_human_confirmation")
+        publish_agent_log(log)
+        return result, summarize_result(plan, result)
+
     if not st.session_state.deriv_token:
         result = {
             "ok": False,
@@ -4320,6 +4829,461 @@ def render_header() -> None:
     )
 
 
+def global_status_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    advisor = state.get("last_advisor_result") or {}
+    pending_trade = state.get("pending_trade")
+    symbol = (
+        advisor.get("symbol")
+        or (((state.get("last_tick") or {}).get("data") or {}).get("symbol"))
+        or state.get("advisor_symbol")
+        or DEFAULT_SYMBOL
+    )
+    entry_price = advisor.get("entry_price")
+    return {
+        "symbol": symbol,
+        "advisor_stance": advisor.get("stance") or "WAIT",
+        "advisor_confidence": float(advisor.get("confidence") or 0),
+        "entry_price": entry_price,
+        "api_calls": len(state.get("api_trace") or []),
+        "sync_version": int(state.get("sync_version") or 0),
+        "pending_trade": bool(pending_trade),
+    }
+
+
+def timestamp_age_seconds(value: Any, *, now: datetime | None = None) -> float | None:
+    if not value:
+        return None
+    try:
+        parsed = pd.to_datetime(value, utc=True).to_pydatetime()
+    except (TypeError, ValueError):
+        return None
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return round(max(0.0, (current - parsed).total_seconds()), 1)
+
+
+def freshness_item(value: Any, max_age_seconds: int, *, now: datetime | None = None) -> dict[str, Any]:
+    age = timestamp_age_seconds(value, now=now)
+    if age is None:
+        return {"age_seconds": None, "status": "missing", "fresh": False}
+    fresh = age <= max_age_seconds
+    return {
+        "age_seconds": age,
+        "status": "fresh" if fresh else "stale",
+        "fresh": fresh,
+    }
+
+
+def freshness_snapshot(state: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
+    tick = state.get("last_tick") or {}
+    tick_data = tick.get("data") or {}
+    tick_payload = tick_data.get("tick") or {}
+    snapshots = list(state.get("chart_snapshots") or [])
+    latest_chart = snapshots[0] if snapshots else {}
+    chart_timestamp = (
+        latest_chart.get("created_at")
+        or ((state.get("last_candles") or {}).get("timestamp"))
+    )
+    advisor = state.get("last_advisor_result") or {}
+    items = {
+        "tick": freshness_item(
+            tick_payload.get("timestamp") or tick.get("timestamp"),
+            FRESHNESS_LIMITS_SECONDS["tick"],
+            now=now,
+        ),
+        "chart": freshness_item(
+            chart_timestamp,
+            FRESHNESS_LIMITS_SECONDS["chart"],
+            now=now,
+        ),
+        "advisor": freshness_item(
+            advisor.get("created_at"),
+            FRESHNESS_LIMITS_SECONDS["advisor"],
+            now=now,
+        ),
+    }
+    known_count = sum(1 for item in items.values() if item["status"] != "missing")
+    fresh_count = sum(1 for item in items.values() if item["fresh"])
+    stale_count = sum(1 for item in items.values() if item["status"] == "stale")
+    return {
+        "items": items,
+        "known_count": known_count,
+        "fresh_count": fresh_count,
+        "stale_count": stale_count,
+        "missing_count": len(items) - known_count,
+        "ok": known_count > 0 and stale_count == 0,
+    }
+
+
+def render_global_status_bar() -> None:
+    snapshot = global_status_snapshot(dict(st.session_state))
+    freshness = freshness_snapshot(dict(st.session_state))
+    entry = snapshot.get("entry_price")
+    entry_text = f"{float(entry):.5g}" if entry else t("status_none")
+    confidence = float(snapshot.get("advisor_confidence") or 0)
+    pending_text = t("status_yes") if snapshot.get("pending_trade") else t("status_none")
+    freshness_text = (
+        t("status_none")
+        if not freshness["known_count"]
+        else f'{freshness["fresh_count"]}/{freshness["known_count"]}'
+    )
+    st.markdown(
+        f"""
+        <div class="global-status">
+          <div class="status-cell"><span>{html.escape(t("status_symbol"))}</span><strong>{html.escape(str(snapshot["symbol"]))}</strong></div>
+          <div class="status-cell"><span>{html.escape(t("status_advisor"))}</span><strong>{html.escape(str(snapshot["advisor_stance"]))} · {confidence:.0%}</strong></div>
+          <div class="status-cell"><span>{html.escape(t("status_entry"))}</span><strong>{html.escape(entry_text)}</strong></div>
+          <div class="status-cell {'attention' if freshness.get('stale_count') else ''}"><span>{html.escape(t("status_freshness"))}</span><strong>{html.escape(freshness_text)}</strong></div>
+          <div class="status-cell"><span>{html.escape(t("status_api_calls"))}</span><strong>{int(snapshot["api_calls"])}</strong></div>
+          <div class="status-cell"><span>{html.escape(t("status_sync"))}</span><strong>{int(snapshot["sync_version"])}</strong></div>
+          <div class="status-cell {'attention' if snapshot.get('pending_trade') else ''}"><span>{html.escape(t("status_pending"))}</span><strong>{html.escape(pending_text)}</strong></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def safety_gate_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    has_token = bool(str(state.get("deriv_token") or "").strip())
+    requires_confirmation = bool(state.get("require_trade_confirmation"))
+    confirmed_next = bool(state.get("confirm_next_trade"))
+    live_enabled = bool(state.get("allow_live_execution"))
+    pending_trade = bool(state.get("pending_trade"))
+    confirmation_ready = (not requires_confirmation) or confirmed_next
+    freshness = freshness_snapshot(state)
+    return {
+        "has_token": has_token,
+        "requires_confirmation": requires_confirmation,
+        "confirmed_next": confirmed_next,
+        "confirmation_ready": confirmation_ready,
+        "live_enabled": live_enabled,
+        "pending_trade": pending_trade,
+        "data_freshness_ok": bool(freshness["ok"]),
+        "fresh_count": freshness["fresh_count"],
+        "known_freshness_count": freshness["known_count"],
+        "stale_count": freshness["stale_count"],
+        "write_ready": has_token and confirmation_ready and not pending_trade,
+    }
+
+
+def render_safety_gate_panel() -> None:
+    snapshot = safety_gate_snapshot(dict(st.session_state))
+    token_state = t("safety_ready") if snapshot["has_token"] else t("safety_blocked")
+    confirmation_state = (
+        t("safety_ready")
+        if snapshot["confirmation_ready"]
+        else t("safety_required")
+    )
+    live_state = t("safety_enabled") if snapshot["live_enabled"] else t("safety_disabled")
+    pending_state = t("status_yes") if snapshot["pending_trade"] else t("status_none")
+    freshness_state = (
+        t("safety_ready")
+        if snapshot["data_freshness_ok"]
+        else f'{snapshot["fresh_count"]}/{snapshot["known_freshness_count"]}'
+    )
+    cells = [
+        (t("safety_token"), token_state, snapshot["has_token"]),
+        (t("safety_confirmation"), confirmation_state, snapshot["confirmation_ready"]),
+        (t("safety_freshness"), freshness_state, snapshot["data_freshness_ok"]),
+        (t("safety_live"), live_state, not snapshot["live_enabled"]),
+        (t("safety_pending_order"), pending_state, not snapshot["pending_trade"]),
+    ]
+    html_cells = []
+    for label, value, ok in cells:
+        html_cells.append(
+            f"""
+            <div class="safety-cell {'ok' if ok else 'warn'}">
+              <span>{html.escape(label)}</span>
+              <strong>{html.escape(value)}</strong>
+            </div>
+            """.strip()
+        )
+    st.markdown(
+        f"""
+        <div class="safety-panel">
+          <div class="safety-title">{html.escape(t("safety_gate_panel"))}</div>
+          <div class="safety-grid">{''.join(html_cells)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def advisor_trade_alignment(pending: dict[str, Any], advisor: dict[str, Any] | None) -> str:
+    action = str(pending.get("action") or "")
+    if action == "close_open_contract":
+        return "close_action"
+    if not advisor:
+        return "no_advisor"
+    pending_symbol = str(pending.get("symbol") or "")
+    advisor_symbol = str(advisor.get("symbol") or "")
+    if pending_symbol and advisor_symbol and pending_symbol != advisor_symbol:
+        return "symbol_mismatch"
+    advisor_stance = str(advisor.get("stance") or "WAIT").upper()
+    direction = str(pending.get("contract_type") or "").upper()
+    if advisor_stance == "WAIT":
+        return "advisor_wait"
+    if advisor_stance and direction and advisor_stance == direction:
+        return "aligned"
+    if advisor_stance in {"CALL", "PUT"} and direction in {"CALL", "PUT"}:
+        return "direction_conflict"
+    return "unknown"
+
+
+def pending_trade_summary(
+    pending: dict[str, Any] | None,
+    advisor: dict[str, Any] | None = None,
+    freshness: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not pending:
+        return {"has_pending_trade": False, "flags": []}
+    action = str(pending.get("action") or "")
+    direction = str(pending.get("contract_type") or "").upper()
+    amount = pending.get("amount")
+    duration = pending.get("duration")
+    duration_unit = str(pending.get("duration_unit") or "")
+    alignment = advisor_trade_alignment(pending, advisor)
+    flags: list[str] = []
+    if not pending.get("symbol") and action != "close_open_contract":
+        flags.append("missing_symbol")
+    if action != "close_open_contract" and direction not in {"CALL", "PUT"}:
+        flags.append("missing_direction")
+    try:
+        amount_value = float(amount) if amount is not None else 0.0
+    except (TypeError, ValueError):
+        amount_value = 0.0
+    if action != "close_open_contract" and amount_value <= 0:
+        flags.append("missing_amount")
+    try:
+        duration_value = int(duration) if duration is not None else 0
+    except (TypeError, ValueError):
+        duration_value = 0
+    if action != "close_open_contract" and duration_value <= 0:
+        flags.append("missing_duration")
+    if pending.get("allow_live"):
+        flags.append("live_execution")
+    if alignment in {"symbol_mismatch", "advisor_wait", "direction_conflict"}:
+        flags.append(alignment)
+    stale_count = int((freshness or {}).get("stale_count") or 0)
+    if stale_count:
+        flags.append("stale_data")
+    return {
+        "has_pending_trade": True,
+        "action": action or "unknown",
+        "symbol": pending.get("symbol"),
+        "direction": direction or None,
+        "amount": amount_value if amount is not None else None,
+        "duration": f"{duration_value}{duration_unit}" if duration_value and duration_unit else None,
+        "allow_live": bool(pending.get("allow_live")),
+        "advisor_alignment": alignment,
+        "fresh_count": int((freshness or {}).get("fresh_count") or 0),
+        "known_freshness_count": int((freshness or {}).get("known_count") or 0),
+        "stale_count": stale_count,
+        "flags": flags,
+    }
+
+
+def advisor_trade_draft(
+    advisor: dict[str, Any] | None,
+    *,
+    amount: float = 1.0,
+    duration: int = 5,
+    duration_unit: str = "t",
+    allow_live: bool = False,
+) -> dict[str, Any]:
+    if not advisor:
+        return {"ok": False, "reason": "missing_advisor"}
+    stance = str(advisor.get("stance") or "WAIT").upper()
+    if stance not in {"CALL", "PUT"}:
+        return {"ok": False, "reason": "advisor_wait", "stance": stance}
+    symbol = normalize_deriv_symbol(str(advisor.get("symbol") or DEFAULT_SYMBOL))
+    try:
+        amount_value = float(amount)
+    except (TypeError, ValueError):
+        amount_value = 0.0
+    try:
+        duration_value = int(duration)
+    except (TypeError, ValueError):
+        duration_value = 0
+    if amount_value <= 0:
+        return {"ok": False, "reason": "invalid_amount", "stance": stance}
+    if duration_value <= 0:
+        return {"ok": False, "reason": "invalid_duration", "stance": stance}
+    return {
+        "ok": True,
+        "pending_trade": {
+            "action": "execute_simulated_trade",
+            "symbol": symbol,
+            "amount": amount_value,
+            "contract_type": stance,
+            "duration": duration_value,
+            "duration_unit": duration_unit if duration_unit in {"t", "m", "h"} else "t",
+            "contract_id": None,
+            "allow_live": bool(allow_live),
+            "source": "advisor_council",
+            "advisor_created_at": advisor.get("created_at"),
+            "advisor_confidence": float(advisor.get("confidence") or 0),
+            "advisor_entry_price": advisor.get("entry_price"),
+        },
+    }
+
+
+def advisor_audit_summary(advisor: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not advisor:
+        return None
+    return {
+        "ok": bool(advisor.get("ok", True)),
+        "created_at": advisor.get("created_at"),
+        "symbol": advisor.get("symbol"),
+        "stance": advisor.get("stance"),
+        "confidence": advisor.get("confidence"),
+        "entry_price": advisor.get("entry_price"),
+        "runtime": advisor.get("runtime"),
+        "source_count": advisor.get("source_count"),
+        "vote_counts": advisor.get("vote_counts") or {},
+        "consensus": advisor.get("consensus"),
+    }
+
+
+def execution_audit_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    advisor = state.get("last_advisor_result") or None
+    freshness = freshness_snapshot(state)
+    pending = state.get("pending_trade") or None
+    return {
+        "schema_version": 1,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "global_status": global_status_snapshot(state),
+        "data_freshness": freshness,
+        "safety_gate": safety_gate_snapshot(state),
+        "pending_trade_summary": pending_trade_summary(pending, advisor, freshness),
+        "pending_trade": pending,
+        "advisor": advisor_audit_summary(advisor),
+        "api_trace": list(state.get("api_trace") or [])[-20:],
+        "runtime_events": list(state.get("runtime_events") or [])[-30:],
+        "chart_snapshot_count": len(state.get("chart_snapshots") or []),
+        "team_event_count": len(state.get("team_events") or []),
+    }
+
+
+def render_audit_export_panel() -> None:
+    st.markdown(f"#### {t('audit_export')}")
+    st.caption(t("audit_export_caption"))
+    snapshot = execution_audit_snapshot(dict(st.session_state))
+    st.download_button(
+        t("download_audit"),
+        data=json.dumps(snapshot, ensure_ascii=False, indent=2, default=str).encode("utf-8"),
+        file_name=f"deriv-audit-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json",
+        mime="application/json",
+        width="stretch",
+    )
+
+
+def system_health_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    checks: dict[str, dict[str, Any]] = {}
+    try:
+        init_local_db()
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("SELECT 1").fetchone()
+        checks["db"] = {"ok": True, "detail": str(DB_PATH)}
+    except Exception as exc:
+        checks["db"] = {"ok": False, "detail": str(exc)}
+
+    try:
+        build_advisor_langgraph()
+        checks["langgraph"] = {"ok": True, "detail": "compiled"}
+    except Exception as exc:
+        checks["langgraph"] = {"ok": False, "detail": str(exc)}
+
+    checks["token"] = {
+        "ok": bool(str(state.get("deriv_token") or "").strip()),
+        "detail": "configured" if state.get("deriv_token") else "missing",
+    }
+    checks["pending"] = {
+        "ok": not bool(state.get("pending_trade")),
+        "detail": "none" if not state.get("pending_trade") else "pending_trade",
+    }
+    freshness = freshness_snapshot(state)
+    checks["freshness"] = {
+        "ok": bool(freshness.get("ok")),
+        "detail": f'{freshness.get("fresh_count", 0)}/{freshness.get("known_count", 0)} fresh',
+    }
+    required_ok = bool(checks["db"]["ok"] and checks["langgraph"]["ok"])
+    attention = [
+        key
+        for key, item in checks.items()
+        if key not in {"token", "freshness"} and not item["ok"]
+    ]
+    return {
+        "ok": required_ok and not attention,
+        "checks": checks,
+        "attention": attention,
+        "api_trace_count": len(state.get("api_trace") or []),
+        "runtime_event_count": len(state.get("runtime_events") or []),
+    }
+
+
+def render_system_health_panel() -> None:
+    health = system_health_snapshot(dict(st.session_state))
+    st.markdown(f"#### {t('system_health')}")
+    st.caption(t("system_health_caption"))
+    cols = st.columns(5)
+    checks = health["checks"]
+    health_labels = {
+        "db": t("health_db"),
+        "langgraph": t("health_langgraph"),
+        "token": t("health_token"),
+        "pending": t("health_pending"),
+        "freshness": t("status_freshness"),
+    }
+    for col, key in zip(cols, ["db", "langgraph", "token", "pending", "freshness"], strict=True):
+        item = checks[key]
+        col.metric(
+            health_labels[key],
+            t("health_ready") if item["ok"] else t("health_attention"),
+            str(item["detail"]),
+        )
+
+
+def render_pending_trade_panel(*, show_raw: bool = True) -> None:
+    pending = st.session_state.get("pending_trade")
+    if not pending:
+        return
+    summary = pending_trade_summary(
+        pending,
+        st.session_state.get("last_advisor_result"),
+        freshness_snapshot(dict(st.session_state)),
+    )
+    flags = summary.get("flags") or []
+    flag_text = ", ".join(flags) if flags else t("safety_ready")
+    freshness_text = (
+        t("status_none")
+        if not summary.get("known_freshness_count")
+        else f'{summary.get("fresh_count")}/{summary.get("known_freshness_count")}'
+    )
+    st.markdown(
+        f"""
+        <div class="pending-panel">
+          <div class="safety-title">{html.escape(t("pending_trade"))}</div>
+          <div class="pending-grid">
+            <div><span>{html.escape(t("pending_action"))}</span><strong>{html.escape(str(summary.get("action")))}</strong></div>
+            <div><span>{html.escape(t("status_symbol"))}</span><strong>{html.escape(str(summary.get("symbol") or t("status_none")))}</strong></div>
+            <div><span>{html.escape(t("pending_direction"))}</span><strong>{html.escape(str(summary.get("direction") or t("status_none")))}</strong></div>
+            <div><span>{html.escape(t("pending_amount"))}</span><strong>{html.escape(str(summary.get("amount") or t("status_none")))}</strong></div>
+            <div><span>{html.escape(t("pending_duration"))}</span><strong>{html.escape(str(summary.get("duration") or t("status_none")))}</strong></div>
+            <div><span>{html.escape(t("pending_advisor_alignment"))}</span><strong>{html.escape(str(summary.get("advisor_alignment")))}</strong></div>
+            <div><span>{html.escape(t("pending_freshness"))}</span><strong>{html.escape(freshness_text)}</strong></div>
+            <div class="{'warn' if flags else 'ok'}"><span>{html.escape(t("pending_flags"))}</span><strong>{html.escape(flag_text)}</strong></div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if show_raw:
+        with st.expander(t("pending_raw_payload"), expanded=False):
+            st.json(pending)
+
+
 def readable_agent_bubble(agent_id: str) -> str:
     events = st.session_state.get("team_events", [])
     spec = AGENT_SPECS[agent_id]
@@ -4458,16 +5422,17 @@ def render_swarm_graph() -> None:
         position: relative;
         height: 520px;
         overflow: hidden;
-        border: 1px solid rgba(38, 59, 52, .55);
+        border: 1px solid rgba(38, 59, 52, .42);
+        border-radius: 8px;
         background:
-          radial-gradient(circle at 50% 44%, rgba(0,184,148,.09), transparent 38%),
-          radial-gradient(circle at 82% 18%, rgba(122,167,255,.12), transparent 26%),
-          radial-gradient(circle, rgba(8,17,15,.08) 1px, transparent 1px),
-          linear-gradient(180deg, rgba(248,252,250,.96), rgba(236,245,241,.91));
-        background-size: auto, auto, 18px 18px, auto;
+          linear-gradient(90deg, rgba(8,17,15,.07) 1px, transparent 1px),
+          linear-gradient(0deg, rgba(8,17,15,.05) 1px, transparent 1px),
+          linear-gradient(180deg, rgba(248,252,250,.97), rgba(236,245,241,.92));
+        background-size: 22px 22px, 22px 22px, auto;
         color: #10221d;
         font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        box-shadow: 0 22px 70px rgba(0,0,0,.22);
+        box-shadow: 0 16px 44px rgba(0,0,0,.2);
+        transform: translateZ(0);
       }}
       html, body {{
         margin: 0;
@@ -4506,7 +5471,8 @@ def render_swarm_graph() -> None:
         border: 1px solid rgba(255,255,255,.72);
         background: rgba(255,255,255,.68);
         backdrop-filter: blur(12px);
-        box-shadow: 0 12px 34px rgba(16,34,29,.12);
+        border-radius: 8px;
+        box-shadow: 0 10px 24px rgba(16,34,29,.1);
       }}
       .kg-actions {{
         pointer-events: auto;
@@ -4524,8 +5490,9 @@ def render_swarm_graph() -> None:
         font-weight: 800;
         font-size: 12px;
         border-radius: 999px;
-        box-shadow: 0 12px 34px rgba(16,34,29,.12);
+        box-shadow: 0 10px 24px rgba(16,34,29,.1);
         backdrop-filter: blur(12px);
+        transition: transform .12s ease, background .12s ease;
       }}
       .kg-actions button:hover {{ transform: translateY(-1px); background: rgba(255,255,255,.92); }}
       .kg-switch {{ display: inline-flex; align-items: center; gap: 6px; }}
@@ -4541,7 +5508,8 @@ def render_swarm_graph() -> None:
         border: 1px solid rgba(255,255,255,.72);
         background: rgba(255,255,255,.66);
         backdrop-filter: blur(12px);
-        box-shadow: 0 12px 34px rgba(16,34,29,.12);
+        border-radius: 8px;
+        box-shadow: 0 10px 24px rgba(16,34,29,.1);
         min-width: 150px;
       }}
       .kg-legend-row {{ display: flex; align-items: center; justify-content: space-between; gap: 14px; font-size: 12px; color: #29443d; }}
@@ -4558,7 +5526,8 @@ def render_swarm_graph() -> None:
         border: 1px solid rgba(255,255,255,.76);
         background: rgba(255,255,255,.76);
         backdrop-filter: blur(16px);
-        box-shadow: 0 18px 54px rgba(16,34,29,.18);
+        border-radius: 8px;
+        box-shadow: 0 14px 38px rgba(16,34,29,.16);
         transform: translateX(115%);
         opacity: 0;
         transition: .22s ease;
@@ -4595,6 +5564,7 @@ def render_swarm_graph() -> None:
         border: 1px solid rgba(255,255,255,.7);
         background: rgba(255,255,255,.62);
         backdrop-filter: blur(12px);
+        border-radius: 8px;
       }}
       @media (max-width: 760px) {{
         #kg-root {{ height: 640px; }}
@@ -4639,6 +5609,7 @@ def render_swarm_graph() -> None:
       let hovered = null, selected = null, dragging = null;
       let pan = {{ x: 0, y: 0 }}, zoom = 1, isPanning = false, last = {{x:0,y:0}};
       let alpha = 1;
+      let lastStatusAt = 0;
       const colors = {{ system:'#8b5cf6', task:'#14b8a6', risk:'#f43f5e', concept:'#06b6d4', api:'#ef4444' }};
       const nodes = graph.nodes.map((n, i) => ({{
         ...n,
@@ -4670,6 +5641,19 @@ def render_swarm_graph() -> None:
         const rect = canvas.getBoundingClientRect();
         return {{ x: rect.width / 2 + pan.x + node.x * zoom, y: rect.height / 2 + pan.y + node.y * zoom }};
       }}
+      function roundedRect(x, y, w, h, r) {{
+        const radius = Math.min(r, w / 2, h / 2);
+        ctx.beginPath();
+        ctx.moveTo(x + radius, y);
+        ctx.arcTo(x + w, y, x + w, y + h, radius);
+        ctx.arcTo(x + w, y + h, x, y + h, radius);
+        ctx.arcTo(x, y + h, x, y, radius);
+        ctx.arcTo(x, y, x + w, y, radius);
+        ctx.closePath();
+      }}
+      function compactLabel(text, maxChars = 14) {{
+        return text.length > maxChars ? text.slice(0, maxChars - 1) + '…' : text;
+      }}
       function related(node) {{
         if (!node) return new Set();
         const set = new Set([node.id]);
@@ -4680,6 +5664,7 @@ def render_swarm_graph() -> None:
         return set;
       }}
       function tick() {{
+        if (alpha <= .052 && !dragging) return;
         const center = byId.get('manager');
         if (center) {{
           center.x *= .94; center.y *= .94; center.vx *= .45; center.vy *= .45;
@@ -4709,7 +5694,7 @@ def render_swarm_graph() -> None:
           n.vx *= .86; n.vy *= .86;
           n.x += n.vx; n.y += n.vy;
         }});
-        alpha = Math.max(.045, alpha * .992);
+        alpha = Math.max(.045, alpha * .985);
       }}
       function draw() {{
         tick();
@@ -4739,24 +5724,27 @@ def render_swarm_graph() -> None:
             ctx.fillStyle = '#00b894';
             ctx.beginPath(); ctx.arc(px, py, 3.2 / zoom, 0, Math.PI * 2); ctx.fill();
           }}
-          if (showLabels && active) {{
+          if (showLabels && active && zoom > .48) {{
             const mx = (l.source.x + l.target.x) / 2;
             const my = (l.source.y + l.target.y) / 2;
             ctx.font = `${{11 / zoom}}px "PingFang SC", "Microsoft YaHei", system-ui`;
-            const w = ctx.measureText(l.label).width + 12 / zoom;
-            ctx.globalAlpha = .9;
-            ctx.fillStyle = 'rgba(255,255,255,.82)';
-            ctx.fillRect(mx - w / 2, my - 9 / zoom, w, 18 / zoom);
+            const edgeLabel = compactLabel(l.label, 18);
+            const w = ctx.measureText(edgeLabel).width + 12 / zoom;
+            ctx.globalAlpha = .58;
+            ctx.fillStyle = 'rgba(255,255,255,.68)';
+            roundedRect(mx - w / 2, my - 9 / zoom, w, 18 / zoom, 7 / zoom);
+            ctx.fill();
             ctx.fillStyle = '#35544c';
             ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-            ctx.fillText(l.label, mx, my);
+            ctx.globalAlpha = .72;
+            ctx.fillText(edgeLabel, mx, my);
           }}
         }});
 
         nodes.forEach(n => {{
           const isFocus = focus && neighborhood.has(n.id);
           const isDim = focus && !isFocus;
-          const pulse = Math.sin(time * 2.2 + n.x * .01) * 2.2;
+          const pulse = (n === hovered || n === selected || n.id === 'manager') ? Math.sin(time * 2.8 + n.x * .01) * 1.6 : 0;
           const r = n.radius + pulse + (n === hovered ? 5 : 0);
           ctx.globalAlpha = isDim ? .22 : (n.confidence || .85);
           if (n === selected || n.id === 'manager') {{
@@ -4775,10 +5763,24 @@ def render_swarm_graph() -> None:
           ctx.font = `900 ${{13 / zoom}}px "PingFang SC", "Microsoft YaHei", system-ui`;
           ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
           ctx.fillText(n.code || n.label.slice(0, 2), n.x, n.y);
-          ctx.fillStyle = '#17312b';
-          ctx.font = `800 ${{12 / zoom}}px "PingFang SC", "Microsoft YaHei", system-ui`;
-          ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-          ctx.fillText(n.label, n.x + r + 8 / zoom, n.y);
+          if (zoom > .42) {{
+            const label = compactLabel(n.label, n.id === 'manager' ? 18 : 12);
+            ctx.font = `800 ${{12 / zoom}}px "PingFang SC", "Microsoft YaHei", system-ui`;
+            const w = ctx.measureText(label).width + 16 / zoom;
+            const h = 22 / zoom;
+            const labelY = n.y + r + 15 / zoom;
+            ctx.globalAlpha = isDim ? .18 : .74;
+            ctx.fillStyle = 'rgba(255,255,255,.7)';
+            roundedRect(n.x - w / 2, labelY - h / 2, w, h, 8 / zoom);
+            ctx.fill();
+            ctx.strokeStyle = 'rgba(255,255,255,.42)';
+            ctx.lineWidth = 1 / zoom;
+            ctx.stroke();
+            ctx.fillStyle = '#17312b';
+            ctx.globalAlpha = isDim ? .28 : .86;
+            ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+            ctx.fillText(label, n.x, labelY);
+          }}
         }});
         ctx.restore();
         renderStatus();
@@ -4817,15 +5819,23 @@ def render_swarm_graph() -> None:
         ).join('');
       }}
       function renderStatus() {{
+        const now = performance.now();
+        if (now - lastStatusAt < 220) return;
+        lastStatusAt = now;
         status.innerHTML = `<span>{status_nodes}: ${{nodes.length}}</span><span>{status_links}: ${{links.length}}</span><span>${{ui.selected}}: ${{selected ? selected.label : ui.none}}</span><span>${{ui.hovered}}: ${{hovered ? hovered.label : ui.none}}</span><span>{status_layout}</span><span>${{ui.memorySync}}</span><span>${{graph.status.updated}}</span>`;
       }}
       canvas.addEventListener('mousemove', e => {{
         if (dragging) {{ const p = world(e.clientX, e.clientY); dragging.x = p.x; dragging.y = p.y; dragging.vx = 0; dragging.vy = 0; alpha = .55; return; }}
         if (isPanning) {{ pan.x += e.clientX - last.x; pan.y += e.clientY - last.y; last = {{x:e.clientX,y:e.clientY}}; return; }}
-        hovered = hit(e.clientX, e.clientY);
+        const nextHover = hit(e.clientX, e.clientY);
+        if (nextHover !== hovered) {{
+          hovered = nextHover;
+          alpha = Math.max(alpha, .18);
+        }}
       }});
       canvas.addEventListener('mousedown', e => {{
         const n = hit(e.clientX, e.clientY);
+        alpha = Math.max(alpha, .45);
         if (n) {{ dragging = n; canvas.classList.add('dragging'); }}
         else {{ isPanning = true; last = {{x:e.clientX,y:e.clientY}}; }}
       }});
@@ -4835,6 +5845,7 @@ def render_swarm_graph() -> None:
         e.preventDefault();
         const delta = e.deltaY > 0 ? .92 : 1.08;
         zoom = Math.max(.35, Math.min(2.8, zoom * delta));
+        alpha = Math.max(alpha, .22);
       }}, {{ passive: false }});
       document.getElementById('kg-close').onclick = () => openPanel(null);
       document.getElementById('kg-labels').onchange = e => showLabels = e.target.checked;
@@ -4919,6 +5930,31 @@ def normalize_close(frame: pd.DataFrame) -> pd.Series:
     if first == 0:
         return frame["close"]
     return frame["close"] / first * 100
+
+
+def advisor_chart_overlay(symbol: str, advisor_result: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not advisor_result:
+        return None
+    if str(advisor_result.get("symbol") or "") != str(symbol):
+        return None
+    entry_price = advisor_result.get("entry_price")
+    try:
+        price = float(entry_price)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(price) or price <= 0:
+        return None
+    stance = str(advisor_result.get("stance") or "WAIT").upper()
+    colors = {"CALL": "#00b894", "PUT": "#f05f5f", "WAIT": "#f5b84b"}
+    confidence = float(advisor_result.get("confidence") or 0)
+    return {
+        "symbol": symbol,
+        "price": price,
+        "stance": stance if stance in colors else "WAIT",
+        "confidence": confidence,
+        "color": colors.get(stance, colors["WAIT"]),
+        "label": f"{stance if stance in colors else 'WAIT'} · {confidence:.0%}",
+    }
 
 
 def chart_config() -> dict[str, Any]:
@@ -5125,6 +6161,32 @@ def render_trading_chart_workbench(result: dict[str, Any]) -> None:
         annotation_text=f"Last {latest_close:.5g}",
         annotation_position="right",
     )
+    overlay = advisor_chart_overlay(symbol, st.session_state.get("last_advisor_result"))
+    if overlay:
+        fig.add_hline(
+            y=overlay["price"],
+            line_width=2,
+            line_dash="dash",
+            line_color=overlay["color"],
+            annotation_text=f"{t('chart_advisor_overlay')} {overlay['label']} · {overlay['price']:.5g}",
+            annotation_position="left",
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=[frame.iloc[-1]["timestamp"]],
+                y=[overlay["price"]],
+                mode="markers+text",
+                marker=dict(size=12, color=overlay["color"], line=dict(color="#ffffff", width=1)),
+                text=[overlay["stance"]],
+                textposition="top center",
+                name=t("chart_advisor_overlay"),
+                hovertemplate=(
+                    f"{t('chart_advisor_overlay')}<br>"
+                    "stance=%{text}<br>"
+                    "entry=%{y:.5f}<extra></extra>"
+                ),
+            )
+        )
     fig.update_layout(
         title=f"{symbol} · {t('chart_title_suffix')} · granularity={granularity}s · candles={len(frame)}",
         height=int(st.session_state.chart_height),
@@ -5332,6 +6394,61 @@ def render_direct_dispatch() -> None:
     st.session_state.direct_prompt_nonce += 1
 
 
+def render_advisor_trade_draft_controls(result: dict[str, Any]) -> None:
+    stance = str(result.get("stance") or "WAIT").upper()
+    key_suffix = re.sub(r"[^A-Za-z0-9_]+", "_", str(result.get("created_at") or "latest"))
+    with st.container(border=True):
+        st.markdown(f"#### {t('advisor_trade_draft')}")
+        st.caption(t("advisor_trade_draft_caption"))
+        controls = st.columns([0.28, 0.28, 0.24, 0.2])
+        amount = controls[0].number_input(
+            t("advisor_trade_amount"),
+            min_value=0.35,
+            max_value=1000.0,
+            value=1.0,
+            step=0.5,
+            key=f"advisor_trade_amount_{key_suffix}",
+        )
+        duration = controls[1].number_input(
+            t("advisor_trade_duration"),
+            min_value=1,
+            max_value=60,
+            value=5,
+            step=1,
+            key=f"advisor_trade_duration_{key_suffix}",
+        )
+        duration_unit = controls[2].selectbox(
+            "Unit",
+            ["t", "m", "h"],
+            index=0,
+            key=f"advisor_trade_unit_{key_suffix}",
+        )
+        disabled = stance not in {"CALL", "PUT"}
+        if controls[3].button(
+            t("advisor_trade_draft"),
+            type="primary",
+            width="stretch",
+            disabled=disabled,
+            key=f"advisor_trade_button_{key_suffix}",
+        ):
+            draft = advisor_trade_draft(
+                result,
+                amount=float(amount),
+                duration=int(duration),
+                duration_unit=str(duration_unit),
+                allow_live=bool(st.session_state.allow_live_execution),
+            )
+            if draft.get("ok"):
+                st.session_state.pending_trade = draft["pending_trade"]
+                st.session_state.active_page = "trading"
+                st.success(t("advisor_trade_created"))
+                st.rerun()
+            else:
+                st.warning(t("advisor_trade_wait_blocked"))
+        if disabled:
+            st.info(t("advisor_trade_wait_blocked"))
+
+
 def render_advisor_result(result: dict[str, Any]) -> None:
     st.markdown(
         f"""
@@ -5343,12 +6460,15 @@ def render_advisor_result(result: dict[str, Any]) -> None:
         """,
         unsafe_allow_html=True,
     )
-    cols = st.columns(4)
+    cols = st.columns(5)
     cols[0].metric(t("advisor_confidence"), f"{float(result.get('confidence') or 0):.0%}")
     cols[1].metric(t("advisor_elapsed"), f"{float(result.get('elapsed_ms') or 0) / 1000:.1f}s")
     cols[2].metric(t("advisor_sources"), int(result.get("source_count") or 0))
-    cols[3].metric("Runtime", str(result.get("runtime") or "local"))
+    entry_price = result.get("entry_price")
+    cols[3].metric(t("advisor_entry_price"), f"{float(entry_price):.5g}" if entry_price else "N/A")
+    cols[4].metric("Runtime", str(result.get("runtime") or "local"))
     st.caption(f"Votes: `{json.dumps(result.get('vote_counts') or {}, ensure_ascii=False)}`")
+    render_advisor_trade_draft_controls(result)
 
     opinions = result.get("opinions") or []
     cards = []
@@ -5412,6 +6532,180 @@ def render_advisor_result(result: dict[str, Any]) -> None:
         mime="application/json",
         width="stretch",
     )
+
+
+def fetch_latest_price_for_evaluation(symbol: str) -> float | None:
+    result = call_deriv_tool(
+        "get_market_ticks",
+        get_market_ticks(symbol, False),
+        {"symbol": symbol, "subscribe": False, "advisor_evaluation": True},
+    )
+    if not result.get("ok"):
+        return None
+    value = (((result.get("data") or {}).get("tick") or {}).get("quote"))
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    return price if math.isfinite(price) and price > 0 else None
+
+
+def fetch_candles_for_evaluation(symbol: str, granularity: int = 60, count: int = 120) -> pd.DataFrame:
+    result = call_deriv_tool(
+        "get_historical_candles",
+        get_historical_candles(symbol, granularity, count),
+        {
+            "symbol": symbol,
+            "granularity": granularity,
+            "count": count,
+            "advisor_evaluation": True,
+        },
+    )
+    return candles_frame_from_result(result)
+
+
+def evaluate_recent_advisors(limit: int = 12) -> list[dict[str, Any]]:
+    records = load_advisor_run_records(limit)
+    price_cache: dict[str, float | None] = {}
+    candle_cache: dict[str, pd.DataFrame] = {}
+    rows: list[dict[str, Any]] = []
+    for record in records:
+        result = record.get("result") or {}
+        symbol = str(result.get("symbol") or record.get("symbol") or DEFAULT_SYMBOL)
+        if symbol not in price_cache:
+            price_cache[symbol] = fetch_latest_price_for_evaluation(symbol)
+        if symbol not in candle_cache:
+            candle_cache[symbol] = fetch_candles_for_evaluation(symbol)
+        entry = result.get("entry_price")
+        if entry is None:
+            entry = advisor_entry_price(dict(result.get("market") or {}))
+        evaluation = evaluate_advisor_outcome(
+            str(result.get("stance") or "WAIT"),
+            entry,
+            price_cache[symbol],
+            float(result.get("confidence") or record.get("confidence") or 0),
+        )
+        future_closes = future_closes_after_created_at(
+            candle_cache[symbol],
+            str(result.get("created_at") or record.get("created_at") or ""),
+            10,
+        )
+        created_at = str(result.get("created_at") or record.get("created_at") or "")
+        readiness = advisor_horizon_readiness(created_at)
+        horizon_evaluation = evaluate_advisor_horizons(
+            str(result.get("stance") or "WAIT"),
+            entry,
+            future_closes,
+            float(result.get("confidence") or record.get("confidence") or 0),
+        )
+        horizons = horizon_evaluation.get("horizons") or {}
+        rows.append(
+            {
+                "id": record.get("id"),
+                "created_at": record.get("created_at"),
+                "symbol": symbol,
+                "stance": evaluation["stance"],
+                "confidence": evaluation["confidence"],
+                "entry_price": evaluation["entry_price"],
+                "exit_price": evaluation["exit_price"],
+                "return_pct": evaluation["return_pct"],
+                "paper_return_pct": evaluation["paper_return_pct"],
+                "status": evaluation["status"],
+                "outcome": evaluation["outcome"],
+                "score": evaluation["score"],
+                "horizon_status": horizon_evaluation["status"],
+                "horizon_average_score": horizon_evaluation["average_score"],
+                "horizon_1m": (horizons.get("1m") or {}).get("paper_return_pct"),
+                "horizon_5m": (horizons.get("5m") or {}).get("paper_return_pct"),
+                "horizon_10m": (horizons.get("10m") or {}).get("paper_return_pct"),
+                "horizon_outcome_1m": (horizons.get("1m") or {}).get("outcome"),
+                "horizon_outcome_5m": (horizons.get("5m") or {}).get("outcome"),
+                "horizon_outcome_10m": (horizons.get("10m") or {}).get("outcome"),
+                "ready_horizons": ",".join(readiness.get("ready") or []),
+                "pending_horizons": ",".join(readiness.get("pending") or []),
+                "age_seconds": readiness.get("age_seconds"),
+                "evaluation_ready": advisor_evaluation_ready(created_at, entry),
+                "question": record.get("question"),
+            }
+        )
+    return rows
+
+
+def render_advisor_evaluation_panel() -> None:
+    with st.expander(t("advisor_evaluation"), expanded=False):
+        st.caption(t("advisor_evaluation_caption"))
+        if st.button(t("advisor_mark_recent"), width="stretch"):
+            st.session_state.advisor_evaluations = evaluate_recent_advisors(12)
+
+        evaluations = list(st.session_state.get("advisor_evaluations") or [])
+        if not evaluations:
+            st.caption(t("advisor_no_evaluations"))
+            return
+
+        summary = summarize_advisor_evaluations(evaluations)
+        horizon_scores = [
+            float(item["horizon_average_score"])
+            for item in evaluations
+            if item.get("horizon_average_score") is not None
+        ]
+        average_horizon_score = round(sum(horizon_scores) / len(horizon_scores), 3) if horizon_scores else None
+        cols = st.columns(5)
+        accuracy = summary.get("direction_accuracy")
+        avg_return = summary.get("average_paper_return_pct")
+        avg_score = summary.get("average_score")
+        cols[0].metric(t("advisor_outcome"), int(summary.get("evaluated_count") or 0))
+        cols[1].metric(
+            t("advisor_direction_accuracy"),
+            "N/A" if accuracy is None else f"{float(accuracy):.0%}",
+        )
+        cols[2].metric(
+            t("advisor_paper_return"),
+            "N/A" if avg_return is None else f"{float(avg_return):+.3f}%",
+        )
+        cols[3].metric("Score", "N/A" if avg_score is None else f"{float(avg_score):.2f}")
+        cols[4].metric(
+            t("advisor_horizon_scores"),
+            "N/A" if average_horizon_score is None else f"{average_horizon_score:.2f}",
+        )
+
+        st.dataframe(
+            [
+                {
+                    "id": item.get("id"),
+                    "time": str(item.get("created_at") or "")[:19],
+                    "symbol": item.get("symbol"),
+                    "stance": item.get("stance"),
+                    "confidence": item.get("confidence"),
+                    "entry": item.get("entry_price"),
+                    "mark": item.get("exit_price"),
+                    "return_pct": item.get("return_pct"),
+                    "paper_return_pct": item.get("paper_return_pct"),
+                    "status": item.get("status"),
+                    "outcome": item.get("outcome"),
+                    "1m_paper": item.get("horizon_1m"),
+                    "1m_outcome": item.get("horizon_outcome_1m"),
+                    "5m_paper": item.get("horizon_5m"),
+                    "5m_outcome": item.get("horizon_outcome_5m"),
+                    "10m_paper": item.get("horizon_10m"),
+                    "10m_outcome": item.get("horizon_outcome_10m"),
+                    "eval_ready": item.get("evaluation_ready"),
+                    "ready": item.get("ready_horizons"),
+                    "pending": item.get("pending_horizons"),
+                    "question": item.get("question"),
+                }
+                for item in evaluations
+            ],
+            width="stretch",
+            height=260,
+        )
+        performance = summarize_advisor_performance(evaluations)
+        if performance:
+            st.markdown(f"#### {t('advisor_performance')}")
+            st.dataframe(
+                performance,
+                width="stretch",
+                height=min(260, 56 + len(performance) * 36),
+            )
 
 
 def render_advisor_council() -> None:
@@ -5495,11 +6789,13 @@ def render_advisor_council() -> None:
             status.update(label=t("advisor_done"), state="complete", expanded=True)
         st.session_state.advisor_prompt_nonce += 1
         render_advisor_result(result)
+        render_advisor_evaluation_panel()
         return
 
     if st.session_state.get("last_advisor_result"):
         st.markdown(f"#### {t('advisor_result')}")
         render_advisor_result(st.session_state.last_advisor_result)
+    render_advisor_evaluation_panel()
 
 
 def render_sync_bus() -> None:
@@ -5563,7 +6859,6 @@ def render_chat() -> None:
 
         st.markdown(f"#### {t('agent_log')}")
         st.code(st.session_state.agent_execution_log, language="text")
-        render_sync_bus()
         st.download_button(
             t("download_log"),
             data=st.session_state.agent_execution_log,
@@ -5619,22 +6914,108 @@ def render_chat() -> None:
         st.session_state.prompt_nonce += 1
 
 
+PAGE_KEYS = ["advisor", "trading", "charts", "monitor"]
+PAGE_NAV_CODES = {
+    "advisor": "AD",
+    "trading": "EX",
+    "charts": "CH",
+    "monitor": "MO",
+}
+
+
+def render_page_nav() -> str:
+    current = st.session_state.get("active_page", "advisor")
+    if current not in PAGE_KEYS:
+        current = "advisor"
+    current_label = t(f"page_{current}")
+    st.markdown(
+        f"""
+        <div class="workspace-head">
+          <div class="workspace-title">{html.escape(t('workspace'))}</div>
+          <div class="workspace-route">Gateway / {html.escape(current_label)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    nav_cards = []
+    for page_key in PAGE_KEYS:
+        active = page_key == current
+        state = "ACTIVE" if active else "READY"
+        nav_cards.append(
+            f"""
+            <div class="nav-card {'active' if active else ''}">
+              <div class="nav-top">
+                <div class="nav-code">{html.escape(PAGE_NAV_CODES[page_key])}</div>
+                <div class="nav-state">{state}</div>
+              </div>
+              <div class="nav-label">{html.escape(t(f'page_{page_key}'))}</div>
+              <div class="nav-caption">{html.escape(t(f'page_{page_key}_caption'))}</div>
+            </div>
+            """.strip()
+        )
+    st.markdown(f'<div class="nav-grid">{"".join(nav_cards)}</div>', unsafe_allow_html=True)
+    nav_cols = st.columns(len(PAGE_KEYS))
+    for col, page_key in zip(nav_cols, PAGE_KEYS, strict=True):
+        if col.button(
+            t(f"page_{page_key}"),
+            key=f"nav_{page_key}",
+            type="primary" if page_key == current else "secondary",
+            width="stretch",
+        ):
+            st.session_state.active_page = page_key
+            st.rerun()
+    selected = st.session_state.get("active_page", current)
+    st.markdown(
+        f"""
+        <div class="page-context">
+          <strong>{html.escape(t(f"page_{selected}"))}</strong>
+          <span>{html.escape(t(f"page_{selected}_caption"))}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    return selected
+
+
+def render_advisor_page() -> None:
+    render_advisor_council()
+
+
+def render_trading_page() -> None:
+    render_safety_gate_panel()
+    render_pending_trade_panel(show_raw=False)
+    render_chat()
+
+
+def render_charts_page() -> None:
+    st.markdown(f"### {t('live_results')}")
+    st.markdown(f'<p class="small-muted">{html.escape(t("results_hint"))}</p>', unsafe_allow_html=True)
+    render_last_artifacts()
+
+
+def render_monitor_page() -> None:
+    render_system_health_panel()
+    render_swarm_graph()
+    render_agent_roster()
+    render_sync_bus()
+    render_audit_export_panel()
+
+
 def main() -> None:
     init_state()
     configure_page()
     render_sidebar()
     render_header()
-    render_advisor_council()
-
-    left, right = st.columns([0.36, 0.64], gap="large")
-    with left:
-        render_chat()
-    with right:
-        render_swarm_graph()
-        render_agent_roster()
-        st.markdown(f"### {t('live_results')}")
-        st.markdown(f'<p class="small-muted">{html.escape(t("results_hint"))}</p>', unsafe_allow_html=True)
-        render_last_artifacts()
+    render_global_status_bar()
+    active_page = render_page_nav()
+    if active_page == "advisor":
+        render_advisor_page()
+    elif active_page == "trading":
+        render_trading_page()
+    elif active_page == "charts":
+        render_charts_page()
+    else:
+        render_monitor_page()
 
 
 if __name__ == "__main__":
