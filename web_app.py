@@ -110,7 +110,7 @@ I18N = {
         "llm_api": "大模型 API",
         "model": "模型",
         "connection": "连接状态",
-        "clear_chat": "清空聊天记录",
+        "clear_chat": "新对话",
         "hero_kicker": "层级多智能体交易网关",
         "hero_title": "Deriv Smart Trading Gateway",
         "hero_subtitle": "交易经理调度行情、策略、风控、合规、图表、执行和报告 Agent，完成实时行情读取、条件判断、模拟盘下单和可审计复盘。",
@@ -153,7 +153,10 @@ I18N = {
         "clear_input": "清空输入",
         "clear_input_short": "清空",
         "send_note": "不会因为 Enter 自动发送，适合中文输入法选词。",
-        "agent_log": "智能体自动执行日志",
+        "agent_log": "智能体行动时间线",
+        "agent_memory": "Agent 上下文记忆",
+        "memory_empty": "还没有记忆。每个 Agent 完成任务后会自动沉淀上下文。",
+        "timeline_empty": "还没有行动记录。发送指令后会显示经理和各 Agent 的协作过程。",
         "results": "实时交易工作台",
         "results_hint": "K 线图、订单回执、子 Agent 状态和最新 tick 会在这里显示。",
         "load_default": "加载所选图表",
@@ -212,7 +215,7 @@ I18N = {
         "measure_data": "测量、区间分析和完整数据",
         "full_ohlcv": "完整 OHLCV",
         "download_ohlcv": "下载 OHLCV CSV",
-        "download_log": "下载执行日志",
+        "download_log": "下载行动时间线",
         "success_badge": "绿色成功勋章 · Deriv 订单回执已确认",
         "chart_empty_info": "没有拿到可绘制的 K 线数据。请换一个市场、周期或减少 K 线数量后重试。",
         "chart_title_suffix": "K 线交易图",
@@ -369,7 +372,7 @@ I18N = {
         "llm_api": "Model API",
         "model": "Model",
         "connection": "Connection",
-        "clear_chat": "Clear Chat",
+        "clear_chat": "New Conversation",
         "hero_kicker": "Hierarchical Multi-Agent Trading Gateway",
         "hero_title": "Deriv Smart Trading Gateway",
         "hero_subtitle": "A trading manager coordinates a market analyst and a risk execution agent for market reads, condition checks, demo execution, and auditable receipts.",
@@ -412,7 +415,10 @@ I18N = {
         "clear_input": "Clear Input",
         "clear_input_short": "Clear",
         "send_note": "Enter will not auto-send, so IME composition is safe.",
-        "agent_log": "Agent Execution Log",
+        "agent_log": "Agent Action Timeline",
+        "agent_memory": "Agent Context Memory",
+        "memory_empty": "No memory yet. Each agent stores context after completing work.",
+        "timeline_empty": "No actions yet. Send a command to see the manager and agents collaborate.",
         "results": "Live Trading Workbench",
         "results_hint": "Candles, receipts, sub-agent state, and latest ticks appear here.",
         "load_default": "Load Selected Chart",
@@ -471,7 +477,7 @@ I18N = {
         "measure_data": "Measurement, Range Analysis, and Full Data",
         "full_ohlcv": "Full OHLCV",
         "download_ohlcv": "Download OHLCV CSV",
-        "download_log": "Download Execution Log",
+        "download_log": "Download Timeline",
         "success_badge": "Success badge · Deriv order receipt confirmed",
         "chart_empty_info": "No drawable candle data was returned. Try another market, timeframe, or a smaller candle count.",
         "chart_title_suffix": "Candlestick Trading Chart",
@@ -1628,6 +1634,8 @@ def manager_system_prompt() -> str:
         MANAGER_SYSTEM_PROMPT
         + "\n\n每个员工的专属 prompt，请调度时尊重：\n"
         + "\n".join(prompt_lines)
+        + "\n\n经理自己的最近上下文记忆：\n"
+        + agent_memory_summary("manager")
     )
 
 
@@ -1661,6 +1669,7 @@ def init_state() -> None:
         "agent_execution_log": text_for("zh", "default_log"),
         "team_events": [],
         "agent_reports": {},
+        "agent_memory": {},
         "runtime_events": [],
         "api_trace": [],
         "sync_version": 0,
@@ -1982,6 +1991,40 @@ def configure_page() -> None:
             color: var(--muted) !important;
             font-size: .82rem;
             padding-top: .45rem;
+        }
+        .agent-timeline {
+            display: grid;
+            gap: .65rem;
+            margin: .45rem 0 .85rem;
+        }
+        .timeline-item,
+        .memory-item {
+            border: 1px solid rgba(145,164,155,.22);
+            background: rgba(11,25,21,.72);
+            border-radius: 8px;
+            padding: .8rem .9rem;
+        }
+        .timeline-title,
+        .memory-time {
+            color: var(--green-2) !important;
+            font-size: .76rem;
+            font-weight: 900;
+            letter-spacing: 0;
+            margin-bottom: .25rem;
+        }
+        .timeline-body,
+        .memory-summary {
+            color: var(--text) !important;
+            font-size: .9rem;
+            line-height: 1.5;
+        }
+        .timeline-empty {
+            border: 1px dashed rgba(145,164,155,.28);
+            background: rgba(11,25,21,.52);
+            color: var(--muted) !important;
+            border-radius: 8px;
+            padding: .9rem;
+            font-size: .9rem;
         }
         div[role="radiogroup"] {
             gap: .45rem;
@@ -2580,22 +2623,7 @@ def render_sidebar() -> None:
                 st.write(row["consensus"])
 
         if st.button(t("clear_chat"), width="stretch"):
-            st.session_state.messages = []
-            st.session_state.last_candles = None
-            st.session_state.last_trade_receipt = None
-            st.session_state.last_tick = None
-            st.session_state.last_plan = None
-            st.session_state.prompt_nonce += 1
-            st.session_state.team_events = []
-            st.session_state.runtime_events = []
-            st.session_state.api_trace = []
-            st.session_state.sync_version = 0
-            st.session_state.agent_reports = {}
-            st.session_state.chart_snapshots = []
-            st.session_state.advisor_runs = []
-            st.session_state.last_advisor_result = None
-            st.session_state.agent_execution_log = default_agent_log()
-            st.session_state.messages = [{"role": "assistant", "content": initial_message()}]
+            reset_conversation_state()
             st.rerun()
 
 
@@ -3367,6 +3395,9 @@ def agent_ai_brief(
 你的身份 prompt：
 {agent_prompt(agent_id)}
 
+你自己的最近上下文记忆：
+{agent_memory_summary(agent_id)}
+
 请只基于给定上下文输出你的专业结论。
 要求：
 - 用中文，80-160 字。
@@ -3732,6 +3763,58 @@ def append_runtime_event_to_state(state: Any, event: dict[str, Any], limit: int 
     state["sync_version"] = int(state.get("sync_version", 0)) + 1
 
 
+def append_agent_memory_to_state(
+    state: Any,
+    agent_id: str,
+    memory: dict[str, Any],
+    limit: int = 20,
+) -> None:
+    memories = dict(state.get("agent_memory", {}) or {})
+    current = list(memories.get(agent_id, []))
+    memories[agent_id] = (current + [memory])[-limit:]
+    state["agent_memory"] = memories
+
+
+def recent_agent_memory(agent_id: str, limit: int = 5) -> list[dict[str, Any]]:
+    memories = st.session_state.get("agent_memory", {}) or {}
+    return list(memories.get(agent_id, []))[-limit:]
+
+
+def agent_memory_summary(agent_id: str, limit: int = 5) -> str:
+    memories = recent_agent_memory(agent_id, limit)
+    if not memories:
+        return "无历史记忆。"
+    lines = []
+    for item in memories:
+        summary = str(item.get("summary") or item.get("task") or "").strip()
+        if not summary:
+            continue
+        lines.append(f"- {item.get('time', '')} {summary}")
+    return "\n".join(lines) or "无历史记忆。"
+
+
+def reset_conversation_state() -> None:
+    st.session_state.messages = [{"role": "assistant", "content": initial_message()}]
+    st.session_state.last_candles = None
+    st.session_state.last_trade_receipt = None
+    st.session_state.last_tick = None
+    st.session_state.last_plan = None
+    st.session_state.pending_trade = None
+    st.session_state.confirm_next_trade = False
+    st.session_state.prompt_nonce += 1
+    st.session_state.team_events = []
+    st.session_state.runtime_events = []
+    st.session_state.api_trace = []
+    st.session_state.sync_version = 0
+    st.session_state.agent_reports = {}
+    st.session_state.agent_memory = {}
+    st.session_state.chart_snapshots = []
+    st.session_state.advisor_runs = []
+    st.session_state.advisor_evaluations = []
+    st.session_state.last_advisor_result = None
+    st.session_state.agent_execution_log = default_agent_log()
+
+
 def format_runtime_events(limit: int = 30) -> str:
     events = st.session_state.get("runtime_events", [])[-limit:]
     if not events:
@@ -3740,6 +3823,56 @@ def format_runtime_events(limit: int = 30) -> str:
         f"{item['time']} [{item['kind']}] {item['source']} -> {item['target']}: {item['message']}"
         for item in events
     )
+
+
+def agent_timeline_html(limit: int = 24) -> str:
+    events = st.session_state.get("team_events", [])[-limit:]
+    if not events:
+        return f'<div class="timeline-empty">{html.escape(t("timeline_empty"))}</div>'
+    items = []
+    for line in events:
+        if "➔" in line:
+            route, _, message = line.partition("：")
+            route = route.strip("[] ")
+            source, _, target = route.partition("➔")
+            title = f"{source.strip()} -> {target.strip()}"
+        else:
+            title = "Agent"
+            message = line
+        items.append(
+            f"""
+            <div class="timeline-item">
+              <div class="timeline-title">{html.escape(title)}</div>
+              <div class="timeline-body">{html.escape(message.strip())}</div>
+            </div>
+            """
+        )
+    return '<div class="agent-timeline">' + "".join(items) + "</div>"
+
+
+def render_agent_timeline(limit: int = 24) -> None:
+    st.markdown(agent_timeline_html(limit), unsafe_allow_html=True)
+
+
+def render_agent_memory_panel() -> None:
+    st.markdown(f"#### {t('agent_memory')}")
+    memories = st.session_state.get("agent_memory", {}) or {}
+    if not memories:
+        st.caption(t("memory_empty"))
+        return
+    tabs = st.tabs([agent_name(agent_id) if agent_id in AGENT_SPECS else agent_id for agent_id in memories.keys()])
+    for tab, (agent_id, items) in zip(tabs, memories.items(), strict=False):
+        with tab:
+            for item in list(items)[-8:]:
+                st.markdown(
+                    f"""
+                    <div class="memory-item">
+                      <div class="memory-time">{html.escape(str(item.get('time') or ''))}</div>
+                      <div class="memory-summary">{html.escape(str(item.get('summary') or item.get('task') or ''))}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
 
 def record_api_trace(
@@ -3879,6 +4012,22 @@ def agent_role(agent_id: str) -> str:
 
 
 def remember_agent_report(agent_id: str, report: dict[str, Any]) -> None:
+    summary = (
+        str(report.get("ai_brief") or "")
+        or str(report.get("summary") or "")
+        or str(report.get("status") or "")
+        or str(report.get("role") or "")
+    )
+    append_agent_memory_to_state(
+        st.session_state,
+        agent_id,
+        {
+            "time": datetime.now(LOCAL_TZ).strftime("%H:%M:%S"),
+            "task": str(report.get("task") or report.get("symbol") or report.get("role") or agent_id),
+            "summary": summary[:800],
+            "ok": bool(report.get("ok", True)),
+        },
+    )
     st.session_state.agent_reports[agent_id] = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "report": report,
@@ -4997,12 +5146,29 @@ def run_hierarchical_trading_team(
     if provider in {"OpenAI", "DeepSeek", "OpenAI-Compatible"} and st.session_state.llm_api_key:
         result = manager_with_openai_tool_calling(user_text, events, writer)
         if result:
+            remember_manager_memory(user_text, result)
             return result
     if provider == "Anthropic" and st.session_state.llm_api_key:
         result = manager_with_anthropic_tool_calling(user_text, events, writer)
         if result:
+            remember_manager_memory(user_text, result)
             return result
-    return deterministic_manager_state_machine(user_text, events, writer)
+    result = deterministic_manager_state_machine(user_text, events, writer)
+    remember_manager_memory(user_text, result)
+    return result
+
+
+def remember_manager_memory(user_text: str, result: TeamRunResult) -> None:
+    append_agent_memory_to_state(
+        st.session_state,
+        "manager",
+        {
+            "time": datetime.now(LOCAL_TZ).strftime("%H:%M:%S"),
+            "task": user_text[:240],
+            "summary": result.final_answer[:800],
+            "ok": result.ok,
+        },
+    )
 
 
 def reset_agent_log() -> list[str]:
@@ -5734,8 +5900,13 @@ def render_pending_trade_panel(*, show_raw: bool = True) -> None:
         unsafe_allow_html=True,
     )
     if show_raw:
-        with st.expander(t("pending_raw_payload"), expanded=False):
-            st.json(pending)
+        st.caption(
+            (
+                "待确认订单只展示关键字段；原始参数不在界面展开。"
+                if current_lang() == "zh"
+                else "Pending orders show only key fields; raw payloads are not shown in the UI."
+            )
+        )
 
 
 def readable_agent_bubble(agent_id: str) -> str:
@@ -6842,7 +7013,7 @@ def render_chart_loader_controls() -> None:
                 st.warning(t("chart_empty_info"))
             else:
                 st.error(f"{t('chart_load_failed')}: {symbol}")
-                st.json(result)
+                st.caption((result.get("error") or {}).get("message", "unknown error"))
 
 
 def render_last_artifacts() -> None:
@@ -6853,7 +7024,10 @@ def render_last_artifacts() -> None:
             f'<div class="success-badge">{html.escape(t("success_badge"))}</div>',
             unsafe_allow_html=True,
         )
-        st.json(receipt)
+        receipt_cols = st.columns(3)
+        receipt_cols[0].metric("Contract ID", receipt.get("contract_id", "-"))
+        receipt_cols[1].metric("Price", receipt.get("purchase_price", "-"))
+        receipt_cols[2].metric("Currency", receipt.get("currency", "-"))
 
     snapshots = st.session_state.chart_snapshots
     if snapshots:
@@ -7108,16 +7282,25 @@ def render_advisor_result(result: dict[str, Any]) -> None:
             st.caption(t("advisor_no_sources"))
 
     with st.expander(t("advisor_transcript"), expanded=False):
-        st.json(
-            {
-                "question": result.get("question"),
-                "symbol": result.get("symbol"),
-                "market": result.get("market"),
-                "news_signal": result.get("news_signal"),
-                "opinions": result.get("opinions"),
-                "vote_counts": result.get("vote_counts"),
-            }
-        )
+        st.markdown(f"**问题**：{result.get('question')}")
+        st.markdown(f"**Symbol**：{result.get('symbol')}")
+        st.markdown(f"**投票**：{result.get('vote_counts')}")
+        opinions = result.get("opinions") or []
+        if opinions:
+            st.dataframe(
+                [
+                    {
+                        "advisor": item.get("name"),
+                        "stance": item.get("stance"),
+                        "confidence": item.get("confidence"),
+                        "rationale": item.get("rationale"),
+                        "invalidation": item.get("invalidation"),
+                    }
+                    for item in opinions
+                ],
+                width="stretch",
+                height=min(320, 80 + len(opinions) * 42),
+            )
     st.download_button(
         t("advisor_download"),
         data=json.dumps(result, ensure_ascii=False, indent=2, default=str).encode("utf-8"),
@@ -7399,7 +7582,7 @@ def render_sync_bus() -> None:
     cols[1].metric("Agent Events", len(st.session_state.get("team_events", [])))
     cols[2].metric("API Calls", len(st.session_state.get("api_trace", [])))
     cols[3].metric("Chart Snapshots", len(st.session_state.get("chart_snapshots", [])))
-    st.code(format_runtime_events(18), language="text")
+    render_agent_timeline(18)
     with st.expander(t("api_trace"), expanded=False):
         api_rows = st.session_state.get("api_trace", [])[-20:]
         if api_rows:
@@ -7451,7 +7634,8 @@ def render_chat() -> None:
         )
 
         st.markdown(f"#### {t('agent_log')}")
-        st.code(st.session_state.agent_execution_log, language="text")
+        render_agent_timeline(24)
+        render_agent_memory_panel()
         st.download_button(
             t("download_log"),
             data=st.session_state.agent_execution_log,
@@ -7481,7 +7665,7 @@ def render_chat() -> None:
 
             def live_writer(line: str) -> None:
                 st.write(line)
-                live_slot.code(format_runtime_events(22), language="text")
+                live_slot.markdown(agent_timeline_html(22), unsafe_allow_html=True)
 
             with st.status(t("team_processing"), expanded=True) as status:
                 team_result = run_hierarchical_trading_team(prompt, writer=live_writer)
@@ -7491,13 +7675,14 @@ def render_chat() -> None:
                     status.update(label=t("team_blocked"), state="error", expanded=True)
 
             with st.expander(t("structured_result"), expanded=False):
-                st.json(
-                    {
-                        "market_report": team_result.market_report,
-                        "execution_report": team_result.execution_report,
-                        "events": [event.line() for event in team_result.events],
-                    }
-                )
+                st.markdown("**团队思路**")
+                for event in team_result.events:
+                    st.markdown(f"- {localized_event_line(event)}")
+                if team_result.market_report:
+                    st.markdown(f"**行情结论**：{team_result.market_report.get('summary') or team_result.market_report.get('ai_brief') or '-'}")
+                if team_result.execution_report:
+                    status = team_result.execution_report.get("status") or ("完成" if team_result.execution_report.get("ok") else "阻断")
+                    st.markdown(f"**执行状态**：{status}")
 
             answer = team_result.final_answer
             rendered = st.write_stream(stream_text(answer))
@@ -8016,7 +8201,7 @@ def render_micro_strategy_page() -> None:
                 if current_lang() == "zh"
                 else "Live candle fetch failed; no trading suggestion is produced."
             )
-            st.json(live_result)
+            st.caption((live_result.get("error") or {}).get("message", "unknown error"))
             return
         live_frame = candles_frame_from_result(live_result)
         frame = normalize_price_frame(live_frame[["timestamp", "close"]])
@@ -8151,8 +8336,22 @@ def render_micro_strategy_page() -> None:
     cols[2].metric("波动率" if current_lang() == "zh" else "Volatility", f"{float(decision.get('volatility_pct') or 0):.3f}%")
     cols[3].metric("预算" if current_lang() == "zh" else "Budget", micro_budget_reason_label(budget_check.get("reason")))
     cols[4].metric("数据条数" if current_lang() == "zh" else "Bars", len(frame))
-    with st.expander("原始数据（排错用）" if current_lang() == "zh" else "Raw Data For Debugging", expanded=False):
-        st.json({"decision": decision, "budget_guard": budget_check})
+    with st.expander("策略检查明细" if current_lang() == "zh" else "Strategy Check Details", expanded=False):
+        st.write(
+            "预算：" + micro_budget_reason_label(budget_check.get("reason"))
+            if current_lang() == "zh"
+            else "Budget: " + micro_budget_reason_label(budget_check.get("reason"))
+        )
+        st.write(
+            "信号：" + micro_action_label(decision.get("action"))
+            if current_lang() == "zh"
+            else "Signal: " + micro_action_label(decision.get("action"))
+        )
+        st.write(
+            f"置信度：{float(decision.get('confidence') or 0):.0%}"
+            if current_lang() == "zh"
+            else f"Confidence: {float(decision.get('confidence') or 0):.0%}"
+        )
 
     st.markdown(f"#### {t('micro_backtest')}")
     summary = backtest.get("summary") or {}
