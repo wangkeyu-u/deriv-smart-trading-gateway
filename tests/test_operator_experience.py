@@ -30,6 +30,7 @@ def test_micro_operator_brief_prioritizes_readable_recommendation() -> None:
 
     assert brief["recommendation"] == "观察跟踪"
     assert brief["action"] == "CALL"
+    assert brief["action_label"] == "看涨 (CALL)"
     assert brief["data_quality"] == "实时K线"
     assert brief["trade_count"] == 4
     assert "headline" in brief
@@ -45,7 +46,7 @@ def test_micro_operator_brief_blocks_when_budget_fails() -> None:
     )
 
     assert brief["recommendation"] == "禁止交易"
-    assert "single_trade_limit_exceeded" in " ".join(brief["risk_items"])
+    assert "单笔金额超过限制" in " ".join(brief["risk_items"])
 
 
 def test_micro_operator_brief_overrides_signal_when_backtest_is_weak() -> None:
@@ -67,6 +68,9 @@ def test_micro_operator_brief_overrides_signal_when_backtest_is_weak() -> None:
 
     assert brief["recommendation"] == "暂不执行"
     assert "纸面回测不支持执行" in brief["headline"]
+    assert "连续亏损熔断" in brief["headline"]
+    assert "max_consecutive_losses" not in brief["headline"]
+    assert "预算状态：未超预算" in brief["risk_items"]
 
 
 def test_micro_tables_keep_operator_relevant_columns() -> None:
@@ -88,18 +92,50 @@ def test_micro_tables_keep_operator_relevant_columns() -> None:
         ]
     )
 
-    assert list(table.columns) == [
-        "bar",
-        "action",
-        "entry",
-        "exit",
-        "amount",
-        "return_%",
-        "pnl",
-        "equity",
-        "confidence",
-        "blockers",
-    ]
+    assert list(table.columns) == ["K线序号", "方向", "入场价", "出场价", "收益率%", "盈亏", "权益", "置信度", "结果"]
+    assert table.iloc[0]["方向"] == "看涨 (CALL)"
+    assert table.iloc[0]["结果"] == "通过"
+
+
+def test_micro_recent_runs_table_uses_operator_language() -> None:
+    table = web_app.micro_recent_runs_table(
+        [
+            {
+                "created_at": "2026-06-06T15:32:00+00:00",
+                "symbol": "R_75",
+                "action": "CALL",
+                "total_pnl": -0.1,
+                "payload": {
+                    "data_source": "live",
+                    "operator_brief": {
+                        "recommendation": "暂不执行",
+                        "action": "CALL",
+                        "headline": "实时方向偏 CALL，但纸面回测不支持执行。",
+                    },
+                    "backtest": {
+                        "summary": {
+                            "win_rate": 0.36,
+                            "total_pnl": -0.00299,
+                            "halt_reason": "max_consecutive_losses",
+                        }
+                    },
+                },
+            }
+        ]
+    )
+
+    assert list(table.columns) == ["时间", "资产", "数据", "建议", "方向", "胜率", "盈亏", "熔断", "结论"]
+    assert table.iloc[0]["数据"] == "实时K线"
+    assert table.iloc[0]["建议"] == "暂不执行"
+    assert table.iloc[0]["熔断"] == "连续亏损熔断"
+    assert "纸面回测不支持执行" in table.iloc[0]["结论"]
+
+
+def test_micro_reason_labels_are_human_readable() -> None:
+    assert web_app.micro_budget_reason_label("within_budget") == "未超预算"
+    assert web_app.micro_halt_reason_label("max_consecutive_losses") == "连续亏损熔断"
+    assert web_app.micro_blocker_label("weak_momentum") == "动量太弱"
+    assert web_app.micro_action_label("WAIT") == "等待"
 
 
 def test_chart_data_status_uses_local_and_stale_status() -> None:
