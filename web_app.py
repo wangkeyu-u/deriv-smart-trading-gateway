@@ -316,10 +316,25 @@ I18N = {
         "micro_max_trades": "最大纸面交易数",
         "micro_run": "运行分析和回测",
         "micro_decision": "当前信号",
+        "micro_operator_brief": "员工视角结论",
+        "micro_operator_recommendation": "行动建议",
+        "micro_risk_brief": "风险与预算",
+        "micro_evidence": "信号证据",
+        "micro_next_steps": "下一步",
+        "micro_trade_log": "Paper Trading 明细",
         "micro_backtest": "Paper Trading 回测",
         "micro_no_trade": "当前预算或熔断条件不允许交易。",
         "micro_recent_runs": "最近小笔策略记录",
         "micro_saved": "已保存本轮小笔策略记录",
+        "chart_data_status": "图表数据状态",
+        "chart_last_candle": "最新 K 线",
+        "chart_data_age": "数据年龄",
+        "chart_time_zone": "时间显示",
+        "chart_local_time_note": "图表横轴显示本地时间 MYT；表格同时保留 UTC 和 MYT。",
+        "chart_stale": "可能过期",
+        "chart_fresh": "新鲜",
+        "chart_refresh_hint": "如果最新 K 线时间落后，请点击刷新当前 K 线。",
+        "sync_test_status": "同步测试状态",
     },
     "en": {
         "sidebar_title": "Deriv Gateway",
@@ -542,10 +557,25 @@ I18N = {
         "micro_max_trades": "Max Paper Trades",
         "micro_run": "Run Analysis & Backtest",
         "micro_decision": "Current Signal",
+        "micro_operator_brief": "Operator Brief",
+        "micro_operator_recommendation": "Recommendation",
+        "micro_risk_brief": "Risk And Budget",
+        "micro_evidence": "Signal Evidence",
+        "micro_next_steps": "Next Steps",
+        "micro_trade_log": "Paper Trading Log",
         "micro_backtest": "Paper Trading Backtest",
         "micro_no_trade": "Budget or circuit conditions do not allow a trade.",
         "micro_recent_runs": "Recent Micro Strategy Runs",
         "micro_saved": "Saved this micro strategy run",
+        "chart_data_status": "Chart Data Status",
+        "chart_last_candle": "Latest Candle",
+        "chart_data_age": "Data Age",
+        "chart_time_zone": "Time Display",
+        "chart_local_time_note": "The chart x-axis uses local MYT time; the table keeps both UTC and MYT.",
+        "chart_stale": "Possibly Stale",
+        "chart_fresh": "Fresh",
+        "chart_refresh_hint": "If the latest candle is behind, refresh the current chart.",
+        "sync_test_status": "Sync Test Status",
     },
 }
 
@@ -3527,8 +3557,13 @@ def push_runtime_event(
         "message": message,
         "payload": payload or {},
     }
-    st.session_state.runtime_events = (st.session_state.runtime_events + [event])[-120:]
-    st.session_state.sync_version = int(st.session_state.get("sync_version", 0)) + 1
+    append_runtime_event_to_state(st.session_state, event)
+
+
+def append_runtime_event_to_state(state: Any, event: dict[str, Any], limit: int = 120) -> None:
+    current_events = list(state.get("runtime_events", []))
+    state["runtime_events"] = (current_events + [event])[-limit:]
+    state["sync_version"] = int(state.get("sync_version", 0)) + 1
 
 
 def format_runtime_events(limit: int = 30) -> str:
@@ -6057,6 +6092,7 @@ def candles_frame_from_result(result: dict[str, Any] | None) -> pd.DataFrame:
     frame = pd.DataFrame(candles)
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
     frame["utc_time"] = frame["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    frame["local_timestamp"] = frame["timestamp"].dt.tz_convert(LOCAL_TZ).dt.tz_localize(None)
     frame["local_time"] = frame["timestamp"].dt.tz_convert(LOCAL_TZ).dt.strftime("%Y-%m-%d %H:%M:%S MYT")
     for column in ("open", "high", "low", "close", "volume"):
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
@@ -6064,6 +6100,47 @@ def candles_frame_from_result(result: dict[str, Any] | None) -> pd.DataFrame:
     frame["ma5"] = frame["close"].rolling(5).mean()
     frame["ma20"] = frame["close"].rolling(20).mean()
     return frame.reset_index(drop=True)
+
+
+def chart_data_status(
+    frame: pd.DataFrame,
+    granularity: int,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    if frame.empty or "timestamp" not in frame.columns:
+        return {
+            "ok": False,
+            "fresh": False,
+            "latest_utc": None,
+            "latest_local": None,
+            "age_seconds": None,
+            "allowed_lag_seconds": max(int(granularity) * 3, 180),
+        }
+    latest_ts = pd.to_datetime(frame.iloc[-1]["timestamp"], utc=True)
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    age_seconds = max(0.0, (current - latest_ts.to_pydatetime()).total_seconds())
+    allowed_lag = max(int(granularity) * 3, 180)
+    return {
+        "ok": True,
+        "fresh": age_seconds <= allowed_lag,
+        "latest_utc": latest_ts.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "latest_local": latest_ts.tz_convert(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S MYT"),
+        "age_seconds": round(age_seconds, 1),
+        "allowed_lag_seconds": allowed_lag,
+    }
+
+
+def local_time_label(value: Any, fmt: str = "%Y-%m-%d %H:%M:%S MYT") -> str:
+    if not value:
+        return ""
+    try:
+        timestamp = pd.to_datetime(value, utc=True)
+    except (TypeError, ValueError):
+        return str(value)
+    return timestamp.tz_convert(LOCAL_TZ).strftime(fmt)
 
 
 def normalize_close(frame: pd.DataFrame) -> pd.Series:
@@ -6151,7 +6228,10 @@ def render_measurement(frame: pd.DataFrame) -> None:
         return
 
     st.markdown(f"#### {t('measure')}")
-    labels = [f"{idx} · {row.timestamp.strftime('%m-%d %H:%M')} · close {row.close:.5g}" for idx, row in frame.iterrows()]
+    labels = [
+        f"{idx} · {row.local_timestamp.strftime('%m-%d %H:%M')} MYT · close {row.close:.5g}"
+        for idx, row in frame.iterrows()
+    ]
     col_a, col_b = st.columns(2)
     start_label = col_a.selectbox(t("start_candle"), labels, index=max(len(labels) - 12, 0))
     end_label = col_b.selectbox(t("end_candle"), labels, index=len(labels) - 1)
@@ -6203,6 +6283,7 @@ def render_trading_chart_workbench(result: dict[str, Any]) -> None:
     symbol = data.get("symbol", DEFAULT_SYMBOL)
     granularity = int(data.get("granularity") or DEFAULT_GRANULARITY)
     count = int(data.get("returned_count") or len(frame))
+    status = chart_data_status(frame, granularity)
 
     st.markdown(
         f"""
@@ -6215,6 +6296,13 @@ def render_trading_chart_workbench(result: dict[str, Any]) -> None:
         """,
         unsafe_allow_html=True,
     )
+
+    status_cols = st.columns([0.25, 0.25, 0.25, 0.25])
+    status_cols[0].metric(t("chart_last_candle"), status.get("latest_local") or "N/A")
+    status_cols[1].metric(t("chart_data_age"), "N/A" if status.get("age_seconds") is None else f"{float(status['age_seconds']):.0f}s")
+    status_cols[2].metric(t("chart_data_status"), t("chart_fresh") if status.get("fresh") else t("chart_stale"))
+    status_cols[3].metric(t("chart_time_zone"), "MYT / UTC")
+    st.caption(f"{t('chart_local_time_note')} {t('chart_refresh_hint')}")
 
     control_a, control_b, control_c = st.columns([0.32, 0.34, 0.34])
     st.session_state.chart_height = control_a.slider(
@@ -6248,11 +6336,20 @@ def render_trading_chart_workbench(result: dict[str, Any]) -> None:
     fig = go.Figure()
     fig.add_trace(
         go.Candlestick(
-            x=frame["timestamp"],
+            x=frame["local_timestamp"],
             open=frame["open"],
             high=frame["high"],
             low=frame["low"],
             close=frame["close"],
+            customdata=frame[["local_time", "utc_time"]],
+            hovertemplate=(
+                "%{customdata[0]}<br>"
+                "%{customdata[1]}<br>"
+                f"{symbol}: open=%{{open:.5f}}<br>"
+                "high=%{high:.5f}<br>"
+                "low=%{low:.5f}<br>"
+                "close=%{close:.5f}<extra></extra>"
+            ),
             increasing_line_color="#007f73",
             decreasing_line_color="#be3434",
             increasing_fillcolor="#007f73",
@@ -6262,7 +6359,7 @@ def render_trading_chart_workbench(result: dict[str, Any]) -> None:
     )
     fig.add_trace(
         go.Scatter(
-            x=frame["timestamp"],
+            x=frame["local_timestamp"],
             y=frame["ma5"],
             mode="lines",
             line=dict(color="#d89b24", width=1.5),
@@ -6271,7 +6368,7 @@ def render_trading_chart_workbench(result: dict[str, Any]) -> None:
     )
     fig.add_trace(
         go.Scatter(
-            x=frame["timestamp"],
+            x=frame["local_timestamp"],
             y=frame["ma20"],
             mode="lines",
             line=dict(color="#2457c5", width=1.5),
@@ -6284,7 +6381,7 @@ def render_trading_chart_workbench(result: dict[str, Any]) -> None:
         compare_symbol = ((st.session_state.compare_result.get("data") or {}).get("symbol") or "Compare")
         fig.add_trace(
             go.Scatter(
-                x=compare_frame["timestamp"],
+                x=compare_frame["local_timestamp"],
                 y=normalize_close(compare_frame),
                 yaxis="y2",
                 mode="lines",
@@ -6314,7 +6411,7 @@ def render_trading_chart_workbench(result: dict[str, Any]) -> None:
         )
         fig.add_trace(
             go.Scatter(
-                x=[frame.iloc[-1]["timestamp"]],
+                x=[frame.iloc[-1]["local_timestamp"]],
                 y=[overlay["price"]],
                 mode="markers+text",
                 marker=dict(size=12, color=overlay["color"], line=dict(color="#ffffff", width=1)),
@@ -6374,7 +6471,7 @@ def render_trading_chart_workbench(result: dict[str, Any]) -> None:
 
     render_chart_stats(frame)
 
-    with st.expander(t("measure_data"), expanded=True):
+    with st.expander(t("measure_data"), expanded=False):
         render_measurement(frame)
         st.markdown(f"#### {t('full_ohlcv')}")
         st.dataframe(
@@ -6408,13 +6505,16 @@ def render_last_artifacts() -> None:
         st.markdown(f"#### {t('chart_snapshots')}")
         tabs = st.tabs(
             [
-                f"{item.get('symbol')} · {item.get('granularity')}s · {item.get('created_at', '')[11:19]}"
+                f"{item.get('symbol')} · {item.get('granularity')}s · {local_time_label(item.get('created_at'), '%H:%M:%S MYT')}"
                 for item in snapshots
             ]
         )
         for tab, item in zip(tabs, snapshots, strict=False):
             with tab:
-                st.caption(f"{t('snapshot_time')}: {item.get('created_at')} · source={item.get('source')}")
+                st.caption(
+                    f"{t('snapshot_time')}: {local_time_label(item.get('created_at'))} · "
+                    f"UTC={item.get('created_at')} · source={item.get('source')}"
+                )
                 render_trading_chart_workbench(item["result"])
     elif st.session_state.last_candles and st.session_state.last_candles.get("ok"):
         render_trading_chart_workbench(st.session_state.last_candles)
@@ -7139,6 +7239,156 @@ def micro_price_frame_from_text(raw: str) -> pd.DataFrame:
     return normalize_price_frame(values)
 
 
+def micro_operator_brief(
+    decision: dict[str, Any],
+    budget_check: dict[str, Any],
+    backtest: dict[str, Any],
+    frame: pd.DataFrame,
+    *,
+    lang: str | None = None,
+) -> dict[str, Any]:
+    language = lang or current_lang()
+    action = str(decision.get("action") or "WAIT")
+    confidence = float(decision.get("confidence") or 0.0)
+    blockers = [str(item) for item in decision.get("blockers") or []]
+    summary = backtest.get("summary") or {}
+    trade_count = int(summary.get("trade_count") or 0)
+    total_pnl = float(summary.get("total_pnl") or 0.0)
+    win_rate = summary.get("win_rate")
+    budget_ok = bool(budget_check.get("ok"))
+    halt_reason = summary.get("halt_reason") or "none"
+
+    if not budget_ok:
+        recommendation = "DO_NOT_TRADE"
+        headline = (
+            "预算闸门阻止本轮交易，先不要动本金。"
+            if language == "zh"
+            else "Budget guard blocks this run. Keep capital untouched."
+        )
+    elif action in {"WAIT", "HOLD"}:
+        recommendation = "WAIT"
+        headline = (
+            "当前没有干净的小笔交易优势，先等更强信号。"
+            if language == "zh"
+            else "No clean small-trade edge yet. Wait for a stronger signal."
+        )
+    else:
+        recommendation = "PAPER_ONLY"
+        headline = (
+            f"当前可做 {action} 纸面验证，但真实执行必须继续走确认闸门。"
+            if language == "zh"
+            else f"{action} is allowed for paper trading, but keep live execution behind confirmation."
+        )
+
+    risk_items = [
+        f"single_trade_amount={decision.get('risk', {}).get('max_trade_amount', 'N/A')}",
+        f"budget={budget_check.get('reason', 'unknown')}",
+        f"halt={halt_reason}",
+    ]
+    if blockers:
+        risk_items.append("blockers=" + ", ".join(blockers))
+
+    next_steps = []
+    if recommendation == "DO_NOT_TRADE":
+        next_steps.append(
+            "先降低单次金额，或确认已用预算后再尝试。"
+            if language == "zh"
+            else "Reduce amount or reset spent budget before any new attempt."
+        )
+    elif recommendation == "WAIT":
+        next_steps.append(
+            "先刷新/补充最新收盘价，再重新运行判断。"
+            if language == "zh"
+            else "Collect fresher closes and rerun before considering a trade."
+        )
+    else:
+        next_steps.append(
+            "先只当作纸面信号；等多轮胜率和 PnL 稳定后再考虑执行。"
+            if language == "zh"
+            else "Use this only as a paper signal until repeated runs show stable win rate and PnL."
+        )
+    next_steps.append(
+        "不要绕过主交易台的人工确认闸门。"
+        if language == "zh"
+        else "Do not bypass the main trading desk confirmation gate."
+    )
+
+    return {
+        "headline": headline,
+        "recommendation": recommendation,
+        "action": action,
+        "confidence": confidence,
+        "latest_price": decision.get("latest_price"),
+        "bars": len(frame),
+        "trade_count": trade_count,
+        "win_rate": win_rate,
+        "total_pnl": total_pnl,
+        "ending_equity": summary.get("ending_equity"),
+        "risk_items": risk_items,
+        "evidence": {
+            "momentum_3_pct": decision.get("momentum_3_pct"),
+            "momentum_7_pct": decision.get("momentum_7_pct"),
+            "volatility_pct": decision.get("volatility_pct"),
+            "gross_edge_pct": decision.get("gross_edge_pct"),
+            "short_ema": decision.get("short_ema"),
+            "long_ema": decision.get("long_ema"),
+        },
+        "next_steps": next_steps,
+    }
+
+
+def micro_trades_table(trades: list[dict[str, Any]]) -> pd.DataFrame:
+    if not trades:
+        return pd.DataFrame()
+    frame = pd.DataFrame(trades)
+    columns = [
+        "index",
+        "action",
+        "entry_price",
+        "exit_price",
+        "amount",
+        "return_pct",
+        "pnl",
+        "equity",
+        "confidence",
+        "blockers",
+    ]
+    frame = frame[[column for column in columns if column in frame.columns]].copy()
+    if "blockers" in frame.columns:
+        frame["blockers"] = frame["blockers"].apply(lambda value: ", ".join(value) if isinstance(value, list) else value)
+    return frame.rename(
+        columns={
+            "index": "bar",
+            "entry_price": "entry",
+            "exit_price": "exit",
+            "return_pct": "return_%",
+        }
+    )
+
+
+def micro_recent_runs_table(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame()
+    frame = pd.DataFrame(rows)
+    columns = [
+        "created_at",
+        "symbol",
+        "asset_kind",
+        "action",
+        "confidence",
+        "budget_ok",
+        "trade_count",
+        "total_pnl",
+        "halted",
+        "goal",
+    ]
+    frame = frame[[column for column in columns if column in frame.columns]].copy()
+    for column in ("budget_ok", "halted"):
+        if column in frame.columns:
+            frame[column] = frame[column].map({1: "yes", 0: "no", True: "yes", False: "no"}).fillna(frame[column])
+    return frame
+
+
 def render_micro_strategy_page() -> None:
     st.markdown(f"### {t('micro_strategy')}")
     st.markdown(f'<p class="small-muted">{html.escape(t("micro_strategy_caption"))}</p>', unsafe_allow_html=True)
@@ -7167,7 +7417,8 @@ def render_micro_strategy_page() -> None:
         recent_runs = load_recent_micro_strategy_runs()
         if recent_runs:
             st.markdown(f"#### {t('micro_recent_runs')}")
-            st.dataframe(recent_runs, width="stretch", height=min(340, 72 + len(recent_runs) * 32))
+            recent_table = micro_recent_runs_table(recent_runs)
+            st.dataframe(recent_table, width="stretch", height=min(340, 72 + len(recent_table) * 32))
         return
 
     frame = micro_price_frame_from_text(prices_text)
@@ -7212,7 +7463,43 @@ def render_micro_strategy_page() -> None:
         budget_check=budget_check,
         backtest=backtest,
     )
+    push_runtime_event(
+        "micro_strategy",
+        "Micro Strategy",
+        "Sync Bus",
+        f"{config.symbol} {decision.get('action')} run saved",
+        {
+            "symbol": config.symbol,
+            "action": decision.get("action"),
+            "budget_ok": budget_check.get("ok"),
+            "trade_count": (backtest.get("summary") or {}).get("trade_count"),
+        },
+    )
     st.success(t("micro_saved"))
+
+    operator_brief = micro_operator_brief(decision, budget_check, backtest, frame)
+    st.markdown(f"#### {t('micro_operator_brief')}")
+    st.info(operator_brief["headline"])
+    brief_cols = st.columns(5)
+    brief_cols[0].metric(t("micro_operator_recommendation"), operator_brief["recommendation"])
+    brief_cols[1].metric("Action", operator_brief["action"])
+    brief_cols[2].metric("Confidence", f"{operator_brief['confidence']:.0%}")
+    brief_cols[3].metric("Paper PnL", f"{operator_brief['total_pnl']:+.5f}")
+    brief_cols[4].metric("Trades", int(operator_brief["trade_count"]))
+
+    info_cols = st.columns([0.34, 0.33, 0.33])
+    with info_cols[0]:
+        st.markdown(f"##### {t('micro_risk_brief')}")
+        for item in operator_brief["risk_items"]:
+            st.markdown(f"- `{item}`")
+    with info_cols[1]:
+        st.markdown(f"##### {t('micro_evidence')}")
+        evidence_rows = [{"signal": key, "value": value} for key, value in operator_brief["evidence"].items()]
+        st.dataframe(evidence_rows, width="stretch", hide_index=True, height=248)
+    with info_cols[2]:
+        st.markdown(f"##### {t('micro_next_steps')}")
+        for item in operator_brief["next_steps"]:
+            st.markdown(f"- {html.escape(item)}")
 
     st.markdown(f"#### {t('micro_decision')}")
     cols = st.columns(5)
@@ -7221,7 +7508,8 @@ def render_micro_strategy_page() -> None:
     cols[2].metric("Volatility", f"{float(decision.get('volatility_pct') or 0):.3f}%")
     cols[3].metric("Budget", str(budget_check.get("reason")))
     cols[4].metric("Bars", len(frame))
-    st.json({"decision": decision, "budget_guard": budget_check})
+    with st.expander("Raw decision payload", expanded=False):
+        st.json({"decision": decision, "budget_guard": budget_check})
 
     st.markdown(f"#### {t('micro_backtest')}")
     summary = backtest.get("summary") or {}
@@ -7232,15 +7520,18 @@ def render_micro_strategy_page() -> None:
     backtest_cols[3].metric("Equity", f"{float(summary.get('ending_equity') or 100):.5f}")
     backtest_cols[4].metric("Halt", str(summary.get("halt_reason") or "none"))
     trades = backtest.get("trades") or []
-    if trades:
-        st.dataframe(trades, width="stretch", height=min(320, 72 + len(trades) * 32))
+    trade_table = micro_trades_table(trades)
+    if not trade_table.empty:
+        st.markdown(f"##### {t('micro_trade_log')}")
+        st.dataframe(trade_table, width="stretch", height=min(360, 72 + len(trade_table) * 32))
     else:
         st.info(t("micro_no_trade"))
 
     recent_runs = load_recent_micro_strategy_runs()
     if recent_runs:
         st.markdown(f"#### {t('micro_recent_runs')}")
-        st.dataframe(recent_runs, width="stretch", height=min(340, 72 + len(recent_runs) * 32))
+        recent_table = micro_recent_runs_table(recent_runs)
+        st.dataframe(recent_table, width="stretch", height=min(340, 72 + len(recent_table) * 32))
 
 
 def render_trading_page() -> None:
