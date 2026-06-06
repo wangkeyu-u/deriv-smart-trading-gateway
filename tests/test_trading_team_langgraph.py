@@ -40,3 +40,41 @@ def test_incomplete_trade_graph_returns_clarification_without_execution() -> Non
     assert "方向 CALL/PUT" in result.final_answer
     assert "execution" not in (result.agent_reports or {})
     assert "market" not in (result.agent_reports or {})
+
+
+def test_team_graph_execution_blockers_include_risk_and_compliance() -> None:
+    blockers = web_app.team_graph_execution_blockers(
+        {
+            "missing_fields": [],
+            "guardrails": [],
+            "agent_reports": {
+                "risk": {"ok": False, "reason": "missing_deriv_api_token"},
+                "compliance": {"ok": False, "blockers": ["missing_direction"]},
+            },
+        }
+    )
+
+    assert blockers == ["missing_deriv_api_token", "missing_direction"]
+
+
+def test_complete_trade_without_token_is_graph_blocked_before_execution(monkeypatch) -> None:
+    def fake_market_agent(args, events, writer=None):
+        return {"role": "Market Analyst Agent", "ok": True, "summary": "fake market ok"}
+
+    def fake_risk_agent(args, events, writer=None):
+        return {"role": "Risk Sentinel", "ok": False, "status": "blocked", "reason": "missing_deriv_api_token"}
+
+    def fail_execution(*args, **kwargs):
+        raise AssertionError("execution_agent should be blocked by LangGraph guardrail")
+
+    web_app.init_state()
+    monkeypatch.setattr(web_app, "assign_task_to_market_agent", fake_market_agent)
+    monkeypatch.setattr(web_app, "assign_task_to_risk_agent", fake_risk_agent)
+    monkeypatch.setattr(web_app, "execution_agent", fail_execution)
+
+    result = web_app.run_trading_team_langgraph("帮我用 1 美金买 R_100 看涨 5 ticks")
+
+    assert result.execution_report is not None
+    assert result.execution_report["reason"] == "graph_guardrail_blocked"
+    assert "missing_deriv_api_token" in result.execution_report["blockers"]
+    assert "没有提交订单" in result.final_answer

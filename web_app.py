@@ -5075,6 +5075,10 @@ def deterministic_manager_summary(
             f"合同 ID：{receipt.get('contract_id')}，成交价：{receipt.get('purchase_price')}。"
         )
     if execution_report and not execution_report.get("ok"):
+        if execution_report.get("reason") == "graph_guardrail_blocked":
+            blockers = execution_report.get("blockers") or []
+            blocker_text = ", ".join(str(item) for item in blockers) if blockers else "guardrail_blocked"
+            return f"经理总结：图级风控未放行执行，原因：{blocker_text}。没有提交订单。"
         return f"经理总结：交易未完成，原因：{execution_report.get('reason') or execution_report.get('error')}。"
     if market_report:
         return f"经理总结：{market_report.get('summary')}"
@@ -5181,6 +5185,29 @@ def team_graph_agent_args(agent_id: str, state: TeamGraphState) -> dict[str, Any
     return {"task": "整理 LangGraph 团队协作复盘。"}
 
 
+def team_graph_execution_blockers(state: TeamGraphState) -> list[str]:
+    blockers: list[str] = []
+    missing_fields = list(state.get("missing_fields") or [])
+    if missing_fields:
+        blockers.append("missing_trade_parameters")
+    reports = state.get("agent_reports") or {}
+    risk_report = reports.get("risk") or {}
+    if risk_report and not risk_report.get("ok", True):
+        blockers.append(str(risk_report.get("reason") or risk_report.get("status") or "risk_blocked"))
+    compliance_report = reports.get("compliance") or {}
+    if compliance_report and not compliance_report.get("ok", True):
+        compliance_blockers = compliance_report.get("blockers") or []
+        if compliance_blockers:
+            blockers.extend(str(item) for item in compliance_blockers)
+        else:
+            blockers.append(str(compliance_report.get("status") or "compliance_blocked"))
+    for guardrail in state.get("guardrails") or []:
+        guardrail_text = str(guardrail)
+        if guardrail_text and guardrail_text != "missing_trade_parameters":
+            blockers.append(guardrail_text)
+    return list(dict.fromkeys(blockers))
+
+
 def team_graph_final_answer(state: TeamGraphState) -> str:
     missing = list(state.get("missing_fields") or [])
     if missing:
@@ -5200,15 +5227,22 @@ def make_team_graph_agent_node(agent_id: str) -> Callable[[TeamGraphState], dict
         events = list(state.get("events") or [])
         reports = dict(state.get("agent_reports") or {})
         args = team_graph_agent_args(agent_id, state)
-        if agent_id == "execution" and state.get("missing_fields"):
+        execution_blockers = team_graph_execution_blockers({**state, "agent_reports": reports}) if agent_id == "execution" else []
+        if agent_id == "execution" and execution_blockers:
             result = {
                 "role": "Execution Trader",
                 "ok": False,
                 "status": "blocked",
-                "reason": "missing_trade_parameters",
-                "missing_fields": list(state.get("missing_fields") or []),
+                "reason": "graph_guardrail_blocked",
+                "blockers": execution_blockers,
             }
-            append_team_event(events, "Guardrail", "执行交易员", "缺少关键交易参数，执行节点未放行。", None)
+            append_team_event(
+                events,
+                "Guardrail",
+                "执行交易员",
+                "图级风控未放行执行节点：" + ", ".join(execution_blockers),
+                None,
+            )
         else:
             result = manager_tool_dispatch(f"assign_task_to_{agent_id}_agent", args, events, None)
         reports[agent_id] = result
