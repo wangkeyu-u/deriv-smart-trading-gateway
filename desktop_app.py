@@ -10,8 +10,11 @@ desktop dependencies.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -19,6 +22,22 @@ import pandas as pd
 from budget_guard import BudgetLimits, budget_guard_check
 from micro_trading import analyze_micro_trade, micro_trade_config_from_goal
 import web_app
+
+
+def _configure_qt_plugin_path() -> None:
+    if os.environ.get("QT_PLUGIN_PATH") and os.environ.get("QT_QPA_PLATFORM_PLUGIN_PATH"):
+        return
+    try:
+        import PySide6
+    except Exception:
+        return
+    pyside_dir = Path(PySide6.__file__).resolve().parent
+    plugins_dir = pyside_dir / "Qt" / "plugins"
+    platform_dir = plugins_dir / "platforms"
+    if plugins_dir.exists():
+        os.environ.setdefault("QT_PLUGIN_PATH", str(plugins_dir))
+    if platform_dir.exists():
+        os.environ.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", str(platform_dir))
 
 
 def _parse_prices(raw: str) -> pd.DataFrame:
@@ -54,7 +73,163 @@ def _desktop_dependency_error(exc: Exception) -> int:
     return 2
 
 
+def _qt_preflight_ok() -> bool:
+    code = """
+from PySide6.QtWidgets import QApplication
+app = QApplication([])
+app.quit()
+""".strip()
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            env=os.environ.copy(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0
+
+
+def _main_tk(reason: str = "") -> int:
+    try:
+        import tkinter as tk
+        from tkinter import messagebox, ttk
+    except Exception as exc:
+        print("Neither PySide6 nor Tkinter desktop UI could be started.")
+        print(f"PySide6 issue: {reason}")
+        print(f"Tkinter import error: {exc}")
+        return 2
+
+    root = tk.Tk()
+    root.title("Deriv Smart Trading Gateway")
+    root.geometry("980x720")
+    root.minsize(780, 560)
+
+    style = ttk.Style()
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+    style.configure("TNotebook.Tab", padding=(16, 8))
+    style.configure("Primary.TButton", padding=(12, 8))
+
+    notebook = ttk.Notebook(root)
+    notebook.pack(fill="both", expand=True, padx=14, pady=14)
+
+    monitor = ttk.Frame(notebook, padding=16)
+    health_output = tk.Text(monitor, wrap="word", height=26)
+    ttk.Label(monitor, text="System Health", font=("Helvetica", 20, "bold")).pack(anchor="w")
+    ttk.Label(monitor, text="Local checks only. No network trading call is made here.").pack(anchor="w", pady=(4, 12))
+    health_output.pack(fill="both", expand=True)
+    notebook.add(monitor, text="Monitor")
+
+    micro = ttk.Frame(notebook, padding=16)
+    form = ttk.Frame(micro)
+    form.pack(fill="x")
+    fields: dict[str, tk.StringVar] = {
+        "goal": tk.StringVar(value="高频小额交易，先做纸面策略"),
+        "symbol": tk.StringVar(value="R_75"),
+        "amount": tk.StringVar(value="1.0"),
+        "daily": tk.StringVar(value="5.0"),
+        "total": tk.StringVar(value="5.0"),
+        "spent_today": tk.StringVar(value="0.0"),
+        "spent_total": tk.StringVar(value="0.0"),
+        "asset": tk.StringVar(value="deriv"),
+    }
+    rows = [
+        ("Goal", "goal"),
+        ("Symbol / Fund", "symbol"),
+        ("Max Trade Amount", "amount"),
+        ("Daily Budget Cap", "daily"),
+        ("Total Budget Cap", "total"),
+        ("Spent Today", "spent_today"),
+        ("Spent Total", "spent_total"),
+    ]
+    for row, (label, key) in enumerate(rows):
+        ttk.Label(form, text=label).grid(row=row, column=0, sticky="w", pady=4)
+        ttk.Entry(form, textvariable=fields[key]).grid(row=row, column=1, sticky="ew", pady=4, padx=(12, 0))
+    ttk.Label(form, text="Asset Kind").grid(row=len(rows), column=0, sticky="w", pady=4)
+    ttk.Combobox(
+        form,
+        textvariable=fields["asset"],
+        values=["deriv", "fund", "equity", "crypto", "forex"],
+        state="readonly",
+    ).grid(row=len(rows), column=1, sticky="ew", pady=4, padx=(12, 0))
+    form.columnconfigure(1, weight=1)
+
+    ttk.Label(micro, text="Recent closes").pack(anchor="w", pady=(14, 4))
+    price_input = tk.Text(micro, height=5, wrap="word")
+    price_input.insert("1.0", "100,100.03,100.06,100.10,100.15,100.22,100.30,100.39,100.49")
+    price_input.pack(fill="x")
+    micro_output = tk.Text(micro, wrap="word")
+    micro_output.pack(fill="both", expand=True, pady=(12, 0))
+
+    def refresh_health() -> None:
+        health_output.delete("1.0", "end")
+        health_output.insert("1.0", _health_text())
+        root.after(5000, refresh_health)
+
+    def analyze() -> None:
+        try:
+            frame = _parse_prices(price_input.get("1.0", "end"))
+            config = micro_trade_config_from_goal(
+                fields["goal"].get(),
+                fields["symbol"].get().strip() or "R_75",
+                asset_kind=fields["asset"].get(),  # type: ignore[arg-type]
+                default_amount=float(fields["amount"].get() or 1.0),
+            )
+            budget = budget_guard_check(
+                action="execute_simulated_trade" if config.asset_kind == "deriv" else "spot_paper_trade",
+                amount=config.max_trade_amount,
+                limits=BudgetLimits(
+                    max_single_trade_amount=float(fields["amount"].get() or 1.0),
+                    max_daily_trade_budget=float(fields["daily"].get() or 5.0),
+                    max_total_trade_budget=float(fields["total"].get() or 5.0),
+                ),
+                daily_spent=float(fields["spent_today"].get() or 0.0),
+                total_spent=float(fields["spent_total"].get() or 0.0),
+            )
+            result = analyze_micro_trade(frame, config)
+            result["micro_budget_guard"] = budget
+            if not budget.get("ok"):
+                result["action"] = "WAIT" if config.asset_kind == "deriv" else "HOLD"
+                result["blockers"] = list(result.get("blockers") or []) + [str(budget.get("reason"))]
+            result["generated_at"] = datetime.utcnow().isoformat() + "Z"
+            result["desktop_runtime"] = "tkinter_fallback"
+            micro_output.delete("1.0", "end")
+            micro_output.insert("1.0", json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        except Exception as exc:
+            messagebox.showwarning("Analysis failed", str(exc))
+
+    ttk.Button(micro, text="Analyze Micro Strategy", style="Primary.TButton", command=analyze).pack(anchor="w", pady=12)
+    notebook.add(micro, text="Micro Strategy")
+
+    background = ttk.Frame(notebook, padding=16)
+    ttk.Label(background, text="Background Mode", font=("Helvetica", 20, "bold")).pack(anchor="w")
+    ttk.Label(
+        background,
+        text=(
+            "PySide6 tray mode is unavailable on this machine, so this fallback "
+            "desktop window keeps the operator tools available without crashing."
+        ),
+        wraplength=720,
+    ).pack(anchor="w", pady=(8, 18))
+    ttk.Label(background, text=f"Fallback reason: {reason}", wraplength=720).pack(anchor="w")
+    ttk.Button(background, text="Quit Desktop App", command=root.destroy).pack(anchor="w", pady=18)
+    notebook.add(background, text="Background")
+
+    refresh_health()
+    root.mainloop()
+    return 0
+
+
 def main() -> int:
+    _configure_qt_plugin_path()
+    if not _qt_preflight_ok():
+        return _main_tk("Qt platform plugin preflight failed")
     try:
         from PySide6.QtCore import QTimer
         from PySide6.QtGui import QAction, QIcon
