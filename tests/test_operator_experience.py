@@ -24,10 +24,13 @@ def test_micro_operator_brief_prioritizes_readable_recommendation() -> None:
         {"ok": True, "reason": "within_budget"},
         {"summary": {"trade_count": 4, "total_pnl": 0.018, "ending_equity": 100.018, "halt_reason": None}},
         frame,
+        data_source="live",
+        symbol="R_75",
     )
 
-    assert brief["recommendation"] == "PAPER_ONLY"
+    assert brief["recommendation"] == "观察跟踪"
     assert brief["action"] == "CALL"
+    assert brief["data_quality"] == "实时K线"
     assert brief["trade_count"] == 4
     assert "headline" in brief
     assert brief["next_steps"]
@@ -41,8 +44,29 @@ def test_micro_operator_brief_blocks_when_budget_fails() -> None:
         pd.DataFrame({"close": [100]}),
     )
 
-    assert brief["recommendation"] == "DO_NOT_TRADE"
+    assert brief["recommendation"] == "禁止交易"
     assert "single_trade_limit_exceeded" in " ".join(brief["risk_items"])
+
+
+def test_micro_operator_brief_overrides_signal_when_backtest_is_weak() -> None:
+    brief = web_app.micro_operator_brief(
+        {"action": "CALL", "confidence": 0.94, "risk": {"max_trade_amount": 1}},
+        {"ok": True, "reason": "within_budget"},
+        {
+            "summary": {
+                "trade_count": 13,
+                "win_rate": 0.4615,
+                "total_pnl": -0.0008892,
+                "halt_reason": "max_consecutive_losses",
+            }
+        },
+        pd.DataFrame({"close": [100, 101]}),
+        data_source="live",
+        symbol="R_75",
+    )
+
+    assert brief["recommendation"] == "暂不执行"
+    assert "纸面回测不支持执行" in brief["headline"]
 
 
 def test_micro_tables_keep_operator_relevant_columns() -> None:
