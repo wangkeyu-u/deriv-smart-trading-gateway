@@ -79,3 +79,17 @@ def test_ui_does_not_render_debug_code_blocks() -> None:
 
     assert "st.code(" not in source
     assert "st.json(" not in source
+
+
+def test_init_state_can_prefill_local_environment_secrets(monkeypatch) -> None:
+    monkeypatch.setenv("DERIV_API_TOKEN", "demo-token")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-reasoner")
+
+    web_app.st.session_state.clear()
+    web_app.init_state()
+
+    assert web_app.st.session_state.deriv_token == "demo-token"
+    assert web_app.st.session_state.llm_provider == "DeepSeek"
+    assert web_app.st.session_state.llm_api_key == "deepseek-key"
+    assert web_app.st.session_state.llm_model == "deepseek-reasoner"

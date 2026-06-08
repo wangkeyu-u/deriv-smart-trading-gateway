@@ -13,6 +13,7 @@ import html
 import operator
 import json
 import math
+import os
 import re
 import sqlite3
 import time
@@ -1221,6 +1222,18 @@ def init_local_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_memory_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                task TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                ok INTEGER NOT NULL
+            )
+            """
+        )
 
 
 def save_team_run(user_prompt: str, result: TeamRunResult) -> None:
@@ -1263,12 +1276,42 @@ def save_team_run(user_prompt: str, result: TeamRunResult) -> None:
                     str(receipt.get("contract_id") or ""),
                     str(receipt.get("symbol") or ""),
                     str(receipt.get("contract_type") or ""),
-                    float(receipt.get("purchase_price") or 0),
+                    float(receipt.get("amount") or 0),
                     float(receipt.get("purchase_price") or 0),
                     str(receipt.get("currency") or ""),
                     json.dumps(receipt, ensure_ascii=False, default=str),
                 ),
             )
+
+
+def _json_load(value: Any, fallback: Any) -> Any:
+    try:
+        return json.loads(str(value or ""))
+    except (TypeError, json.JSONDecodeError):
+        return fallback
+
+
+def load_latest_team_run() -> dict[str, Any] | None:
+    init_local_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT
+                id, created_at, user_prompt, final_answer, ok, events_json,
+                market_report_json, execution_report_json, log_text
+            FROM team_runs
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    if not row:
+        return None
+    record = dict(row)
+    record["events"] = _json_load(record.get("events_json"), [])
+    record["market_report"] = _json_load(record.get("market_report_json"), None)
+    record["execution_report"] = _json_load(record.get("execution_report_json"), None)
+    return record
 
 
 def load_recent_runs(limit: int = 5) -> list[dict[str, Any]]:
@@ -1431,6 +1474,55 @@ def load_recent_micro_strategy_runs(limit: int = 8) -> list[dict[str, Any]]:
         record["payload"] = payload if isinstance(payload, dict) else {}
         records.append(record)
     return records
+
+
+def save_agent_memory_item(agent_id: str, item: dict[str, Any]) -> None:
+    init_local_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO agent_memory_items (created_at, agent_id, task, summary, ok)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now(timezone.utc).isoformat(),
+                str(agent_id),
+                str(item.get("task") or "")[:500],
+                str(item.get("summary") or "")[:1200],
+                1 if item.get("ok", True) else 0,
+            ),
+        )
+
+
+def load_agent_memory_items(limit_per_agent: int = 5) -> dict[str, list[dict[str, Any]]]:
+    init_local_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT id, created_at, agent_id, task, summary, ok
+            FROM agent_memory_items
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (max(1, int(limit_per_agent)) * max(1, len(AGENT_SPECS) + len(advisor_specs()) + 4),),
+        ).fetchall()
+    memory: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        record = dict(row)
+        agent_id = str(record.pop("agent_id"))
+        items = memory.setdefault(agent_id, [])
+        if len(items) >= limit_per_agent:
+            continue
+        items.append(
+            {
+                "time": local_time_label(record.get("created_at"), "%H:%M:%S"),
+                "task": record.get("task") or "",
+                "summary": record.get("summary") or "",
+                "ok": bool(record.get("ok")),
+            }
+        )
+    return {agent_id: list(reversed(items)) for agent_id, items in memory.items()}
 
 
 SYSTEM_PROMPT = """
@@ -1666,13 +1758,35 @@ def manager_system_prompt() -> str:
 
 
 def init_state() -> None:
+    deriv_token_default = os.environ.get("DERIV_API_TOKEN", "").strip()
+    llm_provider_default: Provider = "本地规则"
+    llm_api_key_default = ""
+    llm_model_default = "local-rule-engine"
+    custom_base_url_default = os.environ.get("OPENAI_COMPATIBLE_BASE_URL", "").strip()
+    if os.environ.get("OPENAI_API_KEY"):
+        llm_provider_default = "OpenAI"
+        llm_api_key_default = os.environ["OPENAI_API_KEY"].strip()
+        llm_model_default = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip()
+    elif os.environ.get("DEEPSEEK_API_KEY"):
+        llm_provider_default = "DeepSeek"
+        llm_api_key_default = os.environ["DEEPSEEK_API_KEY"].strip()
+        llm_model_default = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat").strip()
+    elif os.environ.get("ANTHROPIC_API_KEY"):
+        llm_provider_default = "Anthropic"
+        llm_api_key_default = os.environ["ANTHROPIC_API_KEY"].strip()
+        llm_model_default = os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest").strip()
+    elif os.environ.get("OPENAI_COMPATIBLE_API_KEY"):
+        llm_provider_default = "OpenAI-Compatible"
+        llm_api_key_default = os.environ["OPENAI_COMPATIBLE_API_KEY"].strip()
+        llm_model_default = os.environ.get("OPENAI_COMPATIBLE_MODEL", "custom-model").strip()
+
     defaults = {
-        "deriv_token": "",
-        "llm_provider": "本地规则",
-        "llm_api_key": "",
-        "llm_model": "local-rule-engine",
-        "custom_base_url": "",
-        "provider": "本地规则",
+        "deriv_token": deriv_token_default,
+        "llm_provider": llm_provider_default,
+        "llm_api_key": llm_api_key_default,
+        "llm_model": llm_model_default,
+        "custom_base_url": custom_base_url_default,
+        "provider": llm_provider_default,
         "require_trade_confirmation": True,
         "confirm_next_trade": False,
         "allow_live_execution": False,
@@ -1726,6 +1840,66 @@ def init_state() -> None:
             st.session_state.llm_model = st.session_state.get(
                 "anthropic_model", "claude-3-5-sonnet-latest"
             )
+
+
+def is_initial_message_stack(messages: list[dict[str, Any]] | None) -> bool:
+    if not messages or len(messages) != 1:
+        return False
+    message = messages[0]
+    return message.get("role") == "assistant" and message.get("content") in {
+        text_for("zh", "initial_message"),
+        text_for("en", "initial_message"),
+    }
+
+
+def hydrate_persisted_session_state() -> None:
+    if st.session_state.get("persisted_state_loaded"):
+        return
+
+    advisor_records = load_advisor_run_records(6)
+    advisor_results = [
+        record.get("result")
+        for record in advisor_records
+        if isinstance(record.get("result"), dict) and record.get("result")
+    ]
+    if advisor_results and not st.session_state.get("last_advisor_result"):
+        st.session_state.last_advisor_result = advisor_results[0]
+        st.session_state.advisor_runs = advisor_results[:6]
+        st.session_state.advisor_symbol = str(advisor_results[0].get("symbol") or DEFAULT_SYMBOL)
+
+    latest_team = load_latest_team_run()
+    if latest_team:
+        if is_initial_message_stack(st.session_state.get("messages")):
+            st.session_state.messages = [
+                {"role": "user", "content": str(latest_team.get("user_prompt") or "")},
+                {"role": "assistant", "content": str(latest_team.get("final_answer") or "")},
+            ]
+        if latest_team.get("log_text"):
+            st.session_state.agent_execution_log = str(latest_team.get("log_text"))
+        events = latest_team.get("events")
+        if isinstance(events, list) and events:
+            st.session_state.team_events = [str(event) for event in events][-80:]
+        reports: dict[str, dict[str, Any]] = {}
+        if latest_team.get("market_report"):
+            reports["market"] = {
+                "updated_at": str(latest_team.get("created_at") or ""),
+                "report": latest_team["market_report"],
+            }
+        execution_report = latest_team.get("execution_report")
+        if execution_report:
+            reports["execution"] = {
+                "updated_at": str(latest_team.get("created_at") or ""),
+                "report": execution_report,
+            }
+            if isinstance(execution_report, dict) and execution_report.get("ok"):
+                st.session_state.last_trade_receipt = {"ok": True, "data": {"receipt": execution_report.get("receipt") or {}}}
+        if reports and not st.session_state.get("agent_reports"):
+            st.session_state.agent_reports = reports
+
+    if not st.session_state.get("agent_memory"):
+        st.session_state.agent_memory = load_agent_memory_items()
+
+    st.session_state.persisted_state_loaded = True
 
 
 def configure_page() -> None:
@@ -3860,11 +4034,14 @@ def append_agent_memory_to_state(
     agent_id: str,
     memory: dict[str, Any],
     limit: int = 20,
+    persist: bool = False,
 ) -> None:
     memories = dict(state.get("agent_memory", {}) or {})
     current = list(memories.get(agent_id, []))
     memories[agent_id] = (current + [memory])[-limit:]
     state["agent_memory"] = memories
+    if persist:
+        save_agent_memory_item(agent_id, memory)
 
 
 def recent_agent_memory(agent_id: str, limit: int = 5) -> list[dict[str, Any]]:
@@ -4119,6 +4296,7 @@ def remember_agent_report(agent_id: str, report: dict[str, Any]) -> None:
             "summary": summary[:800],
             "ok": bool(report.get("ok", True)),
         },
+        persist=True,
     )
     st.session_state.agent_reports[agent_id] = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -5488,6 +5666,7 @@ def remember_manager_memory(user_text: str, result: TeamRunResult) -> None:
             "summary": result.final_answer[:800],
             "ok": result.ok,
         },
+        persist=True,
     )
 
 
@@ -8720,6 +8899,7 @@ def render_monitor_page() -> None:
 
 def main() -> None:
     init_state()
+    hydrate_persisted_session_state()
     configure_page()
     render_sidebar()
     render_header()

@@ -12,6 +12,33 @@ The newest layer is the **Boss Advisor Room**: a LangGraph council where multipl
 
 The project is moving toward a **native desktop operator app** with background runtime support. Streamlit remains available as an operator console, while LangGraph handles agent orchestration and FastMCP exposes the Deriv tool layer for MCP-compatible clients.
 
+## Technology Stack
+
+| Layer | Technology | Why It Is Used |
+| --- | --- | --- |
+| Agent orchestration | LangGraph | Models trading work as an explicit state graph instead of a single prompt. This makes routing, guardrails, memory, and tests easier to control. |
+| Tool server | FastMCP | Exposes Deriv market and execution tools to MCP-compatible clients while keeping tool boundaries explicit. |
+| Market data | Deriv WebSocket API | Provides live ticks, candle history, account checks, proposals, buys, open-contract status, and close-contract flows. |
+| Strategy engine | Python + pandas | Keeps numerical work deterministic: EMA, momentum, volatility, cost edge, confidence, paper PnL, and circuit breakers. |
+| AI providers | OpenAI-compatible chat API, DeepSeek, Anthropic, local rules | Lets every agent run with configurable prompts and provider choice instead of being locked to one model. |
+| Persistence | SQLite | Stores local run history, advisor results, micro-strategy runs, trade receipts, audit logs, and agent memory without requiring a remote database. |
+| Charts | Plotly | Renders candlesticks, moving averages, advisor overlays, zoom, measurement, and exportable chart views. |
+| Operator UI | Streamlit | Provides a fast multi-page control console for advisor, trading desk, charts, micro strategy, and monitoring. |
+| Desktop shell | PySide6 | Provides a native app surface, background behavior, and tray-style operator workflow. |
+| Validation | pytest, smoke tests, browser checks | Covers parsing, prompts, LangGraph compilation, safety gates, persistence, market tools, and UI rendering. |
+
+## Design Philosophy
+
+The system is intentionally not an "AI says buy, then buys" demo. The architecture separates reasoning, calculation, safety, and execution:
+
+- LLM agents reason, debate, summarize, and coordinate work.
+- Deterministic Python code calculates prices, indicators, budgets, and circuit breakers.
+- LangGraph controls which agent can run next and blocks execution before unsafe nodes are called.
+- SQLite keeps a local audit trail so the operator can reopen the app and continue from recent context.
+- Human confirmation remains the final write gate before any Deriv order submission.
+
+This makes the project closer to a controlled AI operations system than a single chatbot.
+
 ## Highlights
 
 - **LangGraph trading team runtime** with supervisor routing, graph nodes, handoff-style routing, guardrails, shared state, and per-agent memory.
@@ -88,7 +115,7 @@ The native desktop app is the intended long-term operator surface. It does not r
 Run it directly:
 
 ```bash
-cd /Users/wangkeyu/Documents/项目
+cd deriv-smart-trading-gateway
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/pip install -r desktop_requirements.txt
@@ -98,7 +125,7 @@ python3 -m venv .venv
 On macOS you can double-click:
 
 ```text
-/Users/wangkeyu/Documents/项目/Deriv Desktop.command
+Deriv Desktop.command
 ```
 
 Current desktop modules:
@@ -110,7 +137,7 @@ Current desktop modules:
 Build a macOS desktop app bundle:
 
 ```bash
-cd /Users/wangkeyu/Documents/项目
+cd deriv-smart-trading-gateway
 scripts/build_desktop_app.sh
 open "dist/Deriv Smart Trading Gateway.app"
 ```
@@ -142,7 +169,7 @@ This module is intentionally non-executing by default. It produces analysis, pap
 ## Streamlit Quick Start
 
 ```bash
-cd /Users/wangkeyu/Documents/项目
+cd deriv-smart-trading-gateway
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/streamlit run web_app.py --server.port 8501
@@ -157,7 +184,7 @@ http://localhost:8501
 On macOS you can also double-click:
 
 ```text
-/Users/wangkeyu/Documents/项目/Deriv Gateway.command
+Deriv Gateway.command
 ```
 
 The launcher creates `.venv` if needed, installs dependencies, and opens the Streamlit app.
@@ -165,7 +192,7 @@ The launcher creates `.venv` if needed, installs dependencies, and opens the Str
 ## Run The MCP Server
 
 ```bash
-cd /Users/wangkeyu/Documents/项目
+cd deriv-smart-trading-gateway
 .venv/bin/python server.py
 ```
 
@@ -263,7 +290,54 @@ The app stores run history and audit records in a local SQLite database:
 local_data/gateway.sqlite3
 ```
 
-Stored records include team runs, advisor runs, micro-strategy runs, role dialogue, API traces, execution logs, and trade receipts. API keys are not written to this database.
+The database is created automatically on first run. You do not need a remote account or cloud database for local persistence.
+
+Stored records include:
+
+- `team_runs`: user prompt, final manager answer, agent event timeline, market report, execution report, and execution log.
+- `advisor_runs`: advisor question, symbol, consensus, confidence, full result JSON, and paper-evaluation context.
+- `micro_strategy_runs`: small-trade strategy goal, symbol, action, confidence, budget result, paper PnL, trade count, and circuit-breaker state.
+- `trade_receipts`: Deriv demo/live receipt metadata when an order is actually submitted.
+- `agent_memory_items`: short memory summaries for manager, market, strategy, risk, compliance, chart, execution, report, and advisor agents.
+
+On app startup, the workspace hydrates from SQLite:
+
+- the latest trading-desk prompt and answer are restored into the chat area;
+- the latest execution log and agent timeline are restored;
+- the latest advisor result is restored as the active advisor context;
+- recent advisor, team, and micro-strategy runs appear in the sidebar and page tables;
+- per-agent memory is restored so agents do not start from a completely blank context.
+
+For safety, some values are intentionally not persisted:
+
+- Deriv API tokens;
+- model API keys;
+- browser session state;
+- pending trade confirmations.
+
+Pending trade confirmations are not restored because an old pending order could become stale or unsafe. After reopening the app, the operator must re-check data freshness and confirm a new trade attempt.
+
+If you want the app to prefill secrets without storing them in SQLite, configure local environment variables before launch:
+
+```bash
+export DERIV_API_TOKEN="your-demo-token"
+export OPENAI_API_KEY="your-openai-key"
+# or:
+export DEEPSEEK_API_KEY="your-deepseek-key"
+export ANTHROPIC_API_KEY="your-anthropic-key"
+export OPENAI_COMPATIBLE_API_KEY="your-compatible-key"
+export OPENAI_COMPATIBLE_BASE_URL="https://api.your-provider.com/v1"
+```
+
+The UI masks these values, and audit export still excludes them.
+
+To reset local history, stop the app and remove the SQLite file:
+
+```bash
+rm local_data/gateway.sqlite3
+```
+
+API keys are not written to the database. They live only in the current UI session and are masked in the interface.
 
 ## Model Providers
 
@@ -309,10 +383,14 @@ Run the checks:
 Recent validation:
 
 ```text
-13 passed
+77 passed
 dependencies: OK
 prompts_and_symbols: OK
+advisor_evaluation: OK
 langgraph_compile: OK
+micro_trading_engine: OK
+budget_guard: OK
+paper_trading: OK
 deriv_market_tools: OK
 advisor_runtime: OK
 ```
