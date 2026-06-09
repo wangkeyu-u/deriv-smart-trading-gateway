@@ -589,6 +589,7 @@ async def execute_simulated_trade(
                 "purchase_price": buy.get("buy_price") or buy.get("purchase_price") or ask_price,
                 "currency": currency,
                 "symbol": params.symbol,
+                "amount": params.amount,
                 "contract_type": params.contract_type,
                 "duration": params.duration,
                 "duration_unit": params.duration_unit,
