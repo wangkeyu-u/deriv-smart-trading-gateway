@@ -66,28 +66,87 @@ FRESHNESS_LIMITS_SECONDS = {
     "advisor": 300,
 }
 COMMON_DERIV_SYMBOLS = [
+    # --- Volatility ---
     "R_10",
     "R_25",
     "R_50",
     "R_75",
     "R_100",
+    # --- 1-second Volatility ---
     "1HZ10V",
+    "1HZ15V",
     "1HZ25V",
+    "1HZ30V",
     "1HZ50V",
     "1HZ75V",
+    "1HZ90V",
     "1HZ100V",
+    # --- Boom ---
+    "BOOM50",
+    "BOOM150N",
+    "BOOM300N",
     "BOOM500",
+    "BOOM600",
+    "BOOM900",
     "BOOM1000",
+    # --- Crash ---
+    "CRASH50",
+    "CRASH150N",
+    "CRASH300N",
     "CRASH500",
+    "CRASH600",
+    "CRASH900",
     "CRASH1000",
+    # --- Jump ---
     "JD10",
     "JD25",
     "JD50",
     "JD75",
     "JD100",
+    # --- Step ---
+    "stpRNG",
+    "stpRNG2",
+    "stpRNG3",
+    "stpRNG4",
+    "stpRNG5",
+    # --- Range Break ---
+    "RB100",
+    "RB200",
+    # --- Bear / Bull ---
+    "RDBEAR",
+    "RDBULL",
+    # --- Baskets ---
+    "WLDAUD",
+    "WLDEUR",
+    "WLDGBP",
+    "WLDUSD",
+    "WLDXAU",
+    # --- Major forex ---
+    "frxAUDJPY",
+    "frxAUDUSD",
+    "frxEURAUD",
+    "frxEURCAD",
+    "frxEURCHF",
+    "frxEURGBP",
+    "frxEURJPY",
     "frxEURUSD",
+    "frxGBPAUD",
+    "frxGBPJPY",
     "frxGBPUSD",
+    "frxUSDCAD",
+    "frxUSDCHF",
     "frxUSDJPY",
+    # --- Minor forex ---
+    "frxAUDCAD",
+    "frxAUDCHF",
+    "frxAUDNZD",
+    "frxEURNZD",
+    "frxGBPCAD",
+    "frxGBPCHF",
+    "frxGBPNOK",
+    "frxGBPNZD",
+    "frxNZDJPY",
+    "frxNZDUSD",
 ]
 CHART_GRANULARITY_OPTIONS = [60, 120, 300, 900, 1800, 3600]
 APP_DIR = Path(__file__).resolve().parent
@@ -886,7 +945,9 @@ def default_agent_prompts() -> dict[str, dict[str, str]]:
         },
         "advisor.chief": {
             "name": "首席谋士",
-            "prompt": "你汇总所有谋士观点，只输出一个短线结论：CALL、PUT 或 WAIT；必须包含置信度、执行前提和失效条件。",
+            "prompt": ("你汇总所有谋士观点，只输出一个短线结论：CALL、PUT 或 WAIT；必须包含置信度、执行前提和失效条件。"
+                       if current_lang() == "zh"
+                       else "Synthesize all advisor opinions into one short-term conclusion: CALL, PUT, or WAIT. Must include confidence, execution prerequisite, and invalidation condition."),
         },
     }
 
@@ -1017,9 +1078,33 @@ def has_cjk(text: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", text))
 
 
+def translate_message(text: str) -> str:
+    """Translate Chinese agent names embedded in a message string."""
+    if current_lang() == "zh":
+        return text
+    for zh, en in {
+        "用户": "User",
+        "经理": "Manager",
+        "行情分析师": "Market Analyst",
+        "风控执行员": "Risk & Execution Agent",
+        "执行交易员": "Execution Trader",
+        "策略研究员": "Strategy Researcher",
+        "风控官": "Risk Sentinel",
+        "合规审查员": "Compliance Reviewer",
+        "图表工程师": "Chart Engineer",
+        "报告员": "Report Agent",
+        "系统": "System",
+    }.items():
+        text = text.replace(zh, en)
+    return text
+
 def role_label(role: str) -> str:
     if current_lang() == "zh":
         return role
+    return role_name(role)
+
+def role_name(role: str) -> str:
+    """Translate internal Chinese role names to display names."""
     return {
         "用户": "User",
         "经理": "Manager",
@@ -1033,6 +1118,11 @@ def role_label(role: str) -> str:
         "报告员": "Report Agent",
         "系统": "System",
     }.get(role, role)
+
+
+def llm_lang_instruction() -> str:
+    """Returns output language instruction for LLM system prompts."""
+    return "请用中文输出。" if current_lang() == "zh" else "Output in English."
 
 
 def localize_event_message(event: AgentEvent) -> str:
@@ -2878,7 +2968,7 @@ def plan_with_openai_compatible(user_text: str, provider: Provider) -> ToolPlan 
         request: dict[str, Any] = {
             "model": st.session_state.llm_model,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": SYSTEM_PROMPT + "\n\n" + llm_lang_instruction()},
                 {"role": "user", "content": user_text},
             ],
             "temperature": 0.1,
@@ -2907,7 +2997,7 @@ def plan_with_anthropic(user_text: str) -> ToolPlan | None:
             model=st.session_state.llm_model,
             max_tokens=700,
             temperature=0.1,
-            system=SYSTEM_PROMPT,
+            system=SYSTEM_PROMPT + "\n\n" + llm_lang_instruction(),
             messages=[{"role": "user", "content": user_text}],
         )
         content = "\n".join(
@@ -3008,7 +3098,7 @@ def local_rule_plan(user_text: str) -> ToolPlan:
             return ToolPlan(
                 action="chat",
                 params={},
-                rationale=f"交易指令缺少 {', '.join(missing)}。",
+                rationale=("交易指令缺少 {" + ", ".join(missing) + "}。" if current_lang() == "zh" else "Trade instruction missing: " + ", ".join(missing) + "."),
             )
         return ToolPlan(
             action="execute_simulated_trade",
@@ -3022,27 +3112,27 @@ def local_rule_plan(user_text: str) -> ToolPlan:
                 "market_read": "tick",
                 "auto_execute": True,
             },
-            rationale="本地规则识别为模拟交易指令。",
+            rationale=("本地规则识别为模拟交易指令。" if current_lang() == "zh" else "Local rule engine identified a simulated trade intent."),
         )
 
     if any(keyword in user_text for keyword in ["K线", "k线", "蜡烛", "历史", "走势"]):
         return ToolPlan(
             action="get_historical_candles",
             params={"symbol": symbol, "granularity": granularity, "count": count},
-            rationale="本地规则识别为 K 线数据查询。",
+            rationale=("本地规则识别为 K 线数据查询。" if current_lang() == "zh" else "Local rule engine identified a candle data query."),
         )
 
     if any(keyword in user_text for keyword in ["最新", "行情", "报价", "tick", "价格"]):
         return ToolPlan(
             action="get_market_ticks",
             params={"symbol": symbol, "subscribe": False},
-            rationale="本地规则识别为最新行情查询。",
+            rationale=("本地规则识别为最新行情查询。" if current_lang() == "zh" else "Local rule engine identified a latest tick query."),
         )
 
     return ToolPlan(
         action="chat",
         params={},
-        rationale="没有识别到明确工具调用，进入普通说明。",
+        rationale=("没有识别到明确工具调用，进入普通说明。" if current_lang() == "zh" else "No specific tool call identified. Entering chat mode."),
     )
 
 
@@ -3267,6 +3357,26 @@ def extract_condition(text: str) -> dict[str, Any] | None:
 
 def advisor_name(advisor: dict[str, str], lang: str | None = None) -> str:
     return advisor["zh_name"] if (lang or current_lang()) == "zh" else advisor["en_name"]
+def translate_advisor_role(role: str) -> str:
+    """Translate a Chinese advisor role to the current language."""
+    if current_lang() == "zh":
+        return role
+    role_map = {a["zh_role"]: a["en_role"] for a in ADVISOR_SPECS}
+    return role_map.get(role, role)
+
+def translate_advisor_name(name: str) -> str:
+    """Translate a Chinese advisor name to the current language."""
+    if current_lang() == "zh":
+        return name
+    name_map = {a["zh_name"]: a["en_name"] for a in ADVISOR_SPECS}
+    return name_map.get(name, name)
+
+def translate_advisor_votes(vote_counts: dict[str, int]) -> dict[str, int]:
+    """Translate Chinese advisor names in vote counts to current language."""
+    if current_lang() == "zh":
+        return vote_counts
+    name_map = {a["zh_name"]: a["en_name"] for a in ADVISOR_SPECS}
+    return {name_map.get(k, k): v for k, v in vote_counts.items()}
 
 
 def advisor_role(advisor: dict[str, str], lang: str | None = None) -> str:
@@ -3456,7 +3566,7 @@ def advisor_market_snapshot(
                 "change_pct": change_pct,
                 "ma5": ma5,
                 "ma20": ma20,
-                "summary": f"{symbol} 60m window trend={trend}, change={change_pct:+.2f}%, ma5={ma5:.5g}, ma20={ma20:.5g}",
+                "summary": f"{symbol} 60m window trend={trend}, change={change_pct:+.2f}%, ma5={ma5:.5g}, ma20={ma20:.5g}" if current_lang() == "zh" else f"{symbol} 60m trend={trend}, change={change_pct:+.2f}%, ma5={ma5:.5g}, ma20={ma20:.5g}",
             }
         )
     elif latest_quote is not None:
@@ -3500,24 +3610,44 @@ def local_advisor_opinion(
     latest = market.get("latest_close") or (market.get("tick") or {}).get("quote")
     if advisor_id == "risk":
         stance = "WAIT" if base_stance != "WAIT" and source_count == 0 else base_stance
-        rationale = "没有网页确认时降低仓位和冲动；若要做，只做 demo 小额并保留撤退条件。"
-        invalidation = "最新 Tick 反向突破或连续三根反向波动。"
+        rationale = ("没有网页确认时降低仓位和冲动；若要做，只做 demo 小额并保留撤退条件。"
+                     if (lang or current_lang()) == "zh"
+                     else "No web confirmation; reduce sizing and impulse. If trading, use demo micro-size and keep exit conditions.")
+        invalidation = ("最新 Tick 反向突破或连续三根反向波动。"
+                        if (lang or current_lang()) == "zh"
+                        else "Latest tick reverses direction or three consecutive opposing candles.")
     elif advisor_id == "contrarian":
         stance = "WAIT" if base_stance in {"CALL", "PUT"} else "CALL" if trend == "down" else "PUT"
-        rationale = "反方视角：短线共识可能已经被价格吸收，必须等下一根确认。"
-        invalidation = "若价格继续沿原方向扩大并伴随新闻确认，反方观点失效。"
+        rationale = ("反方视角：短线共识可能已经被价格吸收，必须等下一根确认。"
+                     if (lang or current_lang()) == "zh"
+                     else "Devil's advocate: short-term consensus may already be priced in. Wait for the next candle to confirm.")
+        invalidation = ("若价格继续沿原方向扩大并伴随新闻确认，反方观点失效。"
+                        if (lang or current_lang()) == "zh"
+                        else "If price continues in the original direction with news confirmation, the contrarian view is invalidated.")
     elif advisor_id == "quant":
         stance = base_stance
-        rationale = f"量化视角看 {market.get('summary')}；趋势不干净就不追。"
-        invalidation = "MA5/MA20 关系反转，或最新价跌回本轮窗口中位。"
+        rationale = (f"量化视角看 {market.get('summary')}；趋势不干净就不追。"
+                     if (lang or current_lang()) == "zh"
+                     else f"Quant view of {market.get('summary')}; don't chase unless the trend is clean.")
+        invalidation = ("MA5/MA20 关系反转，或最新价跌回本轮窗口中位。"
+                        if (lang or current_lang()) == "zh"
+                        else "MA5/MA20 reverses, or latest price falls back to the mid-point of the current window.")
     elif advisor_id == "macro":
         stance = base_stance if news_signal.get("label") != "mixed" else "WAIT"
-        rationale = f"网页情绪={news_signal.get('label')}，来源={source_count} 条；没有外部催化就不加速。"
-        invalidation = "出现新的高影响消息或相关新闻标题方向反转。"
+        rationale = (f"网页情绪={news_signal.get('label')}，来源={source_count} 条；没有外部催化就不加速。"
+                     if (lang or current_lang()) == "zh"
+                     else f"Web sentiment={news_signal.get('label')}, sources={source_count}; don't accelerate without external catalysts.")
+        invalidation = ("出现新的高影响消息或相关新闻标题方向反转。"
+                        if (lang or current_lang()) == "zh"
+                        else "New high-impact news appears or related headlines reverse direction.")
     else:
         stance = base_stance
-        rationale = f"盘口节奏倾向 {base_stance}，最新价/收盘={latest}；等待短周期确认后再交给执行链。"
-        invalidation = "报价停滞、跳动变慢或连续反向 Tick。"
+        rationale = (f"盘口节奏倾向 {base_stance}，最新价/收盘={latest}；等待短周期确认后再交给执行链。"
+                     if (lang or current_lang()) == "zh"
+                     else f"Flow rhythm leans {base_stance}, latest/close={latest}; wait for short-cycle confirmation before passing to execution.")
+        invalidation = ("报价停滞、跳动变慢或连续反向 Tick。"
+                        if (lang or current_lang()) == "zh"
+                        else "Quotes stall, ticks slow, or consecutive opposing ticks appear.")
     return {
         "advisor_id": advisor_id,
         "name": advisor_name(advisor, lang),
@@ -3539,11 +3669,17 @@ def consensus_from_opinions(opinions: list[dict[str, Any]], market: dict[str, An
     web_bonus = min(len(sources), 6) * 0.025
     confidence = min(0.92, max(0.25, support * 0.62 + data_bonus + web_bonus))
     if winner == "CALL":
-        summary = "谋士团偏向看涨/做多，但只建议进入原交易链复核，不直接下单。"
+        summary = ("谋士团偏向看涨/做多，但只建议进入原交易链复核，不直接下单。"
+                   if current_lang() == "zh"
+                   else "Council leans bullish/long, but only recommends review by the trading chain; do not place orders directly.")
     elif winner == "PUT":
-        summary = "谋士团偏向看跌/做空，但只建议进入原交易链复核，不直接下单。"
+        summary = ("谋士团偏向看跌/做空，但只建议进入原交易链复核，不直接下单。"
+                   if current_lang() == "zh"
+                   else "Council leans bearish/short, but only recommends review by the trading chain; do not place orders directly.")
     else:
-        summary = "谋士团建议等待，当前信息不足以支持短线立即出手。"
+        summary = ("谋士团建议等待，当前信息不足以支持短线立即出手。"
+                   if current_lang() == "zh"
+                   else "Council recommends waiting; current data is insufficient for short-term action.")
     return {
         "stance": winner,
         "summary": summary,
@@ -3574,12 +3710,17 @@ def advisor_llm_synthesis(
         f"- {item['name']}: {item['stance']} | {item['rationale']} | invalidation: {item['invalidation']}"
         for item in opinions
     )
+    _zdir = "方向" if current_lang() == "zh" else "Direction"
+    _zconf = "置信度" if current_lang() == "zh" else "Confidence"
+    _zpreq = "执行前提" if current_lang() == "zh" else "Execution prerequisite"
+    _zfail = "失效条件" if current_lang() == "zh" else "Invalidation condition"
+    _zentry = "入场参考价" if current_lang() == "zh" else "Entry reference price"
     prompt = f"""
 你是首席谋士。你的专属 prompt：
 {agent_prompt("advisor.chief")}
 
 请基于下列材料，在 120 字以内给老板一个短线交易决策建议。
-要求：必须包含 方向(CALL/PUT/WAIT)、置信度、执行前提、失效条件。不要建议绕过人工确认。
+要求：必须包含 {_zdir}(CALL/PUT/WAIT)、{_zconf}、{_zpreq}、{_zfail}。不要建议绕过人工确认。
 
 问题: {question}
 Symbol: {symbol}
@@ -3609,7 +3750,7 @@ Symbol: {symbol}
             response = client.chat.completions.create(
                 model=st.session_state.llm_model,
                 messages=[
-                    {"role": "system", "content": "你输出简洁、可审计、适合短线交易前复核的中文建议。"},
+                    {"role": "system", "content": ("你输出简洁、可审计、适合短线交易前复核的中文建议。" if current_lang() == "zh" else "You output concise, auditable recommendations suitable for short-term trading review. Output in English.")},
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.15,
@@ -3624,7 +3765,7 @@ Symbol: {symbol}
                 model=st.session_state.llm_model,
                 max_tokens=220,
                 temperature=0.15,
-                system="你输出简洁、可审计、适合短线交易前复核的中文建议。",
+                system=("你输出简洁、可审计、适合短线交易前复核的中文建议。" if current_lang() == "zh" else "You output concise, auditable recommendations suitable for short-term trading review. Output in English."),
                 messages=[{"role": "user", "content": prompt}],
             )
             return "\n".join(
@@ -3689,7 +3830,7 @@ def agent_ai_brief(
             response = client.chat.completions.create(
                 model=st.session_state.llm_model,
                 messages=[
-                    {"role": "system", "content": "你是交易系统里的专业子 Agent，只输出可审计的中文行动结论。"},
+                    {"role": "system", "content": ("你是交易系统里的专业子 Agent，只输出可审计的中文行动结论。" if current_lang() == "zh" else "You are a specialized sub-agent in the trading system. Output only auditable, actionable conclusions in English.")},
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.15,
@@ -3704,7 +3845,7 @@ def agent_ai_brief(
                 model=st.session_state.llm_model,
                 max_tokens=max_tokens,
                 temperature=0.15,
-                system="你是交易系统里的专业子 Agent，只输出可审计的中文行动结论。",
+                system=("你是交易系统里的专业子 Agent，只输出可审计的中文行动结论。" if current_lang() == "zh" else "You are a specialized sub-agent in the trading system. Output only auditable, actionable conclusions in English."),
                 messages=[{"role": "user", "content": prompt}],
             )
             return "\n".join(
@@ -4097,26 +4238,31 @@ def format_runtime_events(limit: int = 30) -> str:
 def agent_timeline_html(limit: int = 24) -> str:
     events = st.session_state.get("team_events", [])[-limit:]
     if not events:
-        return f'<div class="timeline-empty">{html.escape(t("timeline_empty"))}</div>'
+        return f"*{html.escape(t('timeline_empty'))}*"
     items = []
     for line in events:
         if "➔" in line:
             route, _, message = line.partition("：")
             route = route.strip("[] ")
             source, _, target = route.partition("➔")
-            title = f"{source.strip()} -> {target.strip()}"
+            src = role_name(source.strip())
+            tgt = role_name(target.strip())
+            body = translate_message(message.strip())
+            if tgt == "Graph":
+                title = f"{src} planned"
+            elif tgt == "User":
+                title = f"{src} summarized"
+            elif src == "User":
+                title = f"{src} asked {tgt}"
+            else:
+                title = f"{src} → {tgt}"
+            body = re.sub(r"^LangGraph 路由[：:]\s*", "", body)
+            body = re.sub(r"^AI判断[：:]\s*", "", body)
         else:
             title = "Agent"
-            message = line
-        items.append(
-            f"""
-            <div class="timeline-item">
-              <div class="timeline-title">{html.escape(title)}</div>
-              <div class="timeline-body">{html.escape(message.strip())}</div>
-            </div>
-            """
-        )
-    return '<div class="agent-timeline">' + "".join(items) + "</div>"
+            body = translate_message(line)
+        items.append(f"**{title}**  \n{body}\n")
+    return "\n\n".join(items)
 
 
 def render_agent_timeline(limit: int = 24) -> None:
@@ -5253,21 +5399,36 @@ def deterministic_manager_summary(
     market_report: dict[str, Any] | None,
     execution_report: dict[str, Any] | None,
 ) -> str:
+    _z = "zh" if current_lang() == "zh" else "en"
     if execution_report and execution_report.get("ok"):
         receipt = execution_report.get("receipt") or {}
-        return (
-            "经理总结：行情员工完成市场检查，执行交易员已通过模拟盘下单。"
-            f"合同 ID：{receipt.get('contract_id')}，成交价：{receipt.get('purchase_price')}。"
-        )
+        if _z == "zh":
+            return (
+                "经理总结：行情员工完成市场检查，执行交易员已通过模拟盘下单。"
+                f"合同 ID：{receipt.get('contract_id')}，成交价：{receipt.get('purchase_price')}。"
+            )
+        else:
+            return (
+                "Manager summary: Market check passed. Execution agent submitted the demo order. "
+                f"Contract ID: {receipt.get('contract_id')}, price: {receipt.get('purchase_price')}."
+            )
     if execution_report and not execution_report.get("ok"):
         if execution_report.get("reason") == "graph_guardrail_blocked":
             blockers = execution_report.get("blockers") or []
             blocker_text = ", ".join(str(item) for item in blockers) if blockers else "guardrail_blocked"
-            return f"经理总结：图级风控未放行执行，原因：{blocker_text}。没有提交订单。"
-        return f"经理总结：交易未完成，原因：{execution_report.get('reason') or execution_report.get('error')}。"
+            if _z == "zh":
+                return f"经理总结：图级风控未放行执行，原因：{blocker_text}。没有提交订单。"
+            else:
+                return f"Manager summary: Graph-level guardrail blocked execution. Reason: {blocker_text}. No order was submitted."
+        reason = execution_report.get('reason') or execution_report.get('error')
+        if _z == "zh":
+            return f"经理总结：交易未完成，原因：{reason}。"
+        else:
+            return f"Manager summary: Trade not completed. Reason: {reason}."
     if market_report:
-        return f"经理总结：{market_report.get('summary')}"
-    return "经理总结：当前指令没有形成可执行交易任务。"
+        prefix = "经理总结：" if _z == "zh" else "Manager summary: "
+        return f"{prefix}{market_report.get('summary')}"
+    return "经理总结：当前指令没有形成可执行交易任务。" if _z == "zh" else "Manager summary: No executable trading task was formed."
 
 
 def trading_team_langgraph_available() -> bool:
@@ -5394,17 +5555,25 @@ def team_graph_execution_blockers(state: TeamGraphState) -> list[str]:
 
 
 def team_graph_final_answer(state: TeamGraphState) -> str:
+    _z = "zh" if current_lang() == "zh" else "en"
     missing = list(state.get("missing_fields") or [])
     if missing:
-        return f"经理总结：我识别到交易意图和 {state.get('symbol')}，但缺少交易参数：{', '.join(missing)}。请补充后我再让执行 Agent 进入确认闸门。"
+        if _z == "zh":
+            return f"经理总结：我识别到交易意图和 {state.get('symbol')}，但缺少交易参数：{', '.join(missing)}。请补充后我再让执行 Agent 进入确认闸门。"
+        else:
+            return f"Manager summary: Trade intent detected for {state.get('symbol')}, but missing parameters: {', '.join(missing)}. Please provide them before the execution agent proceeds."
     execution_report = state.get("execution_report")
     market_report = state.get("market_report")
     if execution_report:
         return deterministic_manager_summary(market_report, execution_report)
     if market_report:
-        return f"经理总结：{market_report.get('summary')}"
+        prefix = "经理总结：" if _z == "zh" else "Manager summary: "
+        return f"{prefix}{market_report.get('summary')}"
     route = team_graph_route_label(list(state.get("route") or []))
-    return f"经理总结：LangGraph 团队已按路线完成协作：{route}。"
+    if _z == "zh":
+        return f"经理总结：LangGraph 团队已按路线完成协作：{route}。"
+    else:
+        return f"Manager summary: LangGraph team completed the route: {route}."
 
 
 def make_team_graph_agent_node(agent_id: str) -> Callable[[TeamGraphState], dict[str, Any]]:
@@ -5425,7 +5594,7 @@ def make_team_graph_agent_node(agent_id: str) -> Callable[[TeamGraphState], dict
                 events,
                 "Guardrail",
                 "执行交易员",
-                "图级风控未放行执行节点：" + ", ".join(execution_blockers),
+                ("图级风控未放行执行节点：" if current_lang() == "zh" else "Graph guardrail blocked execution node: ") + ", ".join(execution_blockers),
                 None,
             )
         else:
@@ -5889,37 +6058,50 @@ def execute_plan(plan: ToolPlan) -> tuple[dict[str, Any], str]:
         return execute_trade_closed_loop(plan)
 
     publish_agent_log(reset_agent_log() + ["1. 普通对话: 未触发工具", "2. 自动触发下单: 无"])
-    return {"ok": True, "data": {}}, "我可以帮你查最新 tick、画 K 线，或执行模拟交易。请给出 symbol、方向、金额和时长。"
+    return {"ok": True, "data": {}}, ("我可以帮你查最新 tick、画 K 线，或执行模拟交易。请给出 symbol、方向、金额和时长。" if current_lang() == "zh" else "I can check the latest tick, draw candles, or execute demo trades. Please provide symbol, direction, amount, and duration.")
 
 
 def summarize_result(plan: ToolPlan, result: dict[str, Any]) -> str:
     if not result.get("ok"):
-        message = (result.get("error") or {}).get("message", "工具调用失败")
-        return f"工具调用没有成功：{message}"
+        message = (result.get("error") or {}).get("message", ("工具调用失败" if current_lang() == "zh" else "Tool call failed"))
+        return f"工具调用没有成功：{message}" if current_lang() == "zh" else f"Tool call did not succeed: {message}"
 
     if plan.action == "get_market_ticks":
         tick = ((result.get("data") or {}).get("tick") or {})
-        return f"{tick.get('symbol')} 最新报价是 {tick.get('quote')}，时间 {tick.get('timestamp')}。"
+        return f"{tick.get('symbol')} 最新报价是 {tick.get('quote')}，时间 {tick.get('timestamp')}。" if current_lang() == "zh" else f"{tick.get('symbol')} latest quote is {tick.get('quote')}, time {tick.get('timestamp')}."
 
     if plan.action == "get_historical_candles":
         data = result.get("data") or {}
-        return f"已获取 {data.get('symbol')} 的 {data.get('returned_count')} 根 K 线，并在下方绘制成蜡烛图。"
+        return f"已获取 {data.get('symbol')} 的 {data.get('returned_count')} 根 K 线，并在下方绘制成蜡烛图。" if current_lang() == "zh" else f"Fetched {data.get('returned_count')} candles for {data.get('symbol')} and rendered the chart below."
 
     if plan.action == "execute_simulated_trade":
         data = result.get("data") or {}
         if data.get("status") == "skipped":
-            return (
-                "条件没有满足，未触发模拟交易。"
-                f"最新价：{data.get('latest_tick')}，条件：{data.get('condition')}。"
-            )
+            if current_lang() == "zh":
+                return (
+                    "条件没有满足，未触发模拟交易。"
+                    f"最新价：{data.get('latest_tick')}，条件：{data.get('condition')}。"
+                )
+            else:
+                return (
+                    "Condition not met. Demo trade was not triggered. "
+                    f"Latest price: {data.get('latest_tick')}, condition: {data.get('condition')}."
+                )
         receipt = ((result.get("data") or {}).get("receipt") or {})
-        return (
-            "模拟交易已提交成功。"
-            f"合约 ID：{receipt.get('contract_id')}，成交价：{receipt.get('purchase_price')} "
-            f"{receipt.get('currency')}。"
-        )
+        if current_lang() == "zh":
+            return (
+                "模拟交易已提交成功。"
+                f"合约 ID：{receipt.get('contract_id')}，成交价：{receipt.get('purchase_price')} "
+                f"{receipt.get('currency')}。"
+            )
+        else:
+            return (
+                "Demo trade submitted successfully. "
+                f"Contract ID: {receipt.get('contract_id')}, purchase price: {receipt.get('purchase_price')} "
+                f"{receipt.get('currency')}."
+            )
 
-    return "已完成。"
+    return ("已完成。" if current_lang() == "zh" else "Completed.")
 
 
 def stream_text(text: str) -> Generator[str, None, None]:
@@ -6294,6 +6476,7 @@ def render_audit_export_panel() -> None:
         data=json.dumps(snapshot, ensure_ascii=False, indent=2, default=str).encode("utf-8"),
         file_name=f"deriv-audit-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json",
         mime="application/json",
+        key="download_audit",
         width="stretch",
     )
 
@@ -7232,7 +7415,7 @@ def fetch_and_store_candles(symbol: str, granularity: int, count: int, source: s
     return result
 
 
-def render_trading_chart_workbench(result: dict[str, Any]) -> None:
+def render_trading_chart_workbench(result: dict[str, Any], *, key_prefix: str = "") -> None:
     frame = candles_frame_from_result(result)
     if frame.empty:
         st.info(t("chart_empty_info"))
@@ -7267,22 +7450,24 @@ def render_trading_chart_workbench(result: dict[str, Any]) -> None:
     st.session_state.chart_height = control_a.slider(
         t("chart_height"),
         min_value=420,
+        key=f"chart_height_{key_prefix}",
         max_value=950,
         value=int(st.session_state.chart_height),
         step=40,
     )
-    compare_enabled = control_b.toggle(t("compare_trend"), value=bool(st.session_state.compare_result))
+    compare_enabled = control_b.toggle(t("compare_trend"), value=bool(st.session_state.compare_result), key=f"compare_trend_{key_prefix}")
     st.session_state.compare_symbol = control_c.text_input(
         t("compare_symbol"),
         value=st.session_state.compare_symbol,
         placeholder=t("compare_placeholder"),
+        key=f"compare_symbol_{key_prefix}",
     )
 
     refresh_cols = st.columns([0.25, 0.25, 0.5])
-    if refresh_cols[0].button(t("refresh_current"), width="stretch"):
+    if refresh_cols[0].button(t("refresh_current"), key=f"refresh_current_{key_prefix}"):
         fetch_and_store_candles(symbol, granularity, count, source="manual_refresh")
         st.rerun()
-    if refresh_cols[1].button(t("refresh_compare"), width="stretch"):
+    if refresh_cols[1].button(t("refresh_compare"), key=f"refresh_compare_{key_prefix}"):
         st.session_state.compare_result = fetch_compare_candles(
             st.session_state.compare_symbol.strip() or "R_75",
             granularity,
@@ -7445,6 +7630,7 @@ def render_trading_chart_workbench(result: dict[str, Any]) -> None:
             data=frame.to_csv(index=False).encode("utf-8"),
             file_name=f"{symbol}-ohlcv.csv",
             mime="text/csv",
+            key=f"download_ohlcv_{key_prefix}",
             width="stretch",
         )
 
@@ -7538,15 +7724,16 @@ def render_last_artifacts() -> None:
                 for item in snapshots
             ]
         )
-        for tab, item in zip(tabs, snapshots, strict=False):
+        for i, (tab, item) in enumerate(zip(tabs, snapshots, strict=False)):
             with tab:
                 st.caption(
                     f"{t('snapshot_time')}: {local_time_label(item.get('created_at'))} · "
                     f"UTC={item.get('created_at')} · source={item.get('source')}"
                 )
-                render_trading_chart_workbench(item["result"])
+                idx = item.get("id", str(i))
+                render_trading_chart_workbench(item["result"], key_prefix=idx)
     elif st.session_state.last_candles and st.session_state.last_candles.get("ok"):
-        render_trading_chart_workbench(st.session_state.last_candles)
+        render_trading_chart_workbench(st.session_state.last_candles, key_prefix="latest")
     else:
         with st.container(border=True):
             st.subheader(t("chart_workbench"))
@@ -7734,7 +7921,8 @@ def render_advisor_result(result: dict[str, Any]) -> None:
     entry_price = result.get("entry_price")
     cols[3].metric(t("advisor_entry_price"), f"{float(entry_price):.5g}" if entry_price else "N/A")
     cols[4].metric("Runtime", str(result.get("runtime") or "local"))
-    st.caption(f"Votes: `{json.dumps(result.get('vote_counts') or {}, ensure_ascii=False)}`")
+    vote_display = translate_advisor_votes(result.get("vote_counts") or {})
+    st.caption(f"Votes: `{json.dumps(vote_display, ensure_ascii=False)}`")
     render_advisor_trade_draft_controls(result)
 
     opinions = result.get("opinions") or []
@@ -7748,8 +7936,8 @@ def render_advisor_result(result: dict[str, Any]) -> None:
   <div class="advisor-card-top">
     <div class="advisor-code" style="border-color:{html.escape(spec['color'])};">{html.escape(spec['code'])}</div>
     <div>
-      <div class="advisor-name">{html.escape(str(opinion.get("name") or ""))}</div>
-      <div class="advisor-role">{html.escape(str(opinion.get("role") or ""))}</div>
+      <div class="advisor-name">{html.escape(translate_advisor_name(str(opinion.get("name") or "")))}</div>
+      <div class="advisor-role">{html.escape(translate_advisor_role(str(opinion.get("role") or "")))}</div>
     </div>
   </div>
   <span class="advisor-stance">{html.escape(str(opinion.get("stance") or "WAIT"))}</span>
@@ -7784,13 +7972,14 @@ def render_advisor_result(result: dict[str, Any]) -> None:
     with st.expander(t("advisor_transcript"), expanded=False):
         st.markdown(f"**问题**：{result.get('question')}")
         st.markdown(f"**Symbol**：{result.get('symbol')}")
-        st.markdown(f"**投票**：{result.get('vote_counts')}")
+        vote_display2 = translate_advisor_votes(result.get("vote_counts") or {})
+        st.markdown(f"**投票**：{vote_display2}")
         opinions = result.get("opinions") or []
         if opinions:
             st.dataframe(
                 [
                     {
-                        "advisor": item.get("name"),
+                        "advisor": translate_advisor_name(str(item.get("name") or "")),
                         "stance": item.get("stance"),
                         "confidence": item.get("confidence"),
                         "rationale": item.get("rationale"),
@@ -7806,6 +7995,7 @@ def render_advisor_result(result: dict[str, Any]) -> None:
         data=json.dumps(result, ensure_ascii=False, indent=2, default=str).encode("utf-8"),
         file_name=f"advisor-council-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json",
         mime="application/json",
+        key=f"advisor_download_{str(result.get('created_at') or 'latest')}",
         width="stretch",
     )
 
@@ -8133,16 +8323,7 @@ def render_chat() -> None:
             unsafe_allow_html=True,
         )
 
-        st.markdown(f"#### {t('agent_log')}")
-        render_agent_timeline(24)
-        render_agent_memory_panel()
-        st.download_button(
-            t("download_log"),
-            data=st.session_state.agent_execution_log,
-            file_name=f"deriv-agent-log-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt",
-            mime="text/plain",
-            width="stretch",
-        )
+        # Agent timeline removed; access via Monitor page
 
         if clear_clicked:
             st.session_state.prompt_nonce += 1
@@ -8179,10 +8360,15 @@ def render_chat() -> None:
                 for event in team_result.events:
                     st.markdown(f"- {localized_event_line(event)}")
                 if team_result.market_report:
-                    st.markdown(f"**行情结论**：{team_result.market_report.get('summary') or team_result.market_report.get('ai_brief') or '-'}")
+                    label = "行情结论" if current_lang() == "zh" else "Market summary"
+                    st.markdown(f"**{label}**：{team_result.market_report.get('summary') or team_result.market_report.get('ai_brief') or '-'}")
                 if team_result.execution_report:
-                    status = team_result.execution_report.get("status") or ("完成" if team_result.execution_report.get("ok") else "阻断")
-                    st.markdown(f"**执行状态**：{status}")
+                    if current_lang() == "zh":
+                        status = team_result.execution_report.get("status") or ("完成" if team_result.execution_report.get("ok") else "阻断")
+                    else:
+                        status = team_result.execution_report.get("status") or ("Completed" if team_result.execution_report.get("ok") else "Blocked")
+                    label = "执行状态" if current_lang() == "zh" else "Execution status"
+                    st.markdown(f"**{label}**：{status}")
 
             answer = team_result.final_answer
             rendered = st.write_stream(stream_text(answer))
