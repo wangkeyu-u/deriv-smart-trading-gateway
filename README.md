@@ -1,6 +1,6 @@
 # Deriv Smart Trading Gateway
 
-An AI-native trading gateway for Deriv that combines a native desktop shell, a FastMCP tool server, a LangGraph-powered advisor council, and a fast micro-strategy engine for short-horizon decision support.
+An AI-native trading gateway for Deriv that combines a React operator workspace, a streaming FastAPI gateway, a native desktop shell, a FastMCP tool server, a LangGraph-powered advisor council, and a fast micro-strategy engine for short-horizon decision support.
 
 ![Deriv Smart Trading Gateway operator workspace](docs/assets/operator-workspace-preview.png)
 
@@ -10,7 +10,9 @@ Deriv Smart Trading Gateway turns natural-language trading intent into a coordin
 
 The newest layer is the **Boss Advisor Room**: a LangGraph council where multiple advisor agents read market context, optional web research, and short-horizon signals before producing one clear `CALL`, `PUT`, or `WAIT` recommendation.
 
-The project is moving toward a **native desktop operator app** with background runtime support. Streamlit remains available as an operator console, while LangGraph handles agent orchestration and FastMCP exposes the Deriv tool layer for MCP-compatible clients.
+The workflow is now anchored by persistent **Trade Cases**. A single case follows the operator goal through advisor review, market validation, micro backtesting, risk review, human confirmation, execution, and post-trade review. Every transition has a version number and an append-only audit event, so page changes and concurrent agent updates do not silently overwrite one another.
+
+The primary browser workspace now uses **React + Vite** with a **FastAPI Server-Sent Events (SSE)** backend. Model output arrives as real provider stream chunks, while agent starts, finishes, tool calls, routes, and errors are delivered on the same live event channel. Streamlit remains available as a compatibility console for legacy modules.
 
 ## Technology Stack
 
@@ -21,9 +23,11 @@ The project is moving toward a **native desktop operator app** with background r
 | Market data | Deriv WebSocket API | Provides live ticks, candle history, account checks, proposals, buys, open-contract status, and close-contract flows. |
 | Strategy engine | Python + pandas | Keeps numerical work deterministic: EMA, momentum, volatility, cost edge, confidence, paper PnL, and circuit breakers. |
 | AI providers | OpenAI-compatible chat API, DeepSeek, Anthropic, local rules | Lets every agent run with configurable prompts and provider choice instead of being locked to one model. |
+| Streaming API | FastAPI + SSE | Delivers tool activity, sub-agent progress, and model tokens incrementally instead of waiting for the complete response. |
 | Persistence | SQLite | Stores local run history, advisor results, micro-strategy runs, trade receipts, audit logs, and agent memory without requiring a remote database. |
 | Charts | Plotly | Renders candlesticks, moving averages, advisor overlays, zoom, measurement, and exportable chart views. |
-| Operator UI | Streamlit | Provides a fast multi-page control console for advisor, trading desk, charts, micro strategy, and monitoring. |
+| Operator UI | React + TypeScript + Vite | Provides a responsive, dense operator workspace with streaming chat, agent activity, live market snapshots, strategy evidence, and health monitoring. |
+| Compatibility UI | Streamlit | Keeps the original multi-page console available while modules migrate to the modern frontend. |
 | Desktop shell | PySide6 | Provides a native app surface, background behavior, and tray-style operator workflow. |
 | Validation | pytest, smoke tests, browser checks | Covers parsing, prompts, LangGraph compilation, safety gates, persistence, market tools, and UI rendering. |
 
@@ -42,6 +46,17 @@ This makes the project closer to a controlled AI operations system than a single
 ## Highlights
 
 - **LangGraph trading team runtime** with supervisor routing, graph nodes, handoff-style routing, guardrails, shared state, and per-agent memory.
+- **Parallel routed-agent execution** so independent market, strategy, risk, compliance, and report work does not accumulate serial model latency.
+- **Persistent run tracing** with a run ID, per-agent latency, partial-failure isolation, cancellation state, restart recovery, and a refresh-safe operator ledger.
+- **Unified live event stream** for tool calls, agent starts/completions, errors, routes, and token-by-token manager output.
+- **Markdown decision answers** with safe rendering for headings, lists, tables, code, and evidence blocks.
+- **Local conversation browser** with automatic titles, previews, message counts, and one-click context restoration from SQLite.
+- **Performance-conscious motion system** for route transitions, agent activity, live status, market-line drawing, and responsive operator feedback.
+- **Persistent Trade Case state machine** that connects advisor, chart, micro-strategy, risk, confirmation, execution, and review artifacts under one case ID.
+- **One-click full simulation** that runs advisor review, live market validation, micro backtesting, and a deterministic consistency gate, then stops before human confirmation.
+- **Operator decision brief** that turns persisted advisor, candle, budget, backtest, and risk evidence into one plain-language decision, supporting metrics, and a concrete next action.
+- **Recoverable workflow checkpoints** that preserve the failed step and reuse completed evidence when the operator retries a case.
+- **Concurrency-safe synchronization** through SQLite transactions, WAL mode, optimistic version checks, and append-only case events.
 - **LangGraph advisor council** with independent advisor nodes, merged graph state, and a chief synthesizer.
 - **Extensible agent prompts** through `agent_prompts.json`, including manager, execution workers, and advisor personas.
 - **Deriv WebSocket tools** for ticks, historical candles, account checks, simulated trades, open-contract status, and close-contract flows.
@@ -49,6 +64,7 @@ This makes the project closer to a controlled AI operations system than a single
 - **Human-in-the-loop execution gates** so write actions require explicit confirmation before Deriv order submission.
 - **Live-account protection** that blocks live trading unless both UI and backend explicitly allow it.
 - **Multi-symbol charting** for synthetic indices, jump indices, boom/crash, and forex symbols such as `R_100`, `R_75`, `BOOM1000`, and `frxEURUSD`.
+- **Market-data integrity checks** that flag duplicate timestamps, out-of-order candles, invalid OHLC ranges, stale data, and possible feed gaps before an operator trusts a chart.
 - **Advisor evaluation loop** that marks recent advisor calls against latest price and 1m/5m/10m candle horizons for paper accuracy and return tracking.
 - **Multi-page operator workspace** that separates the advisor room, trading desk, charts, and system monitor.
 - **Global status strip** for symbol, latest advisor stance, entry reference, API calls, sync version, and pending-trade state.
@@ -68,7 +84,14 @@ This makes the project closer to a controlled AI operations system than a single
 User / Boss
   |
   v
-Native Desktop Operator App / Streamlit Console
+React Operator Workspace / Native Desktop App / Streamlit Compatibility Console
+  |
+  +--> FastAPI SSE Gateway
+  |      session memory -> agent events -> provider token stream -> browser
+  |
+  +--> Trade Case State Machine
+  |      objective -> advisor -> market -> backtest -> risk -> confirm -> execute -> review
+  |      SQLite versioning + append-only audit events
   |
   +--> LangGraph Advisor Council
   |      web_research -> market_snapshot -> news_signal -> advisor_* -> synthesize
@@ -91,20 +114,26 @@ Deriv WebSocket API
 ```text
 .
 ├── agent_prompts.json              # Editable prompt registry for manager, workers, and advisors
+├── agent_streaming.py              # Provider streaming, per-agent calls, routing, and chat memory
 ├── advisor_evaluation.py           # Paper evaluation logic for advisor outcomes and horizons
+├── case_workflow.py                # One-click workflow order, consistency gate, and retry checkpoints
 ├── desktop_app.py                  # Native PySide6 desktop shell
 ├── desktop_packaging_requirements.txt # Optional PyInstaller dependency set
 ├── desktop_requirements.txt        # Optional desktop UI dependency set
 ├── docs/assets/                    # README and project media
+├── frontend/                       # React + TypeScript + Vite operator workspace
+├── gateway_api.py                  # FastAPI REST/SSE gateway and frontend host
 ├── mcp_config.json                 # MCP client configuration
 ├── micro_trading.py                # Small-trade strategy analysis engine
 ├── packaging/pyinstaller/          # Desktop app packaging spec
 ├── paper_trading.py                # Paper-trading backtest and circuit-breaker utilities
 ├── requirements.txt                # Python dependencies
 ├── scripts/build_desktop_app.sh     # macOS desktop build helper
+├── scripts/run_modern_app.sh        # Build and launch the modern operator workspace
 ├── server.py                       # FastMCP server with Deriv WebSocket tools
 ├── smoke_test.py                   # End-to-end runtime smoke checks
 ├── tests/                          # Pytest coverage for parsing, safety, prompts, and LangGraph
+├── trade_cases.py                  # Persistent workflow state machine and audit events
 └── web_app.py                      # Streamlit operator UI and multi-agent runtime
 ```
 
@@ -144,10 +173,53 @@ open "dist/Deriv Smart Trading Gateway.app"
 
 The build script installs the regular runtime, desktop UI dependencies, and PyInstaller packaging dependencies into `.venv`, then creates a local app bundle under `dist/`.
 
-## Streamlit Operator Console
+## Modern Operator Workspace
+
+Start the current primary UI:
+
+```bash
+cd deriv-smart-trading-gateway
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+scripts/run_modern_app.sh
+```
+
+Open:
+
+```text
+http://127.0.0.1:8765
+```
+
+On macOS, `Deriv Gateway.command` performs the same dependency check, frontend build, browser open, and FastAPI launch.
+
+The workspace includes:
+
+- **Command Center**: persistent conversations, true streaming model output, and live sub-agent activity.
+- **Conversation History**: reopen earlier local sessions without losing their stored context; empty sessions stay out of the history list.
+- **Trade Cases**: create persisted tasks, bind one to a manager conversation, and watch advisor, market, risk, workflow, version, and audit evidence synchronize back over the live SSE stream. Chat analysis never creates an order draft or bypasses human confirmation.
+- **Advisor Team**: the active agent roster and each agent's independent prompt.
+- **Markets**: selectable Deriv symbols, live Tick data, 60 one-minute closes, and an uncropped responsive trend chart.
+- **Micro Strategy**: strict per-trade budget, plain-language action, confidence, signal evidence, paper backtest, and circuit-breaker result.
+- **System Monitor**: FastAPI, SSE, SQLite, agent registry, provider, and frontend-build health.
+- **Run Ledger**: recent multi-agent runs, status, symbol, model, successful/degraded agent counts, and end-to-end latency persisted in SQLite.
+
+For remote model providers, each routed sub-agent is called separately and concurrently with its own prompt. The manager waits for the complete evidence set, then streams the final synthesis token by token. API keys stay in the current browser memory and request only; they are not persisted to SQLite.
+
+## Quality Gate
+
+Run the same compile, test, frontend build, API health, and SSE smoke checks used by CI:
+
+```bash
+scripts/quality_gate.sh
+```
+
+Python runtime versions are captured in `requirements-lock.txt`, while the React workspace is reproduced with `frontend/package-lock.json` and `npm ci`. GitHub Actions runs the gate on every push and pull request.
+
+## Streamlit Compatibility Console
 
 The Streamlit UI remains available as a full operator console and is organized into focused pages:
 
+- **Trade Cases**: create and resume end-to-end tasks, inspect synchronized artifacts, control task state, and review the audit timeline.
 - **Advisor Room**: advisor council, source review, transcripts, and paper evaluation.
 - **Micro Strategy**: standalone small-budget strategy lab with budget checks, paper trading, and circuit breakers.
 - **Trading Desk**: natural-language trading manager, direct agent dispatch, and execution log.
@@ -160,13 +232,27 @@ Every page shares one global status strip so the operator can see current symbol
 
 The Trading Desk also surfaces the execution safety gate as a compact panel, while Charts can overlay the latest matching advisor reference price on the active candlestick view.
 
+### End-to-End Trade Case Flow
+
+1. Open **Trade Cases**, enter the objective and symbol, then create the case.
+2. Choose **Run Full Simulation** to execute advisor review, market validation, and the micro-strategy paper backtest in sequence. The manual **Continue Next Step** route remains available for inspecting each module separately.
+3. The consistency gate verifies symbol alignment, fresh and structurally valid candles, an actionable advisor and strategy direction, paper-trade evidence, budget limits, circuit breakers, and a non-live order draft.
+4. If evidence conflicts or a risk limit trips, the case remains blocked with plain-language reasons and no pending order is created.
+5. If a technical step fails, its checkpoint is stored. **Retry From Failure** resumes at that step instead of repeating completed work.
+6. A passing simulation creates only a pending paper-trade draft and stops at the human-confirmation gate. It never submits an order automatically.
+7. After explicit confirmation, a successful receipt completes the case and preserves the full event timeline for review.
+
+Cases can be paused, resumed, cancelled, or retried. Paused and terminal cases reject new agent artifacts, preventing background work from mutating a task the operator has stopped.
+
+The task page rebuilds its decision brief directly from SQLite, so advisor direction, latest validated price, candle count, strategy direction, budget result, paper win rate, PnL, circuit-breaker reason, and retry point survive page changes and application restarts. Pending confirmations intentionally do not survive a restart: the UI marks the old draft as expired and asks the operator to rerun validation against fresh market data.
+
 ## Micro Strategy And Paper Trading
 
 The micro strategy module is separate from the main trading desk. It can analyze recent closes, apply a small-budget guard, run paper-trading backtests, persist recent strategy runs, and halt simulations through circuit breakers such as consecutive losses, total loss, drawdown, or trade-count limits.
 
 This module is intentionally non-executing by default. It produces analysis, paper results, and risk context; it does not bypass the trading desk, human confirmation, or MCP execution safety model.
 
-## Streamlit Quick Start
+## Streamlit Compatibility Quick Start
 
 ```bash
 cd deriv-smart-trading-gateway
@@ -181,13 +267,7 @@ Open the app:
 http://localhost:8501
 ```
 
-On macOS you can also double-click:
-
-```text
-Deriv Gateway.command
-```
-
-The launcher creates `.venv` if needed, installs dependencies, and opens the Streamlit app.
+The Streamlit console remains available at port `8501`, but `Deriv Gateway.command` now launches the modern React/FastAPI workspace on port `8765`.
 
 ## Run The MCP Server
 
@@ -275,7 +355,8 @@ This is intentionally paper evaluation only. It does not place trades or imply r
 
 The gateway is designed to keep execution explicit:
 
-- API keys are stored only in Streamlit session state, not hardcoded in source files.
+- In the React workspace, API keys remain only in browser memory long enough to make the local request; FastAPI does not persist them.
+- In the compatibility console, API keys remain only in Streamlit session state.
 - Missing token, missing amount, missing direction, or unclear trade intent blocks execution.
 - Deriv write actions require human confirmation from the UI.
 - Demo accounts are supported by default.
@@ -294,11 +375,15 @@ The database is created automatically on first run. You do not need a remote acc
 
 Stored records include:
 
+- `chat_sessions` and `chat_messages`: modern workspace conversations, assistant answers, provider metadata, and per-session context.
+
 - `team_runs`: user prompt, final manager answer, agent event timeline, market report, execution report, and execution log.
 - `advisor_runs`: advisor question, symbol, consensus, confidence, full result JSON, and paper-evaluation context.
 - `micro_strategy_runs`: small-trade strategy goal, symbol, action, confidence, budget result, paper PnL, trade count, and circuit-breaker state.
 - `trade_receipts`: Deriv demo/live receipt metadata when an order is actually submitted.
 - `agent_memory_items`: short memory summaries for manager, market, strategy, risk, compliance, chart, execution, report, and advisor agents.
+- `trade_cases`: objective, symbol, current status, workflow stage, synchronization version, artifact context, and last error.
+- `trade_case_events`: append-only task history containing actor, stage, status, version, message, and structured payload.
 
 On app startup, the workspace hydrates from SQLite:
 
@@ -307,6 +392,7 @@ On app startup, the workspace hydrates from SQLite:
 - the latest advisor result is restored as the active advisor context;
 - recent advisor, team, and micro-strategy runs appear in the sidebar and page tables;
 - per-agent memory is restored so agents do not start from a completely blank context.
+- the latest active, paused, or failed Trade Case is restored so the workflow can continue after restarting the app.
 
 For safety, some values are intentionally not persisted:
 
@@ -375,15 +461,18 @@ frxEURUSD, frxGBPUSD, frxUSDJPY
 Run the checks:
 
 ```bash
-.venv/bin/python -m py_compile web_app.py server.py smoke_test.py
+.venv/bin/python -m py_compile gateway_api.py agent_streaming.py web_app.py server.py smoke_test.py
 .venv/bin/python -m pytest -q
 .venv/bin/python smoke_test.py
+cd frontend && npm run build
 ```
 
 Recent validation:
 
 ```text
-77 passed
+111 passed
+React production build: OK
+FastAPI SSE stream: OK
 dependencies: OK
 prompts_and_symbols: OK
 advisor_evaluation: OK
