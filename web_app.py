@@ -41,6 +41,13 @@ from advisor_evaluation import (
     summarize_advisor_performance,
 )
 from budget_guard import BudgetLimits, budget_guard_check
+from case_workflow import (
+    BLOCKER_MESSAGES,
+    WORKFLOW_STEPS,
+    trade_case_consistency_gate,
+    trade_case_decision_snapshot,
+    workflow_resume_step,
+)
 from micro_trading import MicroTradeConfig, analyze_micro_trade, normalize_price_frame
 from paper_trading import CircuitBreakerConfig, backtest_micro_strategy
 from server import (
@@ -51,6 +58,19 @@ from server import (
     get_historical_candles,
     get_market_ticks,
     mask_secret,
+)
+from trade_cases import (
+    CASE_STAGES,
+    TradeCaseConflict,
+    TradeCaseTransitionError,
+    control_trade_case,
+    create_trade_case,
+    get_trade_case,
+    init_trade_case_db,
+    list_trade_case_events,
+    list_trade_cases,
+    record_trade_case_artifact,
+    update_trade_case,
 )
 
 
@@ -323,15 +343,58 @@ I18N = {
         "advisor_horizon_scores": "多窗口评分",
         "workspace": "工作台",
         "page_advisor": "谋士室",
+        "page_cases": "任务中心",
         "page_micro": "小笔策略",
         "page_trading": "交易台",
         "page_charts": "图表",
         "page_monitor": "监控",
         "page_advisor_caption": "限时谋士讨论、网页/行情分析和多窗口纸面复盘。",
+        "page_cases_caption": "统一跟踪谋士、行情、回测、风控、确认、执行和复盘。",
         "page_micro_caption": "小额频繁策略、预算闸门、paper trading 回测和熔断器。",
         "page_trading_caption": "交易经理调度执行团队，处理自然语言交易任务和人工确认。",
         "page_charts_caption": "K 线快照、对比走势、测量和最新 Tick。",
         "page_monitor_caption": "Agent 图谱、角色状态、API trace 和同步总线。",
+        "case_new": "新建交易任务",
+        "case_title": "任务名称",
+        "case_objective": "老板目标",
+        "case_symbol": "目标市场",
+        "case_create": "创建并激活",
+        "case_active": "当前任务",
+        "case_none": "还没有交易任务。先创建一个，后续模块会自动同步到这里。",
+        "case_status": "状态",
+        "case_stage": "当前阶段",
+        "case_version": "同步版本",
+        "case_updated": "最近更新",
+        "case_progress": "流程进度",
+        "case_events": "审计时间线",
+        "case_artifacts": "已同步产物",
+        "case_pause": "暂停",
+        "case_resume": "恢复",
+        "case_cancel": "取消",
+        "case_retry": "重试",
+        "case_open_module": "继续下一步",
+        "case_created": "交易任务已创建",
+        "case_conflict": "任务刚被其他模块更新，请刷新后重试。",
+        "case_auto_run": "一键完整模拟",
+        "case_auto_run_caption": "自动运行谋士、行情完整性检查、小笔回测和一致性闸门；最多只生成待人工确认订单，不会自动成交。",
+        "case_run_now": "运行完整模拟",
+        "case_retry_from_failure": "从失败步骤重试",
+        "case_trade_amount": "模拟金额",
+        "case_candle_count": "验证 K 线数",
+        "case_time_budget": "谋士限时",
+        "case_use_web": "允许谋士联网",
+        "case_ready_confirmation": "一致性检查通过，订单草稿正在等待人工确认。",
+        "case_no_confirmation": "本轮已完成分析，但一致性闸门未通过，因此没有生成待确认订单。",
+        "case_failed_step": "重试起点",
+        "case_gate_result": "一致性闸门",
+        "case_blockers": "阻止原因",
+        "case_decision_brief": "老板决策简报",
+        "case_current_decision": "当前决定",
+        "case_latest_price": "最新价格",
+        "case_paper_result": "纸面结果",
+        "case_next_action": "下一步",
+        "case_evidence": "判断依据",
+        "case_run_details": "运行与恢复细节",
         "status_symbol": "Symbol",
         "status_advisor": "谋士结论",
         "status_entry": "入场价",
@@ -423,6 +486,14 @@ I18N = {
         "chart_stale": "可能过期",
         "chart_fresh": "新鲜",
         "chart_refresh_hint": "如果最新 K 线时间落后，请点击刷新当前 K 线。",
+        "chart_integrity": "行情数据完整性",
+        "chart_integrity_ok": "通过",
+        "chart_integrity_attention": "需检查",
+        "chart_duplicate_bars": "重复时间戳",
+        "chart_gap_count": "检测到的断档",
+        "chart_invalid_ohlc": "异常 OHLC",
+        "chart_order_errors": "时间乱序",
+        "chart_integrity_hint": "完整性检查用于发现重复、乱序、异常价格和可能的数据断档；它是操作提示，不会自动触发交易。",
         "sync_test_status": "同步测试状态",
     },
     "en": {
@@ -585,15 +656,58 @@ I18N = {
         "advisor_horizon_scores": "Horizon Scores",
         "workspace": "Workspace",
         "page_advisor": "Advisor Room",
+        "page_cases": "Trade Cases",
         "page_micro": "Micro Strategy",
         "page_trading": "Trading Desk",
         "page_charts": "Charts",
         "page_monitor": "Monitor",
         "page_advisor_caption": "Time-boxed advisor debate, market/web context, and multi-horizon paper evaluation.",
+        "page_cases_caption": "Track advisor, market, backtest, risk, confirmation, execution, and review as one workflow.",
         "page_micro_caption": "Small-budget frequent strategy, budget guard, paper trading, and circuit breakers.",
         "page_trading_caption": "The trading manager routes natural-language work through the execution team and safety gates.",
         "page_charts_caption": "Candlestick snapshots, comparison overlays, measurement, and latest ticks.",
         "page_monitor_caption": "Agent graph, role state, API traces, and live sync bus.",
+        "case_new": "New Trade Case",
+        "case_title": "Case Title",
+        "case_objective": "Objective",
+        "case_symbol": "Market",
+        "case_create": "Create And Activate",
+        "case_active": "Active Case",
+        "case_none": "No trade case yet. Create one and other modules will sync their output here.",
+        "case_status": "Status",
+        "case_stage": "Current Stage",
+        "case_version": "Sync Version",
+        "case_updated": "Last Updated",
+        "case_progress": "Workflow Progress",
+        "case_events": "Audit Timeline",
+        "case_artifacts": "Synced Artifacts",
+        "case_pause": "Pause",
+        "case_resume": "Resume",
+        "case_cancel": "Cancel",
+        "case_retry": "Retry",
+        "case_open_module": "Continue Next Step",
+        "case_created": "Trade case created",
+        "case_conflict": "Another module updated this case. Refresh and retry.",
+        "case_auto_run": "One-click Full Simulation",
+        "case_auto_run_caption": "Runs advisors, market integrity, micro backtest, and consistency checks. It can only prepare a human-confirmed order and never executes automatically.",
+        "case_run_now": "Run Full Simulation",
+        "case_retry_from_failure": "Retry From Failed Step",
+        "case_trade_amount": "Demo Amount",
+        "case_candle_count": "Validation Candles",
+        "case_time_budget": "Advisor Time Limit",
+        "case_use_web": "Allow Advisor Web Research",
+        "case_ready_confirmation": "Consistency checks passed. The order draft is waiting for human confirmation.",
+        "case_no_confirmation": "Analysis completed, but the consistency gate blocked the order draft.",
+        "case_failed_step": "Retry From",
+        "case_gate_result": "Consistency Gate",
+        "case_blockers": "Blockers",
+        "case_decision_brief": "Operator Decision Brief",
+        "case_current_decision": "Decision",
+        "case_latest_price": "Latest Price",
+        "case_paper_result": "Paper Result",
+        "case_next_action": "Next Action",
+        "case_evidence": "Evidence",
+        "case_run_details": "Run And Recovery Details",
         "status_symbol": "Symbol",
         "status_advisor": "Advisor",
         "status_entry": "Entry",
@@ -685,6 +799,14 @@ I18N = {
         "chart_stale": "Possibly Stale",
         "chart_fresh": "Fresh",
         "chart_refresh_hint": "If the latest candle is behind, refresh the current chart.",
+        "chart_integrity": "Market Data Integrity",
+        "chart_integrity_ok": "Healthy",
+        "chart_integrity_attention": "Attention",
+        "chart_duplicate_bars": "Duplicate Timestamps",
+        "chart_gap_count": "Detected Gaps",
+        "chart_invalid_ohlc": "Invalid OHLC",
+        "chart_order_errors": "Out-of-order Bars",
+        "chart_integrity_hint": "Integrity checks detect duplicates, ordering errors, invalid prices, and possible data gaps. They inform the operator and never trigger a trade automatically.",
         "sync_test_status": "Sync Test Status",
     },
 }
@@ -1033,6 +1155,315 @@ def t(key: str) -> str:
     return I18N.get(current_lang(), I18N["zh"]).get(key, I18N["zh"].get(key, key))
 
 
+CASE_BLOCKER_MESSAGES_ZH = {
+    "missing_advisor": "缺少谋士团分析结果",
+    "advisor_not_actionable": "谋士团建议等待，当前不应生成订单",
+    "missing_market": "缺少行情快照",
+    "market_data_unhealthy": "行情数据不完整、过期或数量不足",
+    "missing_micro_strategy": "缺少小笔策略结果",
+    "micro_not_actionable": "小笔策略没有产生 CALL 或 PUT 信号",
+    "budget_blocked": "交易金额未通过预算限制",
+    "backtest_halted": "纸面回测触发风险熔断",
+    "no_paper_trades": "纸面回测没有产生可评估的交易",
+    "missing_trade_draft": "分析方向有效，但没有生成待确认订单",
+    "symbol_mismatch": "谋士、行情、策略或订单使用了不同的 Symbol",
+    "direction_conflict": "谋士、策略与订单的 CALL/PUT 方向不一致",
+    "invalid_amount": "交易金额无效或超过单笔上限",
+    "live_execution": "一键模拟禁止准备真实账户订单",
+}
+
+
+def case_blocker_message(code: str, lang: str | None = None) -> str:
+    if (lang or current_lang()) == "zh":
+        return CASE_BLOCKER_MESSAGES_ZH.get(code, code)
+    return BLOCKER_MESSAGES.get(code, code)
+
+
+def display_case_blockers(blockers: list[str], detail: dict[str, Any] | None = None) -> list[str]:
+    detail = detail or {}
+    advisor_action = str(detail.get("advisor_action") or "").upper()
+    directions = {
+        str(detail.get(key) or "").upper()
+        for key in ("advisor_action", "micro_action", "pending_action")
+        if str(detail.get(key) or "").upper() in {"CALL", "PUT"}
+    }
+    visible = list(dict.fromkeys(str(code) for code in blockers))
+    if advisor_action not in {"CALL", "PUT"}:
+        visible = [code for code in visible if code != "missing_trade_draft"]
+    if len(directions) < 2:
+        visible = [code for code in visible if code != "direction_conflict"]
+    return visible
+
+
+def workflow_step_label(step: str | None, lang: str | None = None) -> str:
+    labels = {
+        "zh": {
+            "advisor": "重新咨询谋士",
+            "market": "重新获取行情",
+            "micro_strategy": "重新运行小笔回测",
+            "consistency_gate": "重新检查证据",
+            "human_confirmation": "人工确认",
+        },
+        "en": {
+            "advisor": "Run advisors again",
+            "market": "Refresh market data",
+            "micro_strategy": "Run paper backtest again",
+            "consistency_gate": "Recheck evidence",
+            "human_confirmation": "Human confirmation",
+        },
+    }
+    selected = lang or current_lang()
+    return labels.get(selected, labels["zh"]).get(str(step or ""), "-" if selected == "zh" else "-")
+
+
+def workflow_phase_label(step: str | None, lang: str | None = None) -> str:
+    labels = {
+        "zh": {
+            "advisor": "谋士分析",
+            "market": "行情验证",
+            "micro_strategy": "小笔回测",
+            "consistency_gate": "风险复核",
+            "human_confirmation": "人工确认",
+        },
+        "en": {
+            "advisor": "Advisor Review",
+            "market": "Market Validation",
+            "micro_strategy": "Paper Backtest",
+            "consistency_gate": "Risk Review",
+            "human_confirmation": "Human Confirmation",
+        },
+    }
+    selected = lang or current_lang()
+    return labels.get(selected, labels["zh"]).get(str(step or ""), "-")
+
+
+def workflow_status_label(status: str | None, lang: str | None = None) -> str:
+    labels = {
+        "zh": {
+            "running": "分析中",
+            "blocked": "不下单",
+            "awaiting_confirmation": "等待确认",
+            "failed": "运行失败",
+        },
+        "en": {
+            "running": "Running",
+            "blocked": "No Order",
+            "awaiting_confirmation": "Awaiting Confirmation",
+            "failed": "Failed",
+        },
+    }
+    selected = lang or current_lang()
+    return labels.get(selected, labels["zh"]).get(str(status or ""), str(status or "-").replace("_", " ").title())
+
+
+def case_halt_reason(reason: str | None, losses: int, lang: str) -> str:
+    if lang == "zh":
+        messages = {
+            "max_consecutive_losses": f"纸面回测连续亏损 {losses} 次，已触发熔断",
+            "max_total_loss": "纸面回测累计亏损达到上限，已触发熔断",
+            "max_drawdown": "纸面回测回撤达到上限，已触发熔断",
+            "max_trade_count": "纸面回测已达到本轮交易次数上限",
+        }
+        return messages.get(str(reason or ""), "纸面回测触发风险熔断")
+    messages = {
+        "max_consecutive_losses": f"Paper backtest hit {losses} consecutive losses and stopped.",
+        "max_total_loss": "Paper backtest reached the total-loss limit and stopped.",
+        "max_drawdown": "Paper backtest reached the drawdown limit and stopped.",
+        "max_trade_count": "Paper backtest reached its trade-count cap.",
+    }
+    return messages.get(str(reason or ""), "The paper backtest triggered a risk circuit breaker.")
+
+
+def trade_case_operator_brief(
+    case: dict[str, Any],
+    *,
+    has_session_pending: bool = False,
+    lang: str | None = None,
+) -> dict[str, Any]:
+    selected = lang or current_lang()
+    snapshot = trade_case_decision_snapshot(case)
+    status = str(snapshot["status"])
+    advisor = snapshot["advisor"]
+    market = snapshot["market"]
+    strategy = snapshot["strategy"]
+    paper = snapshot["paper"]
+    gate = snapshot["gate"]
+    blockers = display_case_blockers(
+        list(gate.get("blockers") or []),
+        {
+            "advisor_action": advisor.get("action"),
+            "micro_action": strategy.get("action"),
+            "pending_action": snapshot["pending"].get("action"),
+        },
+    )
+    reasons = [case_blocker_message(code, selected) for code in blockers]
+    if "backtest_halted" in blockers:
+        detailed_halt = case_halt_reason(paper.get("halt_reason"), int(paper.get("losses") or 0), selected)
+        reasons = [detailed_halt if code == "backtest_halted" else case_blocker_message(code, selected) for code in blockers]
+
+    advisor_action = str(advisor.get("action") or "-")
+    strategy_action = str(strategy.get("action") or "-")
+    pending_action = str(snapshot["pending"].get("action") or "-")
+    decision = pending_action if status == "awaiting_confirmation" and has_session_pending else "NO_TRADE"
+    tone = "info"
+    if selected == "zh":
+        headline = "任务尚未开始"
+        summary = "运行完整模拟后，这里会汇总谋士、行情、回测和风控结论。"
+        next_action = "运行完整模拟"
+        if status in {"running", "in_progress"}:
+            headline, summary, next_action = "分析进行中", "系统正在收集并同步决策证据。", "等待本轮分析完成"
+        elif status == "blocked":
+            tone, headline = "warning", "本轮不下单"
+            summary = "；".join(reasons) or "证据未通过一致性检查。"
+            next_action = workflow_step_label(snapshot.get("retry_step"), selected)
+        elif status == "failed":
+            tone, headline = "error", "本轮分析失败"
+            summary = str(case.get("last_error") or "某个模块运行失败，已保存恢复点。")
+            next_action = workflow_step_label(snapshot.get("retry_step"), selected)
+        elif status == "awaiting_confirmation" and has_session_pending:
+            tone, headline, decision = "success", "订单草稿已准备，等待你确认", pending_action
+            summary = "全部证据通过一致性检查，但系统不会自动成交。"
+            next_action = "前往交易台核对金额、方向和时效后人工确认"
+        elif status == "awaiting_confirmation":
+            tone, headline = "warning", "原确认草稿已失效，需要重新验证"
+            summary = "应用重启后不会恢复旧订单确认，避免使用过期行情成交。"
+            next_action = "重新运行完整模拟"
+        elif status == "paused":
+            headline, summary, next_action = "任务已暂停", "后台模块不会继续写入这个任务。", "恢复任务后继续"
+        elif status == "cancelled":
+            headline, summary, next_action = "任务已取消", "这个任务不会再接受新的分析结果。", "新建交易任务"
+        elif status == "completed":
+            tone, headline, decision = "success", "交易流程已完成", pending_action
+            summary, next_action = "成交记录和决策证据已保存。", "复盘审计时间线"
+    else:
+        headline = "Case not started"
+        summary = "Run the full simulation to combine advisor, market, backtest, and risk evidence."
+        next_action = "Run full simulation"
+        if status in {"running", "in_progress"}:
+            headline, summary, next_action = "Analysis in progress", "The system is collecting and synchronizing decision evidence.", "Wait for this run to finish"
+        elif status == "blocked":
+            tone, headline = "warning", "Do not place an order"
+            summary = "; ".join(reasons) or "The evidence did not pass consistency checks."
+            next_action = workflow_step_label(snapshot.get("retry_step"), selected)
+        elif status == "failed":
+            tone, headline = "error", "Analysis failed"
+            summary = str(case.get("last_error") or "A module failed and a recovery checkpoint was saved.")
+            next_action = workflow_step_label(snapshot.get("retry_step"), selected)
+        elif status == "awaiting_confirmation" and has_session_pending:
+            tone, headline, decision = "success", "Order draft ready for your confirmation", pending_action
+            summary = "All evidence passed, but the system will not execute automatically."
+            next_action = "Review direction, amount, and freshness in Trading Desk, then confirm"
+        elif status == "awaiting_confirmation":
+            tone, headline = "warning", "The previous confirmation draft expired"
+            summary = "Order confirmations are not restored after restart to prevent stale execution."
+            next_action = "Run the full simulation again"
+        elif status == "paused":
+            headline, summary, next_action = "Case paused", "Background modules cannot update this case.", "Resume the case"
+        elif status == "cancelled":
+            headline, summary, next_action = "Case cancelled", "This case no longer accepts evidence.", "Create a new trade case"
+        elif status == "completed":
+            tone, headline, decision = "success", "Trading workflow completed", pending_action
+            summary, next_action = "The receipt and decision evidence are stored.", "Review the audit timeline"
+
+    evidence = [
+        {
+            "area": "谋士" if selected == "zh" else "Advisor",
+            "status": advisor_action,
+            "detail": (
+                f"置信度 {float(advisor.get('confidence') or 0):.0%}"
+                if selected == "zh"
+                else f"Confidence {float(advisor.get('confidence') or 0):.0%}"
+            ),
+        },
+        {
+            "area": "行情" if selected == "zh" else "Market",
+            "status": "正常" if market.get("healthy") and market.get("fresh") and selected == "zh" else "Healthy" if market.get("healthy") and market.get("fresh") else "需关注" if selected == "zh" else "Needs attention",
+            "detail": (
+                f"{int(market.get('candle_count') or 0)} 根K线，最新价 {market.get('latest_close') if market.get('latest_close') is not None else '-'}"
+                if selected == "zh"
+                else f"{int(market.get('candle_count') or 0)} candles, latest {market.get('latest_close') if market.get('latest_close') is not None else '-'}"
+            ),
+        },
+        {
+            "area": "小笔策略" if selected == "zh" else "Micro Strategy",
+            "status": strategy_action,
+            "detail": (
+                f"置信度 {float(strategy.get('confidence') or 0):.0%}，预算{'通过' if strategy.get('budget_ok') else '未通过'}"
+                if selected == "zh"
+                else f"Confidence {float(strategy.get('confidence') or 0):.0%}, budget {'passed' if strategy.get('budget_ok') else 'blocked'}"
+            ),
+        },
+        {
+            "area": "纸面回测" if selected == "zh" else "Paper Backtest",
+            "status": "熔断" if paper.get("halted") and selected == "zh" else "Halted" if paper.get("halted") else "完成" if selected == "zh" else "Complete",
+            "detail": (
+                f"{paper.get('trade_count')} 笔，胜率 {float(paper.get('win_rate') or 0):.0%}，PnL {float(paper.get('total_pnl') or 0):+.5f}"
+                if selected == "zh"
+                else f"{paper.get('trade_count')} trades, win rate {float(paper.get('win_rate') or 0):.0%}, PnL {float(paper.get('total_pnl') or 0):+.5f}"
+            ),
+        },
+    ]
+    return {
+        "tone": tone,
+        "headline": headline,
+        "summary": summary,
+        "decision": decision,
+        "next_action": next_action,
+        "reasons": reasons,
+        "evidence": evidence,
+        "snapshot": snapshot,
+    }
+
+
+def render_trade_case_operator_brief(case: dict[str, Any]) -> None:
+    session_pending = st.session_state.get("pending_trade") or {}
+    has_session_pending = bool(session_pending) and normalize_deriv_symbol(
+        str(session_pending.get("symbol") or "")
+    ) == normalize_deriv_symbol(str(case.get("symbol") or ""))
+    brief = trade_case_operator_brief(
+        case,
+        has_session_pending=has_session_pending,
+        lang=current_lang(),
+    )
+    st.markdown(f"#### {t('case_decision_brief')}")
+    message = f"**{brief['headline']}**  \n{brief['summary']}"
+    getattr(st, str(brief["tone"]))(message)
+
+    snapshot = brief["snapshot"]
+    advisor = snapshot["advisor"]
+    market = snapshot["market"]
+    paper = snapshot["paper"]
+    decision = str(brief["decision"])
+    if decision == "NO_TRADE":
+        decision = "不下单" if current_lang() == "zh" else "NO ORDER"
+    metrics = st.columns(4)
+    metrics[0].metric(t("case_current_decision"), decision)
+    advisor_value = str(advisor.get("action") or "-")
+    if advisor.get("confidence") is not None:
+        advisor_value += f" · {float(advisor['confidence']):.0%}"
+    metrics[1].metric(t("status_advisor"), advisor_value)
+    latest_close = market.get("latest_close")
+    metrics[2].metric(t("case_latest_price"), "-" if latest_close is None else f"{float(latest_close):.5g}")
+    metrics[3].metric(
+        t("case_paper_result"),
+        f"{int(paper.get('trade_count') or 0)} / {float(paper.get('total_pnl') or 0):+.5f}",
+    )
+    st.markdown(f"**{t('case_next_action')}：** {brief['next_action']}")
+    if snapshot["status"] != "not_started":
+        st.markdown(f"**{t('case_evidence')}**")
+        if current_lang() == "zh":
+            evidence_rows = [
+                {"模块": row["area"], "结论": row["status"], "数据说明": row["detail"]}
+                for row in brief["evidence"]
+            ]
+        else:
+            evidence_rows = [
+                {"Area": row["area"], "Result": row["status"], "Evidence": row["detail"]}
+                for row in brief["evidence"]
+            ]
+        st.dataframe(evidence_rows, width="stretch", hide_index=True)
+
+
 def text_for(lang: str, key: str) -> str:
     return I18N.get(lang, I18N["zh"]).get(key, I18N["zh"].get(key, key))
 
@@ -1249,6 +1680,7 @@ def agent_state_fallback(agent_id: str) -> str:
 
 def init_local_db() -> None:
     DATA_DIR.mkdir(exist_ok=True)
+    init_trade_case_db(DB_PATH)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
@@ -1372,6 +1804,32 @@ def save_team_run(user_prompt: str, result: TeamRunResult) -> None:
                     json.dumps(receipt, ensure_ascii=False, default=str),
                 ),
             )
+    if result.market_report:
+        sync_active_trade_case_artifact(
+            "market",
+            actor="market_agent",
+            message="Trading team market validation saved",
+            payload=result.market_report,
+            auto_create_objective=user_prompt,
+            symbol=str(result.market_report.get("symbol") or DEFAULT_SYMBOL),
+        )
+    execution_report = result.execution_report or {}
+    if execution_report.get("receipt"):
+        sync_active_trade_case_artifact(
+            "trade_receipt",
+            actor="execution_agent",
+            message="Trading team receipt saved; case completed",
+            payload=execution_report.get("receipt") or {},
+        )
+    elif execution_report and execution_report.get("reason") not in {"pending_human_confirmation"}:
+        sync_active_trade_case_artifact(
+            "risk",
+            actor="execution_agent",
+            message="Execution review saved",
+            payload=execution_report,
+            auto_create_objective=user_prompt,
+            symbol=str((result.market_report or {}).get("symbol") or DEFAULT_SYMBOL),
+        )
 
 
 def _json_load(value: Any, fallback: Any) -> Any:
@@ -1439,6 +1897,14 @@ def save_advisor_run(result: dict[str, Any]) -> None:
                 json.dumps(result, ensure_ascii=False, default=str),
             ),
         )
+    sync_active_trade_case_artifact(
+        "advisor",
+        actor="advisor_council",
+        message="Advisor council conclusion saved",
+        payload=result,
+        auto_create_objective=str(result.get("question") or "Advisor review"),
+        symbol=str(result.get("symbol") or DEFAULT_SYMBOL),
+    )
 
 
 def load_recent_advisor_runs(limit: int = 3) -> list[dict[str, Any]]:
@@ -1537,6 +2003,14 @@ def save_micro_strategy_run(
                 json.dumps(payload, ensure_ascii=False, default=str),
             ),
         )
+    sync_active_trade_case_artifact(
+        "micro_strategy",
+        actor="micro_strategy",
+        message="Micro strategy and paper backtest saved",
+        payload=payload,
+        auto_create_objective=goal,
+        symbol=config.symbol,
+    )
 
 
 def load_recent_micro_strategy_runs(limit: int = 8) -> list[dict[str, Any]]:
@@ -1912,7 +2386,9 @@ def init_state() -> None:
         "advisor_runs": [],
         "advisor_evaluations": [],
         "last_advisor_result": None,
+        "last_case_workflow_result": None,
         "active_page": "advisor",
+        "active_trade_case_id": None,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -1988,6 +2464,12 @@ def hydrate_persisted_session_state() -> None:
 
     if not st.session_state.get("agent_memory"):
         st.session_state.agent_memory = load_agent_memory_items()
+
+    if not st.session_state.get("active_trade_case_id"):
+        cases = list_trade_cases(DB_PATH, limit=20)
+        active = next((item for item in cases if item.get("status") in {"active", "paused", "failed"}), None)
+        if active:
+            st.session_state.active_trade_case_id = active["id"]
 
     st.session_state.persisted_state_loaded = True
 
@@ -4170,6 +4652,108 @@ def append_runtime_event_to_state(state: Any, event: dict[str, Any], limit: int 
     state["sync_version"] = int(state.get("sync_version", 0)) + 1
 
 
+def active_trade_case() -> dict[str, Any] | None:
+    case_id = st.session_state.get("active_trade_case_id")
+    if not case_id:
+        return None
+    case = get_trade_case(DB_PATH, str(case_id))
+    if case is None:
+        st.session_state.active_trade_case_id = None
+    return case
+
+
+def create_active_trade_case(objective: str, symbol: str, title: str = "") -> dict[str, Any]:
+    case = create_trade_case(
+        DB_PATH,
+        objective=objective,
+        symbol=normalize_deriv_symbol(symbol),
+        title=title,
+    )
+    st.session_state.active_trade_case_id = case["id"]
+    push_runtime_event(
+        "trade_case",
+        "Operator",
+        "Trade Case",
+        f"{case['id']} created",
+        {"case_id": case["id"], "symbol": case["symbol"], "version": case["version"]},
+    )
+    return case
+
+
+def sync_active_trade_case_artifact(
+    artifact_type: str,
+    *,
+    actor: str,
+    message: str,
+    payload: dict[str, Any],
+    auto_create_objective: str | None = None,
+    symbol: str = DEFAULT_SYMBOL,
+) -> dict[str, Any] | None:
+    if not in_streamlit_runtime():
+        return None
+    case = active_trade_case()
+    if case is None and auto_create_objective:
+        case = create_active_trade_case(auto_create_objective, symbol)
+    if case is None or case.get("status") != "active":
+        return case
+
+    for _attempt in range(3):
+        try:
+            updated = record_trade_case_artifact(
+                DB_PATH,
+                str(case["id"]),
+                artifact_type=artifact_type,
+                actor=actor,
+                message=message,
+                payload=payload,
+                expected_version=int(case["version"]),
+            )
+            push_runtime_event(
+                "trade_case",
+                actor,
+                str(case["id"]),
+                message,
+                {
+                    "case_id": case["id"],
+                    "artifact_type": artifact_type,
+                    "stage": updated["stage"],
+                    "version": updated["version"],
+                },
+            )
+            return updated
+        except TradeCaseConflict:
+            refreshed = get_trade_case(DB_PATH, str(case["id"]))
+            if refreshed is None or refreshed.get("status") != "active":
+                return refreshed
+            case = refreshed
+        except TradeCaseTransitionError:
+            return get_trade_case(DB_PATH, str(case["id"]))
+    return get_trade_case(DB_PATH, str(case["id"]))
+
+
+def set_pending_trade_state(pending: dict[str, Any], *, source: str) -> None:
+    st.session_state.pending_trade = pending
+    sync_active_trade_case_artifact(
+        "pending_trade",
+        actor=source,
+        message="Trade proposal is waiting for human confirmation",
+        payload={key: value for key, value in pending.items() if key != "api_token"},
+        auto_create_objective=f"Review and execute {pending.get('symbol') or DEFAULT_SYMBOL} trade",
+        symbol=str(pending.get("symbol") or DEFAULT_SYMBOL),
+    )
+
+
+def record_trade_receipt_state(receipt_result: dict[str, Any], *, source: str) -> None:
+    st.session_state.last_trade_receipt = receipt_result
+    receipt = ((receipt_result.get("data") or {}).get("receipt") or (receipt_result.get("data") or {}).get("sell") or {})
+    sync_active_trade_case_artifact(
+        "trade_receipt",
+        actor=source,
+        message="Trade receipt recorded; case completed",
+        payload=receipt,
+    )
+
+
 def append_agent_memory_to_state(
     state: Any,
     agent_id: str,
@@ -4457,15 +5041,21 @@ def remember_agent_report(agent_id: str, report: dict[str, Any]) -> None:
     )
 
 
+def chart_snapshot_id(symbol: str, created_at: datetime) -> str:
+    return f"{symbol}-{created_at.strftime('%Y%m%dT%H%M%S%fZ')}"
+
+
 def add_chart_snapshot(result: dict[str, Any], source: str = "agent") -> None:
     if not result or not result.get("ok"):
         return
     data = result.get("data") or {}
+    created_at = datetime.now(timezone.utc)
+    symbol = str(data.get("symbol", DEFAULT_SYMBOL))
     snapshot = {
-        "id": f"{data.get('symbol', DEFAULT_SYMBOL)}-{datetime.now(timezone.utc).strftime('%H%M%S')}",
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "id": chart_snapshot_id(symbol, created_at),
+        "created_at": created_at.isoformat(),
         "source": source,
-        "symbol": data.get("symbol", DEFAULT_SYMBOL),
+        "symbol": symbol,
         "granularity": data.get("granularity", DEFAULT_GRANULARITY),
         "count": data.get("returned_count", DEFAULT_COUNT),
         "result": result,
@@ -4484,6 +5074,18 @@ def add_chart_snapshot(result: dict[str, Any], source: str = "agent") -> None:
         "Chart Snapshots",
         f"{snapshot['symbol']} snapshot synced",
         {"snapshot_id": snapshot["id"], "count": snapshot["count"]},
+    )
+    sync_active_trade_case_artifact(
+        "chart",
+        actor=source,
+        message=f"{snapshot['symbol']} chart snapshot validated",
+        payload={
+            "snapshot_id": snapshot["id"],
+            "symbol": snapshot["symbol"],
+            "granularity": snapshot["granularity"],
+            "count": snapshot["count"],
+            "created_at": snapshot["created_at"],
+        },
     )
 
 
@@ -4903,7 +5505,7 @@ def execution_agent(
         "allow_live": bool(st.session_state.allow_live_execution),
     }
     if st.session_state.require_trade_confirmation and not st.session_state.confirm_next_trade:
-        st.session_state.pending_trade = pending
+        set_pending_trade_state(pending, source="execution_agent")
         report = {
             "role": "Execution Trader",
             "ok": False,
@@ -5021,7 +5623,7 @@ def execution_agent(
     st.session_state.confirm_next_trade = False
     st.session_state.pending_trade = None
     if receipt_result.get("ok"):
-        st.session_state.last_trade_receipt = receipt_result
+        record_trade_receipt_state(receipt_result, source="execution_agent")
         receipt = ((receipt_result.get("data") or {}).get("receipt") or (receipt_result.get("data") or {}).get("sell") or {})
         report = {
             "role": "Execution Trader",
@@ -5937,7 +6539,7 @@ def execute_trade_closed_loop(plan: ToolPlan) -> tuple[dict[str, Any], str]:
         "source": "closed_loop",
     }
     if st.session_state.require_trade_confirmation and not st.session_state.confirm_next_trade:
-        st.session_state.pending_trade = pending
+        set_pending_trade_state(pending, source="closed_loop")
         result = {
             "ok": False,
             "error": {
@@ -5991,7 +6593,7 @@ def execute_trade_closed_loop(plan: ToolPlan) -> tuple[dict[str, Any], str]:
     )
 
     if result.get("ok"):
-        st.session_state.last_trade_receipt = result
+        record_trade_receipt_state(result, source="closed_loop")
         receipt = ((result.get("data") or {}).get("receipt") or {})
         log.append("   order_status=SUCCESS")
         log.append(f"   contract_id={receipt.get('contract_id')}")
@@ -7265,6 +7867,72 @@ def chart_data_status(
     }
 
 
+def chart_integrity_report(
+    frame: pd.DataFrame,
+    granularity: int,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    if frame.empty or "timestamp" not in frame.columns:
+        return {
+            "ok": False,
+            "fresh": False,
+            "duplicate_timestamps": 0,
+            "out_of_order_bars": 0,
+            "invalid_ohlc": 0,
+            "gap_count": 0,
+            "issues": ["empty_data"],
+        }
+
+    timestamps = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+    valid_timestamps = timestamps.dropna()
+    duplicate_timestamps = int(valid_timestamps.duplicated().sum())
+    intervals = valid_timestamps.diff().dt.total_seconds().dropna()
+    out_of_order_bars = int((intervals < 0).sum())
+    gap_threshold = max(float(granularity) * 1.5, float(granularity) + 1.0)
+    gap_count = int((intervals > gap_threshold).sum())
+
+    required_prices = ["open", "high", "low", "close"]
+    if all(column in frame.columns for column in required_prices):
+        prices = frame[required_prices].apply(pd.to_numeric, errors="coerce")
+        finite_mask = prices.map(lambda value: bool(pd.notna(value) and math.isfinite(float(value))))
+        finite_prices = prices.where(finite_mask)
+        invalid_prices = (~finite_mask).any(axis=1) | (prices <= 0).any(axis=1)
+        invalid_ranges = (
+            finite_prices["high"] < finite_prices[["open", "low", "close"]].max(axis=1)
+        ) | (
+            finite_prices["low"] > finite_prices[["open", "high", "close"]].min(axis=1)
+        )
+        invalid_ohlc = int((invalid_prices | invalid_ranges).sum())
+    else:
+        invalid_ohlc = len(frame)
+
+    freshness = chart_data_status(frame, granularity, now=now)
+    issues: list[str] = []
+    if timestamps.isna().any():
+        issues.append("invalid_timestamp")
+    if duplicate_timestamps:
+        issues.append("duplicate_timestamps")
+    if out_of_order_bars:
+        issues.append("out_of_order_bars")
+    if invalid_ohlc:
+        issues.append("invalid_ohlc")
+    if gap_count:
+        issues.append("possible_gaps")
+    if not freshness.get("fresh"):
+        issues.append("stale_data")
+
+    return {
+        "ok": not issues,
+        "fresh": bool(freshness.get("fresh")),
+        "duplicate_timestamps": duplicate_timestamps,
+        "out_of_order_bars": out_of_order_bars,
+        "invalid_ohlc": invalid_ohlc,
+        "gap_count": gap_count,
+        "issues": issues,
+    }
+
+
 def local_time_label(value: Any, fmt: str = "%Y-%m-%d %H:%M:%S MYT") -> str:
     if not value:
         return ""
@@ -7355,7 +8023,7 @@ def render_chart_stats(frame: pd.DataFrame) -> None:
         )
 
 
-def render_measurement(frame: pd.DataFrame) -> None:
+def render_measurement(frame: pd.DataFrame, *, key_prefix: str = "") -> None:
     if len(frame) < 2:
         return
 
@@ -7365,8 +8033,18 @@ def render_measurement(frame: pd.DataFrame) -> None:
         for idx, row in frame.iterrows()
     ]
     col_a, col_b = st.columns(2)
-    start_label = col_a.selectbox(t("start_candle"), labels, index=max(len(labels) - 12, 0))
-    end_label = col_b.selectbox(t("end_candle"), labels, index=len(labels) - 1)
+    start_label = col_a.selectbox(
+        t("start_candle"),
+        labels,
+        index=max(len(labels) - 12, 0),
+        key=f"measure_start_{key_prefix}",
+    )
+    end_label = col_b.selectbox(
+        t("end_candle"),
+        labels,
+        index=len(labels) - 1,
+        key=f"measure_end_{key_prefix}",
+    )
     start_idx = int(start_label.split(" · ", 1)[0])
     end_idx = int(end_label.split(" · ", 1)[0])
     if start_idx == end_idx:
@@ -7426,6 +8104,7 @@ def render_trading_chart_workbench(result: dict[str, Any], *, key_prefix: str = 
     granularity = int(data.get("granularity") or DEFAULT_GRANULARITY)
     count = int(data.get("returned_count") or len(frame))
     status = chart_data_status(frame, granularity)
+    integrity = chart_integrity_report(frame, granularity)
 
     st.markdown(
         f"""
@@ -7445,6 +8124,18 @@ def render_trading_chart_workbench(result: dict[str, Any], *, key_prefix: str = 
     status_cols[2].metric(t("chart_data_status"), t("chart_fresh") if status.get("fresh") else t("chart_stale"))
     status_cols[3].metric(t("chart_time_zone"), "MYT / UTC")
     st.caption(f"{t('chart_local_time_note')} {t('chart_refresh_hint')}")
+
+    with st.expander(t("chart_integrity"), expanded=not integrity["ok"]):
+        integrity_cols = st.columns(5)
+        integrity_cols[0].metric(
+            t("chart_integrity"),
+            t("chart_integrity_ok") if integrity["ok"] else t("chart_integrity_attention"),
+        )
+        integrity_cols[1].metric(t("chart_duplicate_bars"), integrity["duplicate_timestamps"])
+        integrity_cols[2].metric(t("chart_gap_count"), integrity["gap_count"])
+        integrity_cols[3].metric(t("chart_invalid_ohlc"), integrity["invalid_ohlc"])
+        integrity_cols[4].metric(t("chart_order_errors"), integrity["out_of_order_bars"])
+        st.caption(t("chart_integrity_hint"))
 
     control_a, control_b, control_c = st.columns([0.32, 0.34, 0.34])
     st.session_state.chart_height = control_a.slider(
@@ -7611,12 +8302,12 @@ def render_trading_chart_workbench(result: dict[str, Any], *, key_prefix: str = 
             visible=compare_enabled and not compare_frame.empty,
         ),
     )
-    st.plotly_chart(fig, width="stretch", config=chart_config())
+    st.plotly_chart(fig, width="stretch", config=chart_config(), key=f"trading_chart_{key_prefix}")
 
     render_chart_stats(frame)
 
     with st.expander(t("measure_data"), expanded=False):
-        render_measurement(frame)
+        render_measurement(frame, key_prefix=key_prefix)
         st.markdown(f"#### {t('full_ohlcv')}")
         st.dataframe(
             frame[
@@ -7730,7 +8421,7 @@ def render_last_artifacts() -> None:
                     f"{t('snapshot_time')}: {local_time_label(item.get('created_at'))} · "
                     f"UTC={item.get('created_at')} · source={item.get('source')}"
                 )
-                idx = item.get("id", str(i))
+                idx = f"{item.get('id', 'snapshot')}_{i}"
                 render_trading_chart_workbench(item["result"], key_prefix=idx)
     elif st.session_state.last_candles and st.session_state.last_candles.get("ok"):
         render_trading_chart_workbench(st.session_state.last_candles, key_prefix="latest")
@@ -7893,7 +8584,7 @@ def render_advisor_trade_draft_controls(result: dict[str, Any]) -> None:
                 allow_live=bool(st.session_state.allow_live_execution),
             )
             if draft.get("ok"):
-                st.session_state.pending_trade = draft["pending_trade"]
+                set_pending_trade_state(draft["pending_trade"], source="advisor_council")
                 st.session_state.active_page = "trading"
                 st.success(t("advisor_trade_created"))
                 st.rerun()
@@ -8378,14 +9069,635 @@ def render_chat() -> None:
         st.session_state.prompt_nonce += 1
 
 
-PAGE_KEYS = ["advisor", "micro", "trading", "charts", "monitor"]
+PAGE_KEYS = ["cases", "advisor", "micro", "trading", "charts", "monitor"]
 PAGE_NAV_CODES = {
+    "cases": "TC",
     "advisor": "AD",
     "micro": "MI",
     "trading": "EX",
     "charts": "CH",
     "monitor": "MO",
 }
+
+CASE_STAGE_LABELS = {
+    "zh": {
+        "draft": "目标草稿",
+        "advisor_review": "谋士讨论",
+        "market_validation": "行情验证",
+        "micro_backtest": "小笔回测",
+        "risk_review": "风控复核",
+        "awaiting_confirmation": "等待人工确认",
+        "execution": "交易执行",
+        "review": "成交复盘",
+    },
+    "en": {
+        "draft": "Objective Draft",
+        "advisor_review": "Advisor Review",
+        "market_validation": "Market Validation",
+        "micro_backtest": "Micro Backtest",
+        "risk_review": "Risk Review",
+        "awaiting_confirmation": "Human Confirmation",
+        "execution": "Execution",
+        "review": "Post-trade Review",
+    },
+}
+
+CASE_STATUS_LABELS = {
+    "zh": {"active": "进行中", "paused": "已暂停", "completed": "已完成", "cancelled": "已取消", "failed": "失败"},
+    "en": {"active": "Active", "paused": "Paused", "completed": "Completed", "cancelled": "Cancelled", "failed": "Failed"},
+}
+
+
+def case_stage_label(stage: str) -> str:
+    return CASE_STAGE_LABELS[current_lang()].get(stage, stage)
+
+
+def case_status_label(status: str) -> str:
+    return CASE_STATUS_LABELS[current_lang()].get(status, status)
+
+
+def case_next_page(stage: str) -> str:
+    return {
+        "draft": "advisor",
+        "advisor_review": "charts",
+        "market_validation": "micro",
+        "micro_backtest": "trading",
+        "risk_review": "trading",
+        "awaiting_confirmation": "trading",
+        "execution": "monitor",
+        "review": "monitor",
+    }.get(stage, "advisor")
+
+
+def case_artifact_payload(case: dict[str, Any], artifact_type: str) -> dict[str, Any] | None:
+    artifact = (((case.get("context") or {}).get("artifacts") or {}).get(artifact_type) or {})
+    payload = artifact.get("payload")
+    return payload if isinstance(payload, dict) else None
+
+
+def save_workflow_checkpoint(
+    case_id: str,
+    *,
+    completed_steps: list[str],
+    current_step: str,
+    status: str,
+    failed_step: str | None = None,
+    detail: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    case = get_trade_case(DB_PATH, case_id)
+    if case is None:
+        raise KeyError(f"unknown trade case: {case_id}")
+    payload = {
+        "status": status,
+        "current_step": current_step,
+        "completed_steps": list(dict.fromkeys(completed_steps)),
+        "failed_step": failed_step,
+        "detail": detail or {},
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    return record_trade_case_artifact(
+        DB_PATH,
+        case_id,
+        artifact_type="workflow_run",
+        actor="workflow_orchestrator",
+        message=f"Workflow {status}: {current_step}",
+        payload=payload,
+        expected_version=int(case["version"]),
+    )
+
+
+def earliest_retry_step(blockers: list[str]) -> str:
+    if any(code in blockers for code in {"missing_advisor", "advisor_not_actionable", "direction_conflict", "symbol_mismatch"}):
+        return "advisor"
+    if any(code in blockers for code in {"missing_market", "market_data_unhealthy"}):
+        return "market"
+    if any(code in blockers for code in {"missing_micro_strategy", "micro_not_actionable", "budget_blocked", "backtest_halted", "no_paper_trades"}):
+        return "micro_strategy"
+    return "consistency_gate"
+
+
+def run_trade_case_simulation(
+    case_id: str,
+    *,
+    amount: float = 1.0,
+    candle_count: int = 120,
+    time_budget_seconds: int = 8,
+    use_web: bool = False,
+    retry_failed: bool = False,
+    writer: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    case = get_trade_case(DB_PATH, case_id)
+    if case is None:
+        return {"ok": False, "reason": "missing_case"}
+    if case.get("status") == "failed" and retry_failed:
+        case = control_trade_case(
+            DB_PATH,
+            case_id,
+            "retry",
+            actor="workflow_orchestrator",
+            expected_version=int(case["version"]),
+        )
+    if case.get("status") != "active":
+        return {"ok": False, "reason": f"case_{case.get('status')}"}
+    if st.session_state.get("pending_trade"):
+        return {
+            "ok": False,
+            "reason": "pending_trade_exists",
+            "case_id": case_id,
+            "error": "Resolve or clear the existing pending trade before starting another simulation.",
+        }
+
+    st.session_state.active_trade_case_id = case_id
+    resume_step = workflow_resume_step(case)
+    start_index = WORKFLOW_STEPS.index(resume_step)
+    previous_workflow = case_artifact_payload(case, "workflow_run") or {}
+    completed_steps = [
+        step for step in previous_workflow.get("completed_steps", []) if step in WORKFLOW_STEPS[:start_index]
+    ]
+    current_step = resume_step
+
+    def announce(message: str) -> None:
+        if writer:
+            writer(message)
+        push_runtime_event("case_workflow", "Orchestrator", case_id, message)
+
+    try:
+        advisor = case_artifact_payload(case, "advisor")
+        if start_index <= WORKFLOW_STEPS.index("advisor") or not advisor:
+            current_step = "advisor"
+            announce(f"{case_id}: advisor council started")
+            advisor = run_advisor_council(
+                str(case["objective"]),
+                str(case["symbol"]),
+                int(time_budget_seconds),
+                bool(use_web),
+                writer,
+            )
+            refreshed = get_trade_case(DB_PATH, case_id) or case
+            if not case_artifact_payload(refreshed, "advisor"):
+                sync_active_trade_case_artifact(
+                    "advisor",
+                    actor="workflow_orchestrator",
+                    message="Automated advisor result saved",
+                    payload=advisor,
+                )
+            completed_steps.append("advisor")
+            save_workflow_checkpoint(
+                case_id,
+                completed_steps=completed_steps,
+                current_step="advisor",
+                status="running",
+                detail={"stance": advisor.get("stance"), "confidence": advisor.get("confidence")},
+            )
+        else:
+            announce(f"{case_id}: reusing advisor evidence")
+
+        case = get_trade_case(DB_PATH, case_id) or case
+        market = case_artifact_payload(case, "market")
+        if start_index <= WORKFLOW_STEPS.index("market") or not market:
+            current_step = "market"
+            announce(f"{case_id}: market validation started")
+            candle_result = fetch_compare_candles(str(case["symbol"]), DEFAULT_GRANULARITY, int(candle_count))
+            if not candle_result.get("ok"):
+                raise RuntimeError((candle_result.get("error") or {}).get("message", "market fetch failed"))
+            frame = candles_frame_from_result(candle_result)
+            if frame.empty:
+                raise RuntimeError("market returned no drawable candles")
+            integrity = chart_integrity_report(frame, DEFAULT_GRANULARITY)
+            market = {
+                "symbol": str(case["symbol"]),
+                "granularity": DEFAULT_GRANULARITY,
+                "candle_count": len(frame),
+                "latest_timestamp": frame.iloc[-1]["timestamp"].isoformat(),
+                "latest_close": float(frame.iloc[-1]["close"]),
+                "integrity": integrity,
+                "candle_result": candle_result,
+            }
+            add_chart_snapshot(candle_result, source="workflow_orchestrator")
+            sync_active_trade_case_artifact(
+                "market",
+                actor="workflow_orchestrator",
+                message="Automated market evidence saved",
+                payload=market,
+            )
+            completed_steps.append("market")
+            save_workflow_checkpoint(
+                case_id,
+                completed_steps=completed_steps,
+                current_step="market",
+                status="running",
+                detail={"integrity": integrity, "candle_count": len(frame)},
+            )
+        else:
+            announce(f"{case_id}: reusing market evidence")
+
+        case = get_trade_case(DB_PATH, case_id) or case
+        micro = case_artifact_payload(case, "micro_strategy")
+        if start_index <= WORKFLOW_STEPS.index("micro_strategy") or not micro:
+            current_step = "micro_strategy"
+            announce(f"{case_id}: micro strategy backtest started")
+            candle_result = (market or {}).get("candle_result") or {}
+            frame = candles_frame_from_result(candle_result)
+            if frame.empty:
+                raise RuntimeError("persisted market evidence has no candles")
+            price_frame = normalize_price_frame(frame[["timestamp", "close"]])
+            config = MicroTradeConfig(symbol=str(case["symbol"]), max_trade_amount=float(amount))
+            budget_check = budget_guard_check(
+                action="execute_simulated_trade",
+                amount=float(amount),
+                limits=BudgetLimits(
+                    max_single_trade_amount=float(amount),
+                    max_daily_trade_budget=max(5.0, float(amount)),
+                    max_total_trade_budget=max(5.0, float(amount)),
+                ),
+                daily_spent=0,
+                total_spent=0,
+            )
+            decision = analyze_micro_trade(price_frame, config)
+            backtest = backtest_micro_strategy(
+                price_frame,
+                config,
+                CircuitBreakerConfig(),
+                lookback_bars=8,
+            )
+            operator_brief = micro_operator_brief(
+                decision,
+                budget_check,
+                backtest,
+                price_frame,
+                data_source="live",
+                symbol=config.symbol,
+            )
+            save_micro_strategy_run(
+                goal=str(case["objective"]),
+                config=config,
+                decision=decision,
+                budget_check=budget_check,
+                backtest=backtest,
+                operator_brief=operator_brief,
+                data_source="live",
+            )
+            case = get_trade_case(DB_PATH, case_id) or case
+            micro = case_artifact_payload(case, "micro_strategy") or {
+                "config": {"symbol": config.symbol, "max_trade_amount": config.max_trade_amount},
+                "decision": decision,
+                "budget_guard": budget_check,
+                "backtest": backtest,
+                "operator_brief": operator_brief,
+            }
+            completed_steps.append("micro_strategy")
+            save_workflow_checkpoint(
+                case_id,
+                completed_steps=completed_steps,
+                current_step="micro_strategy",
+                status="running",
+                detail={"action": decision.get("action"), "trade_count": (backtest.get("summary") or {}).get("trade_count")},
+            )
+        else:
+            announce(f"{case_id}: reusing micro strategy evidence")
+
+        current_step = "consistency_gate"
+        draft = advisor_trade_draft(
+            advisor,
+            amount=float(amount),
+            duration=5,
+            duration_unit="t",
+            allow_live=False,
+        )
+        pending = draft.get("pending_trade") if draft.get("ok") else None
+        gate = trade_case_consistency_gate(
+            case,
+            advisor=advisor,
+            market=market,
+            micro=micro,
+            pending_trade=pending,
+        )
+        sync_active_trade_case_artifact(
+            "risk",
+            actor="consistency_gate",
+            message="Automated consistency gate completed",
+            payload=gate,
+        )
+        completed_steps.append("consistency_gate")
+        if not gate["ok"]:
+            retry_step = earliest_retry_step(gate["blockers"])
+            save_workflow_checkpoint(
+                case_id,
+                completed_steps=completed_steps,
+                current_step="consistency_gate",
+                status="blocked",
+                failed_step=retry_step,
+                detail=gate,
+            )
+            announce(f"{case_id}: consistency gate blocked the order")
+            result = {
+                "ok": True,
+                "ready_for_confirmation": False,
+                "case_id": case_id,
+                "gate": gate,
+                "resume_step": retry_step,
+            }
+            st.session_state.last_case_workflow_result = result
+            return result
+
+        current_step = "human_confirmation"
+        set_pending_trade_state(pending, source="workflow_orchestrator")
+        completed_steps.append("human_confirmation")
+        save_workflow_checkpoint(
+            case_id,
+            completed_steps=completed_steps,
+            current_step="human_confirmation",
+            status="awaiting_confirmation",
+            detail=gate,
+        )
+        result = {
+            "ok": True,
+            "ready_for_confirmation": True,
+            "case_id": case_id,
+            "gate": gate,
+            "pending_trade": pending,
+        }
+        st.session_state.last_case_workflow_result = result
+        announce(f"{case_id}: waiting for human confirmation")
+        return result
+    except Exception as exc:
+        failure = {
+            "status": "failed",
+            "current_step": current_step,
+            "completed_steps": list(dict.fromkeys(completed_steps)),
+            "failed_step": current_step,
+            "detail": {"error": str(exc)},
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        latest = get_trade_case(DB_PATH, case_id)
+        if latest and latest.get("status") == "active":
+            update_trade_case(
+                DB_PATH,
+                case_id,
+                actor="workflow_orchestrator",
+                message=f"Workflow failed at {current_step}",
+                event_type="workflow_failure",
+                status="failed",
+                artifact_type="workflow_run",
+                payload=failure,
+                expected_version=int(latest["version"]),
+                last_error=str(exc),
+            )
+        result = {
+            "ok": False,
+            "reason": "workflow_failed",
+            "case_id": case_id,
+            "failed_step": current_step,
+            "error": str(exc),
+        }
+        st.session_state.last_case_workflow_result = result
+        announce(f"{case_id}: failed at {current_step}: {exc}")
+        return result
+
+
+def render_trade_case_banner() -> None:
+    case = active_trade_case()
+    if not case:
+        return
+    cols = st.columns([0.68, 0.16, 0.16])
+    cols[0].caption(
+        f"{t('case_active')}: `{case['id']}` · {case['title']} · "
+        f"{case_stage_label(str(case['stage']))} · v{case['version']}"
+    )
+    cols[1].metric(t("case_status"), case_status_label(str(case["status"])))
+    if cols[2].button(t("page_cases"), key="open_active_trade_case", width="stretch"):
+        st.session_state.active_page = "cases"
+        st.rerun()
+
+
+def render_trade_cases_page() -> None:
+    st.markdown(f"### {t('page_cases')}")
+    st.markdown(f'<p class="small-muted">{html.escape(t("page_cases_caption"))}</p>', unsafe_allow_html=True)
+
+    with st.expander(t("case_new"), expanded=not bool(list_trade_cases(DB_PATH, limit=1))):
+        with st.form("create_trade_case_form", clear_on_submit=False):
+            create_cols = st.columns([0.28, 0.5, 0.22])
+            title = create_cols[0].text_input(t("case_title"), placeholder="R_75 short-window validation")
+            objective = create_cols[1].text_input(
+                t("case_objective"),
+                placeholder=(
+                    "先问谋士、验证行情、跑小笔回测，通过风控后再决定是否提交模拟订单"
+                    if current_lang() == "zh"
+                    else "Ask advisors, validate data, run a micro backtest, then review a demo order"
+                ),
+            )
+            symbol = create_cols[2].text_input(t("case_symbol"), value=DEFAULT_SYMBOL)
+            submitted = st.form_submit_button(t("case_create"), type="primary", width="stretch")
+        if submitted:
+            if not objective.strip():
+                st.warning(t("case_objective"))
+            else:
+                case = create_active_trade_case(objective, symbol, title)
+                st.success(f"{t('case_created')}: {case['id']}")
+                st.rerun()
+
+    cases = list_trade_cases(DB_PATH, limit=30)
+    if not cases:
+        st.info(t("case_none"))
+        return
+
+    labels = {
+        item["id"]: f"{item['id']} · {item['title']} · {case_status_label(str(item['status']))}"
+        for item in cases
+    }
+    case_ids = list(labels)
+    current_id = str(st.session_state.get("active_trade_case_id") or case_ids[0])
+    if current_id not in case_ids:
+        current_id = case_ids[0]
+    selected_id = st.selectbox(
+        t("case_active"),
+        case_ids,
+        index=case_ids.index(current_id),
+        format_func=lambda value: labels[value],
+        key="trade_case_selector",
+    )
+    if selected_id != st.session_state.get("active_trade_case_id"):
+        st.session_state.active_trade_case_id = selected_id
+    case = get_trade_case(DB_PATH, selected_id)
+    if case is None:
+        st.error(t("case_none"))
+        return
+
+    metrics = st.columns(5)
+    metrics[0].metric("Case ID", case["id"])
+    metrics[1].metric(t("case_status"), case_status_label(str(case["status"])))
+    metrics[2].metric(t("case_stage"), case_stage_label(str(case["stage"])))
+    metrics[3].metric(t("case_version"), int(case["version"]))
+    metrics[4].metric(t("case_updated"), local_time_label(case["updated_at"], "%m-%d %H:%M MYT"))
+    st.caption(f"{case['objective']} · Symbol `{case['symbol']}`")
+
+    with st.container(border=True):
+        st.markdown(f"#### {t('case_auto_run')}")
+        st.caption(t("case_auto_run_caption"))
+        run_cols = st.columns([0.2, 0.2, 0.2, 0.2, 0.2])
+        workflow_amount = run_cols[0].number_input(
+            t("case_trade_amount"),
+            min_value=0.35,
+            max_value=10.0,
+            value=1.0,
+            step=0.25,
+            key=f"case_amount_{case['id']}",
+        )
+        workflow_candles = run_cols[1].number_input(
+            t("case_candle_count"),
+            min_value=40,
+            max_value=500,
+            value=120,
+            step=20,
+            key=f"case_candles_{case['id']}",
+        )
+        workflow_budget = run_cols[2].number_input(
+            t("case_time_budget"),
+            min_value=4,
+            max_value=25,
+            value=8,
+            step=1,
+            key=f"case_time_budget_{case['id']}",
+        )
+        workflow_web = run_cols[3].toggle(
+            t("case_use_web"),
+            value=False,
+            key=f"case_web_{case['id']}",
+        )
+        run_label = t("case_retry_from_failure") if case["status"] == "failed" else t("case_run_now")
+        run_clicked = run_cols[4].button(
+            run_label,
+            key=f"case_run_{case['id']}",
+            type="primary",
+            width="stretch",
+            disabled=case["status"] not in {"active", "failed"},
+        )
+        if run_clicked:
+            with st.status(t("case_auto_run"), expanded=True) as workflow_status:
+                result = run_trade_case_simulation(
+                    str(case["id"]),
+                    amount=float(workflow_amount),
+                    candle_count=int(workflow_candles),
+                    time_budget_seconds=int(workflow_budget),
+                    use_web=bool(workflow_web),
+                    retry_failed=case["status"] == "failed",
+                    writer=st.write,
+                )
+                if not result.get("ok"):
+                    workflow_status.update(
+                        label=f"{t('case_failed_step')}: {workflow_step_label(result.get('failed_step'))}",
+                        state="error",
+                    )
+                elif result.get("ready_for_confirmation"):
+                    workflow_status.update(label=t("case_ready_confirmation"), state="complete")
+                else:
+                    workflow_status.update(label=t("case_no_confirmation"), state="complete")
+            st.rerun()
+
+        workflow_artifact = case_artifact_payload(case, "workflow_run") or {}
+        render_trade_case_operator_brief(case)
+        if workflow_artifact:
+            with st.expander(
+                t("case_run_details"),
+                expanded=workflow_artifact.get("status") == "failed",
+            ):
+                workflow_metrics = st.columns(3)
+                workflow_metrics[0].metric(
+                    t("case_failed_step"),
+                    workflow_step_label(workflow_artifact.get("failed_step"))
+                    if workflow_artifact.get("status") in {"failed", "blocked"}
+                    else "-",
+                )
+                workflow_metrics[1].metric(
+                    t("case_gate_result"),
+                    workflow_status_label(workflow_artifact.get("status")),
+                )
+                workflow_metrics[2].metric(
+                    t("case_stage"),
+                    workflow_phase_label(workflow_artifact.get("current_step")),
+                )
+                detail = workflow_artifact.get("detail") or {}
+                blockers = display_case_blockers(detail.get("blockers") or [], detail)
+                if blockers:
+                    st.warning(
+                        f"{t('case_blockers')}: "
+                        + "；".join(case_blocker_message(str(code)) for code in blockers)
+                    )
+                if workflow_artifact.get("status") == "failed" and detail.get("error"):
+                    st.error(str(detail["error"]))
+
+    controls = st.columns([0.18, 0.18, 0.18, 0.46])
+    control_action: str | None = None
+    if case["status"] == "active" and controls[0].button(t("case_pause"), key=f"pause_{case['id']}", width="stretch"):
+        control_action = "pause"
+    if case["status"] == "paused" and controls[1].button(t("case_resume"), key=f"resume_{case['id']}", width="stretch"):
+        control_action = "resume"
+    if case["status"] in {"active", "paused", "failed"} and controls[2].button(t("case_cancel"), key=f"cancel_{case['id']}", width="stretch"):
+        control_action = "cancel"
+    if controls[3].button(t("case_open_module"), key=f"next_{case['id']}", type="primary", width="stretch"):
+        st.session_state.active_page = case_next_page(str(case["stage"]))
+        st.rerun()
+    if control_action:
+        try:
+            control_trade_case(
+                DB_PATH,
+                str(case["id"]),
+                control_action,
+                expected_version=int(case["version"]),
+            )
+            st.rerun()
+        except TradeCaseConflict:
+            st.warning(t("case_conflict"))
+        except TradeCaseTransitionError as exc:
+            st.warning(str(exc))
+
+    stage_index = CASE_STAGES.index(str(case["stage"])) if case["stage"] in CASE_STAGES else 0
+    st.markdown(f"#### {t('case_progress')}")
+    st.progress((stage_index + 1) / len(CASE_STAGES))
+    progress_cols = st.columns(4)
+    for index, stage in enumerate(CASE_STAGES):
+        state = "✓" if index < stage_index else "●" if index == stage_index else "○"
+        progress_cols[index % 4].caption(f"{state} {case_stage_label(stage)}")
+
+    artifacts = dict((case.get("context") or {}).get("artifacts") or {})
+    st.markdown(f"#### {t('case_artifacts')}")
+    if artifacts:
+        artifact_rows = []
+        for artifact_type, artifact in artifacts.items():
+            payload = artifact.get("payload") or {}
+            artifact_rows.append(
+                {
+                    ("产物" if current_lang() == "zh" else "Artifact"): artifact_type,
+                    ("来源" if current_lang() == "zh" else "Actor"): artifact.get("actor"),
+                    ("更新时间" if current_lang() == "zh" else "Updated"): local_time_label(artifact.get("updated_at"), "%m-%d %H:%M:%S MYT"),
+                    ("摘要" if current_lang() == "zh" else "Summary"): str(
+                        payload.get("consensus")
+                        or payload.get("headline")
+                        or payload.get("recommendation")
+                        or payload.get("snapshot_id")
+                        or payload.get("status")
+                        or payload.get("contract_id")
+                        or "saved"
+                    )[:180],
+                }
+            )
+        st.dataframe(artifact_rows, width="stretch", hide_index=True)
+    else:
+        st.info(t("case_none"))
+
+    events = list_trade_case_events(DB_PATH, str(case["id"]), limit=200)
+    st.markdown(f"#### {t('case_events')}")
+    event_rows = [
+        {
+            ("时间" if current_lang() == "zh" else "Time"): local_time_label(item["created_at"], "%m-%d %H:%M:%S MYT"),
+            ("版本" if current_lang() == "zh" else "Version"): item["version"],
+            ("角色" if current_lang() == "zh" else "Actor"): item["actor"],
+            ("阶段" if current_lang() == "zh" else "Stage"): case_stage_label(str(item["stage"])),
+            ("事件" if current_lang() == "zh" else "Event"): item["message"],
+        }
+        for item in events
+    ]
+    st.dataframe(event_rows, width="stretch", hide_index=True, height=min(420, 72 + len(event_rows) * 34))
 
 
 def render_page_nav() -> str:
@@ -9091,7 +10403,11 @@ def main() -> None:
     render_header()
     render_global_status_bar()
     active_page = render_page_nav()
-    if active_page == "advisor":
+    if active_page != "cases":
+        render_trade_case_banner()
+    if active_page == "cases":
+        render_trade_cases_page()
+    elif active_page == "advisor":
         render_advisor_page()
     elif active_page == "micro":
         render_micro_strategy_page()

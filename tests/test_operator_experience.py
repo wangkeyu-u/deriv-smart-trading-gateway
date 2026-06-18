@@ -166,6 +166,97 @@ def test_chart_data_status_uses_local_and_stale_status() -> None:
     assert stale["fresh"] is False
 
 
+def test_chart_integrity_report_accepts_regular_fresh_candles() -> None:
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-06-06T15:00:00Z", periods=4, freq="1min"),
+            "open": [100.0, 100.1, 100.2, 100.3],
+            "high": [100.2, 100.3, 100.4, 100.5],
+            "low": [99.9, 100.0, 100.1, 100.2],
+            "close": [100.1, 100.2, 100.3, 100.4],
+        }
+    )
+
+    report = web_app.chart_integrity_report(
+        frame,
+        60,
+        now=datetime(2026, 6, 6, 15, 4, tzinfo=timezone.utc),
+    )
+
+    assert report["ok"] is True
+    assert report["issues"] == []
+    assert report["gap_count"] == 0
+
+
+def test_chart_integrity_report_explains_corrupted_candles() -> None:
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [
+                    "2026-06-06T15:00:00Z",
+                    "2026-06-06T15:01:00Z",
+                    "2026-06-06T15:01:00Z",
+                    "2026-06-06T15:05:00Z",
+                    "2026-06-06T15:04:00Z",
+                ],
+                utc=True,
+            ),
+            "open": [100.0, 100.1, 100.2, 100.3, 100.4],
+            "high": [100.2, 100.3, 100.1, 100.5, 100.6],
+            "low": [99.9, 100.0, 100.1, 100.2, 100.3],
+            "close": [100.1, 100.2, 100.3, 100.4, 100.5],
+        }
+    )
+
+    report = web_app.chart_integrity_report(
+        frame,
+        60,
+        now=datetime(2026, 6, 6, 15, 5, tzinfo=timezone.utc),
+    )
+
+    assert report["ok"] is False
+    assert report["duplicate_timestamps"] == 1
+    assert report["out_of_order_bars"] == 1
+    assert report["gap_count"] == 1
+    assert report["invalid_ohlc"] == 1
+
+
+def test_chart_integrity_report_handles_non_finite_prices() -> None:
+    frame = pd.DataFrame(
+        {
+            "timestamp": [pd.Timestamp("2026-06-06T15:00:00Z")],
+            "open": [float("inf")],
+            "high": [2.0],
+            "low": [1.0],
+            "close": [1.5],
+        }
+    )
+
+    report = web_app.chart_integrity_report(
+        frame,
+        60,
+        now=datetime(2026, 6, 6, 15, 1, tzinfo=timezone.utc),
+    )
+
+    assert report["ok"] is False
+    assert report["invalid_ohlc"] == 1
+    assert "invalid_ohlc" in report["issues"]
+
+
+def test_chart_snapshot_id_includes_subsecond_precision() -> None:
+    first = web_app.chart_snapshot_id(
+        "R_100",
+        datetime(2026, 6, 6, 15, 8, 0, 1, tzinfo=timezone.utc),
+    )
+    second = web_app.chart_snapshot_id(
+        "R_100",
+        datetime(2026, 6, 6, 15, 8, 0, 2, tzinfo=timezone.utc),
+    )
+
+    assert first != second
+    assert first.endswith("000001Z")
+
+
 def test_local_time_label_converts_utc_to_myt() -> None:
     assert web_app.local_time_label("2026-06-06T15:08:00Z") == "2026-06-06 23:08:00 MYT"
 
@@ -191,3 +282,85 @@ def test_append_runtime_event_to_state_increments_sync_version() -> None:
 
     assert state["sync_version"] == 8
     assert state["runtime_events"][-1]["kind"] == "chart"
+
+
+def test_case_blocker_messages_follow_interface_language() -> None:
+    assert web_app.case_blocker_message("advisor_not_actionable", "zh") == "谋士团建议等待，当前不应生成订单"
+    assert web_app.case_blocker_message("advisor_not_actionable", "en") == "Advisor stance is WAIT or invalid."
+
+
+def test_display_case_blockers_cleans_legacy_wait_artifacts() -> None:
+    blockers = web_app.display_case_blockers(
+        ["advisor_not_actionable", "backtest_halted", "missing_trade_draft", "direction_conflict"],
+        {"advisor_action": "WAIT", "micro_action": "PUT", "pending_action": None},
+    )
+
+    assert blockers == ["advisor_not_actionable", "backtest_halted"]
+
+
+def test_operator_brief_explains_backtest_halt_in_plain_chinese() -> None:
+    case = {
+        "status": "active",
+        "stage": "risk_review",
+        "symbol": "R_75",
+        "context": {
+            "artifacts": {
+                "advisor": {"payload": {"stance": "WAIT", "confidence": 0.62}},
+                "micro_strategy": {
+                    "payload": {
+                        "decision": {"action": "PUT", "confidence": 0.95},
+                        "budget_guard": {"ok": True},
+                        "backtest": {
+                            "summary": {
+                                "trade_count": 3,
+                                "wins": 0,
+                                "losses": 3,
+                                "win_rate": 0,
+                                "total_pnl": -0.002,
+                                "halted": True,
+                                "halt_reason": "max_consecutive_losses",
+                            }
+                        },
+                    }
+                },
+                "risk": {
+                    "payload": {
+                        "ok": False,
+                        "blockers": ["advisor_not_actionable", "backtest_halted"],
+                    }
+                },
+                "workflow_run": {
+                    "payload": {"status": "blocked", "failed_step": "advisor"}
+                },
+            }
+        },
+    }
+
+    brief = web_app.trade_case_operator_brief(case, lang="zh")
+
+    assert brief["headline"] == "本轮不下单"
+    assert "连续亏损 3 次" in brief["summary"]
+    assert brief["next_action"] == "重新咨询谋士"
+    assert brief["decision"] == "NO_TRADE"
+
+
+def test_operator_brief_requires_revalidation_after_restart() -> None:
+    case = {
+        "status": "active",
+        "stage": "awaiting_confirmation",
+        "symbol": "R_75",
+        "context": {
+            "artifacts": {
+                "workflow_run": {"payload": {"status": "awaiting_confirmation"}},
+                "pending_trade": {"payload": {"contract_type": "CALL", "amount": 1.0}},
+            }
+        },
+    }
+
+    expired = web_app.trade_case_operator_brief(case, has_session_pending=False, lang="zh")
+    ready = web_app.trade_case_operator_brief(case, has_session_pending=True, lang="zh")
+
+    assert expired["headline"] == "原确认草稿已失效，需要重新验证"
+    assert expired["decision"] == "NO_TRADE"
+    assert ready["headline"] == "订单草稿已准备，等待你确认"
+    assert ready["decision"] == "CALL"
