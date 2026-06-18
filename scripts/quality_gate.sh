@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -17,7 +17,15 @@ echo "[1/5] Checking installed Python dependencies"
 "$PYTHON" -m pip check
 
 echo "[2/5] Compiling Python modules"
-"$PYTHON" -m py_compile ${(f)"$(rg --files -g '*.py' -g '!.venv/**')"}
+PYTHON_FILES=()
+while IFS= read -r file; do
+  PYTHON_FILES+=("$file")
+done < <(rg --files -g '*.py' -g '!.venv/**')
+if [ "${#PYTHON_FILES[@]}" -eq 0 ]; then
+  echo "No Python modules found." >&2
+  exit 1
+fi
+"$PYTHON" -m py_compile "${PYTHON_FILES[@]}"
 
 echo "[3/5] Running Python test suite"
 "$PYTHON" -m pytest -q
@@ -34,7 +42,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-for attempt in {1..40}; do
+for attempt in $(seq 1 40); do
   if curl --fail --silent "http://127.0.0.1:${PORT}/api/health" >/dev/null; then
     break
   fi
