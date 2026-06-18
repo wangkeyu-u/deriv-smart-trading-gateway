@@ -20,7 +20,7 @@ echo "[2/5] Compiling Python modules"
 PYTHON_FILES=()
 while IFS= read -r file; do
   PYTHON_FILES+=("$file")
-done < <(rg --files -g '*.py' -g '!.venv/**')
+done < <(git ls-files --cached --others --exclude-standard -- '*.py')
 if [ "${#PYTHON_FILES[@]}" -eq 0 ]; then
   echo "No Python modules found." >&2
   exit 1
