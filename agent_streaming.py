@@ -15,9 +15,9 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
 
-from server import get_historical_candles, get_market_ticks
+from deriv_client import get_historical_candles, get_market_ticks
 
 
 DEFAULT_MODEL_BY_PROVIDER = {
@@ -332,7 +332,11 @@ def load_prompt_registry(path: Path) -> dict[str, dict[str, str]]:
 
 
 def extract_symbol(text: str) -> str:
-    upper = text.upper().replace(" ", "")
+    original_upper = text.upper()
+    spot_match = re.search(r"(?<![A-Z0-9])([A-Z0-9]{2,10}(?:USDT|USD|EUR|GBP|JPY))(?![A-Z0-9])", original_upper)
+    if spot_match:
+        return spot_match.group(1)
+    upper = original_upper.replace(" ", "")
     patterns = [
         r"R_(?:10|25|50|75|100)",
         r"(?:BOOM|CRASH)(?:300|500|600|900|1000)",
@@ -348,16 +352,153 @@ def extract_symbol(text: str) -> str:
 
 
 def route_agents(message: str) -> list[str]:
+    """Route a user message to the appropriate agents based on intent.
+
+    Supports three intent classes:
+    - decision: "该不该买/卖" -> triggers advisor council + risk + compliance
+    - analysis: "行情怎么样/分析一下" -> market + strategy + chart
+    - execution: "下单/买入/卖出" -> risk + compliance + execution
+    """
     lower = message.casefold()
-    routes = ["strategy"]
-    if any(word in lower for word in ("行情", "价格", "tick", "k线", "走势", "market", "price", "chart")):
+
+    # Detect intent
+    is_decision = any(w in lower for w in (
+        "该不该", "要不要", "能不能买", "能不能卖", "怎么看", "意见",
+        "应该", "建议", "决策", "shall i", "should i", "what do you think"
+    ))
+    is_execution = any(w in lower for w in (
+        "买", "卖", "下单", "交易", "call", "put", "buy", "sell", "执行", "开仓", "平仓"
+    ))
+    is_analysis = any(w in lower for w in (
+        "行情", "价格", "tick", "k线", "走势", "market", "price", "chart",
+        "分析", "analyze", "趋势", "动量"
+    ))
+
+    routes: list[str] = []
+
+    # Always start with strategy for context
+    routes.append("strategy")
+
+    # Analysis intent
+    if is_analysis or not (is_decision or is_execution):
         routes.append("market")
-    if any(word in lower for word in ("买", "卖", "下单", "交易", "call", "put", "buy", "sell", "执行")):
-        routes.extend(["risk", "compliance"])
-    if any(word in lower for word in ("图", "k线", "chart", "蜡烛")):
-        routes.append("chart")
+        if any(w in lower for w in ("图", "k线", "chart", "蜡烛")):
+            routes.append("chart")
+
+    # Decision intent -> trigger advisor council
+    if is_decision:
+        routes.extend([
+            "market",  # advisors need market data
+            "advisor.macro",
+            "advisor.quant",
+            "advisor.flow",
+            "advisor.risk",
+            "advisor.contrarian",
+            "advisor.chief",
+        ])
+
+    # Execution intent -> risk + compliance gate
+    if is_execution:
+        routes.extend(["risk", "compliance", "execution"])
+
+    # Always end with report
     routes.append("report")
+
     return list(dict.fromkeys(routes))
+
+
+def is_advisor(agent_id: str) -> bool:
+    """Check if an agent is an advisor (part of the council)."""
+    return agent_id.startswith("advisor.")
+
+
+def parse_advisor_json(report: str) -> dict[str, Any] | None:
+    """Try to parse an advisor's JSON report. Returns None on failure."""
+    if not report:
+        return None
+    # Try direct parse first
+    try:
+        return json.loads(report)
+    except json.JSONDecodeError:
+        pass
+    # Try to extract JSON block from markdown
+    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", report, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+def local_chief_synthesis(
+    advisor_reports: dict[str, str],
+    symbol: str,
+    language: str = "zh",
+) -> str:
+    """Local fallback: synthesize advisor reports into a chief conclusion."""
+    stances: dict[str, int] = {"CALL": 0, "PUT": 0, "WAIT": 0, "BLOCK": 0}
+    parsed_count = 0
+
+    for agent_id, report in advisor_reports.items():
+        if not is_advisor(agent_id) or agent_id == "advisor.chief":
+            continue
+        parsed = parse_advisor_json(report)
+        if parsed and "stance" in parsed:
+            stances[parsed["stance"]] = stances.get(parsed["stance"], 0) + 1
+            parsed_count += 1
+
+    if parsed_count == 0:
+        # Fallback to text heuristics
+        for report in advisor_reports.values():
+            upper = report.upper()
+            if "CALL" in upper:
+                stances["CALL"] += 1
+            elif "PUT" in upper:
+                stances["PUT"] += 1
+            elif "BLOCK" in upper:
+                stances["BLOCK"] += 1
+            else:
+                stances["WAIT"] += 1
+
+    # Determine winning stance
+    if stances.get("BLOCK", 0) > 0:
+        winner = "WAIT"
+        confidence = 0.3
+    elif stances["CALL"] > stances["PUT"] and stances["CALL"] > stances["WAIT"]:
+        winner = "CALL"
+        confidence = min(0.75, stances["CALL"] / max(1, sum(stances.values())))
+    elif stances["PUT"] > stances["CALL"] and stances["PUT"] > stances["WAIT"]:
+        winner = "PUT"
+        confidence = min(0.75, stances["PUT"] / max(1, sum(stances.values())))
+    else:
+        winner = "WAIT"
+        confidence = 0.5
+
+    if language == "en":
+        return json.dumps({
+            "advisor": "chief",
+            "stance": winner,
+            "confidence": round(confidence, 2),
+            "vote_breakdown": stances,
+            "winning_side": winner,
+            "dissent": "See individual advisor reports",
+            "reasoning": f"Synthesized from {parsed_count} advisor votes",
+            "preconditions": ["human_confirmation", "market_stability"],
+            "invalidation": "If any advisor's preconditions are not met",
+        }, ensure_ascii=False, indent=2)
+
+    return json.dumps({
+        "advisor": "chief",
+        "stance": winner,
+        "confidence": round(confidence, 2),
+        "vote_breakdown": stances,
+        "winning_side": winner,
+        "dissent": "见各谋士报告",
+        "reasoning": f"基于 {parsed_count} 位谋士投票综合得出",
+        "preconditions": ["人工确认", "行情稳定"],
+        "invalidation": "任一谋士前提条件未满足时结论失效",
+    }, ensure_ascii=False, indent=2)
 
 
 async def market_context(symbol: str) -> dict[str, Any]:
@@ -385,6 +526,88 @@ async def market_context(symbol: str) -> dict[str, Any]:
         "closes": closes,
         "ok": bool(tick.get("ok")) and bool(candles.get("ok")),
     }
+
+
+# ---------------------------------------------------------------------------
+# Tool calling: agents can request additional market data frames
+# ---------------------------------------------------------------------------
+VALID_GRANULARITIES = {60: "1m", 300: "5m", 3600: "1h"}
+
+
+async def fetch_market_frame(
+    symbol: str,
+    granularity: int = 60,
+    count: int = 60,
+) -> dict[str, Any]:
+    """Fetch a specific candle frame for an agent.
+
+    Args:
+        symbol: Deriv symbol (e.g. R_75)
+        granularity: 60 (1m), 300 (5m), or 3600 (1h)
+        count: number of candles (1-1000)
+
+    Returns:
+        Dict with closes, ohlcv, change_pct, latest_close, ma5, ma20
+    """
+    granularity = granularity if granularity in VALID_GRANULARITIES else 60
+    count = max(1, min(1000, int(count)))
+    try:
+        candles_raw = await asyncio.wait_for(
+            get_historical_candles(symbol, granularity, count),
+            timeout=8.0,
+        )
+        candles = json.loads(candles_raw)
+    except (TimeoutError, json.JSONDecodeError, Exception):
+        return {"symbol": symbol, "granularity": granularity, "ok": False, "closes": []}
+
+    rows = (candles.get("data") or {}).get("ohlcv") or []
+    closes = [float(row["close"]) for row in rows if row.get("close") is not None]
+    change_pct = ((closes[-1] / closes[0] - 1) * 100) if len(closes) >= 2 and closes[0] else None
+    ma5 = round(sum(closes[-5:]) / len(closes[-5:]), 4) if len(closes) >= 5 else None
+    ma20 = round(sum(closes[-20:]) / len(closes[-20:]), 4) if len(closes) >= 20 else None
+
+    # Compute simple volatility (stdev of last 20 returns)
+    volatility_pct = None
+    if len(closes) >= 21:
+        returns = [(closes[i] / closes[i - 1] - 1) for i in range(-20, 0)]
+        mean = sum(returns) / len(returns)
+        variance = sum((r - mean) ** 2 for r in returns) / len(returns)
+        volatility_pct = round((variance ** 0.5) * 100, 4)
+
+    return {
+        "symbol": symbol,
+        "granularity": granularity,
+        "granularity_label": VALID_GRANULARITIES[granularity],
+        "candle_count": len(rows),
+        "closes": closes,
+        "ohlcv": rows,
+        "latest_close": closes[-1] if closes else None,
+        "window_change_pct": change_pct,
+        "ma5": ma5,
+        "ma20": ma20,
+        "volatility_pct": volatility_pct,
+        "ok": bool(candles.get("ok")),
+    }
+
+
+def detect_tool_request(report: str) -> list[dict[str, Any]] | None:
+    """Detect if an agent's report contains a tool request.
+
+    Looks for JSON like: {"tool": "fetch_market_frame", "granularity": 300, "count": 100}
+    Returns a list of tool requests, or None.
+    """
+    if not report:
+        return None
+    requests: list[dict[str, Any]] = []
+    # Match tool_call JSON blocks
+    for match in re.finditer(r'\{[^{}]*"tool"\s*:\s*"([^"]+)"[^{}]*\}', report):
+        try:
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, dict) and parsed.get("tool"):
+                requests.append(parsed)
+        except json.JSONDecodeError:
+            continue
+    return requests if requests else None
 
 
 def _language_instruction(language: str) -> str:
@@ -470,9 +693,119 @@ async def provider_stream(
             yield delta
 
 
-def local_agent_report(agent_id: str, message: str, symbol: str, market: dict[str, Any] | None) -> str:
+LOCAL_AGENT_NAMES_EN = {
+    "manager": "Trading Manager",
+    "market": "Market Analyst",
+    "strategy": "Strategy Researcher",
+    "risk": "Risk Officer",
+    "compliance": "Compliance Reviewer",
+    "chart": "Chart Engineer",
+    "execution": "Execution Trader",
+    "report": "Reporting Agent",
+}
+
+
+def localized_agent_name(agent_id: str, default: str, language: str) -> str:
+    return LOCAL_AGENT_NAMES_EN.get(agent_id, default) if language == "en" else default
+
+
+def local_agent_report(agent_id: str, message: str, symbol: str, market: dict[str, Any] | None, language: str = "zh") -> str:
     latest = (market or {}).get("latest_close")
     change = (market or {}).get("window_change_pct")
+    closes = (market or {}).get("closes") or []
+
+    # --- Advisor agents: return structured JSON ---
+    if is_advisor(agent_id):
+        ma5 = round(sum(closes[-5:]) / len(closes[-5:]), 4) if len(closes) >= 5 else None
+        ma20 = round(sum(closes[-20:]) / len(closes[-20:]), 4) if len(closes) >= 20 else None
+        trend = "up" if (change or 0) > 0.1 else "down" if (change or 0) < -0.1 else "sideways"
+        # Compute volatility if enough data
+        volatility_pct = None
+        if len(closes) >= 21:
+            returns = [(closes[i] / closes[i - 1] - 1) for i in range(-20, 0)]
+            mean_ret = sum(returns) / len(returns)
+            variance = sum((r - mean_ret) ** 2 for r in returns) / len(returns)
+            volatility_pct = round((variance ** 0.5) * 100, 4)
+
+        if agent_id == "advisor.macro":
+            return json.dumps({
+                "advisor": "macro", "stance": "WAIT", "confidence": 0.35,
+                "catalysts": [], "macro_bias": "neutral",
+                "reasoning": "No external news feed; macro view deferred" if language == "en" else "无外部新闻源，宏观判断暂缓",
+                "preconditions": ["news_catalyst"],
+            }, ensure_ascii=False)
+        if agent_id == "advisor.quant":
+            ma_signal = "golden_cross" if (ma5 and ma20 and ma5 > ma20) else "death_cross" if (ma5 and ma20 and ma5 < ma20) else "neutral"
+            return json.dumps({
+                "advisor": "quant", "stance": "CALL" if ma_signal == "golden_cross" else "PUT" if ma_signal == "death_cross" else "WAIT",
+                "confidence": 0.55, "ma5": round(ma5, 4) if ma5 else None,
+                "ma20": round(ma20, 4) if ma20 else None, "ma_signal": ma_signal,
+                "momentum": "strong" if abs(change or 0) > 0.5 else "weak",
+                "volatility": "medium",
+                "reasoning": f"MA5={'above' if ma5 and ma20 and ma5 > ma20 else 'below'} MA20, change={change or 0:.3f}%",
+                "preconditions": ["ma_cross_confirmed"],
+            }, ensure_ascii=False)
+        if agent_id == "advisor.flow":
+            # Data-driven: flow follows momentum
+            flow_stance = "CALL" if (change or 0) > 0.3 else "PUT" if (change or 0) < -0.3 else "WAIT"
+            flow_conf = min(0.7, abs(change or 0) / 2.0) if change else 0.3
+            return json.dumps({
+                "advisor": "flow", "stance": flow_stance, "confidence": round(flow_conf, 2),
+                "tick_speed": "fast" if abs(change or 0) > 1.0 else "normal",
+                "flow_pressure": "buy_pressure" if (change or 0) > 0 else "sell_pressure" if (change or 0) < 0 else "balanced",
+                "entry_window": "now" if abs(change or 0) > 0.5 else "wait_5min",
+                "reasoning": f"Window change {change or 0:.3f}% indicates {flow_stance}" if language == "en" else f"窗口变化 {change or 0:.3f}% 指向 {flow_stance}",
+                "preconditions": ["tick_stream_stable"] if flow_stance != "WAIT" else ["wait_for_clearer_signal"],
+            }, ensure_ascii=False)
+        if agent_id == "advisor.risk":
+            # Data-driven: risk allows trade if volatility is manageable
+            vol_ok = volatility_pct is None or volatility_pct < 3.0
+            risk_stance = "WAIT" if not vol_ok else "CALL" if (change or 0) > 0 and ma5 and ma20 and ma5 > ma20 else "PUT" if (change or 0) < 0 and ma5 and ma20 and ma5 < ma20 else "WAIT"
+            return json.dumps({
+                "advisor": "risk", "stance": risk_stance, "confidence": 0.5 if vol_ok else 0.3,
+                "account_health": "healthy" if vol_ok else "warning",
+                "max_affordable_loss": 1.0,
+                "risk_reward_ratio": 1.8 if vol_ok else 0.8,
+                "reasoning": f"Volatility {volatility_pct}% is {'acceptable' if vol_ok else 'too high'}" if language == "en" else f"波动率 {volatility_pct}% {'可接受' if vol_ok else '过高'}",
+                "preconditions": ["demo_account_only", "max_loss_1usd"],
+            }, ensure_ascii=False)
+        if agent_id == "advisor.contrarian":
+            # Contrarian: opposite of trend
+            contrarian_stance = "PUT" if (change or 0) > 0.5 else "CALL" if (change or 0) < -0.5 else "WAIT"
+            return json.dumps({
+                "advisor": "contrarian", "stance": contrarian_stance, "confidence": 0.35,
+                "consensus_challenge": "Trend may already be priced in" if language == "en" else "趋势可能已被价格吸收",
+                "hidden_risks": ["momentum_exhaustion"] if abs(change or 0) > 1.0 else ["sample_too_small"],
+                "reasoning": f"Counter-trend view against {change or 0:.3f}% move" if language == "en" else f"逆当前 {change or 0:.3f}% 走势",
+                "preconditions": ["pullback_confirmation"],
+            }, ensure_ascii=False)
+        if agent_id == "advisor.chief":
+            # Chief synthesis happens after other advisors in stream_multi_agent_chat
+            return json.dumps({
+                "advisor": "chief", "stance": "WAIT", "confidence": 0.4,
+                "vote_breakdown": {"CALL": 0, "PUT": 0, "WAIT": 0, "BLOCK": 0},
+                "winning_side": "WAIT",
+                "dissent": "Pending advisor inputs" if language == "en" else "待谋士输入",
+                "reasoning": "Chief synthesis pending" if language == "en" else "首席汇总待定",
+                "preconditions": ["advisor_votes"],
+                "invalidation": "N/A",
+            }, ensure_ascii=False)
+
+    # --- Non-advisor agents: text reports ---
+    if language == "en":
+        if agent_id == "market":
+            if market and market.get("ok"):
+                return f"{symbol} latest price {latest}; 60-minute change {float(change or 0):+.3f}%; {(market or {}).get('candle_count')} candles loaded."
+            return f"Market data for {symbol} is unavailable, so no directional conclusion can be supported."
+        if agent_id == "strategy":
+            return "Define the observation window, entry and exit rules, and maximum trade amount first. Keep WAIT when evidence is insufficient."
+        if agent_id == "risk":
+            return "Allow only small demo validation by default, with strict per-trade, total-budget, and maximum-loss limits."
+        if agent_id == "compliance":
+            return "Only advice or a pending draft is allowed now. Any real write operation still requires explicit parameters and human approval."
+        if agent_id == "chart":
+            return f"The chart must show the full {symbol} time range, latest timestamp, moving averages, and data freshness without clipping the final candle."
+        return "This run's evidence is organized; the final conclusion must state its basis, risks, and next action."
     if agent_id == "market":
         if market and market.get("ok"):
             return f"{symbol} 最新价 {latest}，60 分钟窗口变化 {float(change or 0):+.3f}%，已读取 {(market or {}).get('candle_count')} 根 K 线。"
@@ -488,12 +821,60 @@ def local_agent_report(agent_id: str, message: str, symbol: str, market: dict[st
     return "已整理本轮 Agent 证据；最终结论必须说明依据、风险和下一步。"
 
 
-def local_manager_answer(message: str, symbol: str, reports: dict[str, str]) -> str:
-    lines = [f"我已让团队围绕 {symbol} 完成一轮分析。"]
+def local_manager_answer(message: str, symbol: str, reports: dict[str, str], language: str = "zh") -> str:
+    # Try to extract chief advisor's structured conclusion
+    chief_report = None
     for name, report in reports.items():
-        lines.append(f"- {name}：{report}")
+        if "首席" in name or "chief" in name.lower():
+            chief_report = report
+            break
+
+    chief_parsed = parse_advisor_json(chief_report) if chief_report else None
+
+    if language == "en":
+        lines = [f"The team has completed one analysis round for {symbol}."]
+        if chief_parsed and chief_parsed.get("stance"):
+            lines.append("")
+            lines.append(f"**Conclusion: {chief_parsed['stance']} (confidence: {chief_parsed.get('confidence', 0):.0%})**")
+            if chief_parsed.get("reasoning"):
+                lines.append(f"Reasoning: {chief_parsed['reasoning']}")
+            if chief_parsed.get("preconditions"):
+                lines.append(f"Preconditions: {', '.join(chief_parsed['preconditions'])}")
+            if chief_parsed.get("invalidation"):
+                lines.append(f"Invalidation: {chief_parsed['invalidation']}")
+        lines.append("")
+        lines.append("**Agent Reports:**")
+        for name, report in reports.items():
+            # Truncate long reports
+            short = report[:200] + "..." if len(report) > 200 else report
+            lines.append(f"- {name}: {short}")
+        lines.append("")
+        lines.append("This run provides analysis only; it does not place an order. To proceed, specify direction, amount, and duration, then pass the human approval gate.")
+        return "\n".join(lines)
+
+    lines = [f"我已让团队围绕 {symbol} 完成一轮分析。"]
+    if chief_parsed and chief_parsed.get("stance"):
+        lines.append("")
+        lines.append(f"**结论：{chief_parsed['stance']}（置信度：{chief_parsed.get('confidence', 0):.0%}）**")
+        if chief_parsed.get("reasoning"):
+            lines.append(f"依据：{chief_parsed['reasoning']}")
+        if chief_parsed.get("preconditions"):
+            lines.append(f"执行前提：{'、'.join(chief_parsed['preconditions'])}")
+        if chief_parsed.get("invalidation"):
+            lines.append(f"失效条件：{chief_parsed['invalidation']}")
+    # Include backtest result if available
+    for name, report in reports.items():
+        if "回测" in name or "backtest" in name.lower():
+            lines.append("")
+            lines.append(f"**{name}**：{report}")
+            break
     lines.append("")
-    lines.append("结论：当前只给出分析和下一步，不会自动下单。需要交易时，请明确方向、金额、期限，并通过人工确认闸门。")
+    lines.append("**各 Agent 报告：**")
+    for name, report in reports.items():
+        short = report[:200] + "..." if len(report) > 200 else report
+        lines.append(f"- {name}：{short}")
+    lines.append("")
+    lines.append("当前只给出分析和下一步，不会自动下单。需要交易时，请明确方向、金额、期限，并通过人工确认闸门。")
     return "\n".join(lines)
 
 
@@ -504,6 +885,7 @@ async def stream_multi_agent_chat(
     config: ChatRuntimeConfig,
     prompts_path: Path,
     symbol_override: str | None = None,
+    market_loader: Callable[[str], Awaitable[dict[str, Any]]] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     run_id = f"RUN-{uuid.uuid4().hex[:12].upper()}"
     run_started = time.perf_counter()
@@ -522,19 +904,23 @@ async def stream_multi_agent_chat(
     market: dict[str, Any] | None = None
     if "market" in routes or "chart" in routes:
         tool_started = time.perf_counter()
-        yield {"type": "tool_start", "tool": "market_snapshot", "label": f"读取 {symbol} 实时行情"}
+        yield {
+            "type": "tool_start",
+            "tool": "market_snapshot",
+            "label": f"Load live market data for {symbol}" if config.language == "en" else f"读取 {symbol} 实时行情",
+        }
         try:
             market = await asyncio.wait_for(
-                market_context(symbol),
+                (market_loader or market_context)(symbol),
                 timeout=max(0.1, float(config.tool_timeout_seconds)),
             )
             tool_error = None
         except TimeoutError:
             market = {"symbol": symbol, "ok": False, "error": "market_timeout", "closes": []}
-            tool_error = "行情服务响应超时"
+            tool_error = "Market service timed out" if config.language == "en" else "行情服务响应超时"
         except Exception:
             market = {"symbol": symbol, "ok": False, "error": "market_unavailable", "closes": []}
-            tool_error = "行情服务暂时不可用"
+            tool_error = "Market service is temporarily unavailable" if config.language == "en" else "行情服务暂时不可用"
         yield {
             "type": "tool_done",
             "tool": "market_snapshot",
@@ -544,24 +930,88 @@ async def stream_multi_agent_chat(
             "error": tool_error,
         }
 
-    async def run_agent(agent_id: str) -> tuple[str, str, str, int, str | None]:
+    # --- Build advisor context for chief synthesis ---
+    advisor_reports_raw: dict[str, str] = {}  # agent_id -> report
+
+    # Build history summary for agent context (task #2: conversation memory)
+    def _build_history_context(history: list[dict[str, Any]], language: str, max_turns: int = 5) -> str:
+        """Build a compact conversation history string for agents."""
+        if not history:
+            return ""
+        recent = history[-max_turns * 2:]  # last N exchanges (user+assistant)
+        lines: list[str] = []
+        for item in recent:
+            role = item.get("role", "")
+            content = str(item.get("content", "")).strip()
+            if not content:
+                continue
+            # Truncate long messages
+            if len(content) > 300:
+                content = content[:300] + "..."
+            label = "老板" if role == "user" else "经理" if language == "zh" else "user" if role == "user" else "manager"
+            lines.append(f"[{label}] {content}")
+        return "\n".join(lines) if lines else ""
+
+    history_summary = _build_history_context(history, config.language)
+
+    async def run_agent(agent_id: str, prior_reports: dict[str, str] | None = None) -> tuple[str, str, str, int, str | None]:
         started = time.perf_counter()
         spec = registry.get(agent_id, {"name": agent_id, "prompt": ""})
-        name = spec.get("name") or agent_id
+        name = localized_agent_name(agent_id, spec.get("name") or agent_id, config.language)
         try:
             if config.provider == "local" or not config.api_key:
-                report = local_agent_report(agent_id, message, symbol, market)
+                report = local_agent_report(agent_id, message, symbol, market, config.language)
                 await asyncio.sleep(0.08)
             else:
                 context = json.dumps(market or {}, ensure_ascii=False, default=str)
+                # Build user prompt with prior agent context + history (task #2)
+                user_parts = [f"老板指令：{message}", f"目标 Symbol：{symbol}", f"可用行情：{context}"]
+                # Task #2: Add conversation history
+                if history_summary:
+                    user_parts.append(f"\n近期对话：\n{history_summary}")
+                if prior_reports:
+                    prior_text = "\n".join(f"- {k}: {v}" for k, v in prior_reports.items())
+                    user_parts.append(f"\n前序 Agent 报告（供参考）：\n{prior_text}")
+                # Chief advisor gets special instruction to synthesize
+                if agent_id == "advisor.chief" and prior_reports:
+                    user_parts.append("\n请汇总以上所有谋士观点，按你的输出格式给出最终结论（CALL/PUT/WAIT）。")
+                # Task #1: Tell agents they can request additional data
+                user_parts.append(
+                    "\n如需更多数据，可在报告末尾附加 JSON 工具请求："
+                    '{"tool": "fetch_market_frame", "granularity": 300, "count": 100}'
+                    "（granularity 可选 60/300/3600）"
+                )
+                user_prompt = "\n".join(user_parts)
                 report = await asyncio.wait_for(
                     provider_complete(
                         config,
                         f"{spec.get('prompt', '')}\n{_language_instruction(config.language)}\n只返回给经理的简短专业报告，不要写代码。",
-                        f"老板指令：{message}\n目标 Symbol：{symbol}\n可用行情：{context}",
+                        user_prompt,
                     ),
                     timeout=max(0.1, float(config.agent_timeout_seconds)),
                 )
+                # Task #1: Check if agent requested additional data
+                tool_requests = detect_tool_request(report)
+                if tool_requests:
+                    for req in tool_requests[:2]:  # max 2 tool calls per agent
+                        if req.get("tool") == "fetch_market_frame":
+                            extra_data = await fetch_market_frame(
+                                symbol,
+                                int(req.get("granularity", 60)),
+                                int(req.get("count", 60)),
+                            )
+                            if extra_data.get("ok"):
+                                # Re-run agent with extra data
+                                enriched_context = json.dumps(extra_data, ensure_ascii=False, default=str)
+                                user_parts.append(f"\n[工具返回-{extra_data['granularity_label']}数据]：{enriched_context}")
+                                report = await asyncio.wait_for(
+                                    provider_complete(
+                                        config,
+                                        f"{spec.get('prompt', '')}\n{_language_instruction(config.language)}\n只返回给经理的简短专业报告，不要写代码。",
+                                        "\n".join(user_parts),
+                                    ),
+                                    timeout=max(0.1, float(config.agent_timeout_seconds)),
+                                )
             duration_ms = int((time.perf_counter() - started) * 1000)
             return agent_id, name, report.strip(), duration_ms, None
         except TimeoutError:
@@ -574,45 +1024,163 @@ async def stream_multi_agent_chat(
     reports: dict[str, str] = {}
     successful_agents: list[str] = []
     failed_agents: list[str] = []
-    tasks: list[asyncio.Task[tuple[str, str, str, int, str | None]]] = []
-    for agent_id in routes:
-        spec = registry.get(agent_id, {"name": agent_id})
-        yield {"type": "agent_start", "agent_id": agent_id, "name": spec.get("name") or agent_id}
-        tasks.append(asyncio.create_task(run_agent(agent_id), name=f"agent:{agent_id}"))
 
-    try:
-        for completed in asyncio.as_completed(tasks):
-            agent_id, name, report, duration_ms, error_code = await completed
-            if error_code:
-                failed_agents.append(agent_id)
-                report = "该 Agent 本轮未完成，经理将基于其余证据继续。"
-                reports[name] = report
-                yield {
-                    "type": "agent_error",
-                    "agent_id": agent_id,
-                    "name": name,
-                    "report": report,
-                    "duration_ms": duration_ms,
-                    "error_code": error_code,
-                    "message": "Agent 响应超时" if error_code == "timeout" else "模型服务暂时不可用",
-                }
+    # --- Two-phase execution: non-chief first, then chief with context ---
+    # Phase 1: Run all non-chief agents in parallel
+    phase1_agents = [a for a in routes if a != "advisor.chief"]
+    phase2_agents = [a for a in routes if a == "advisor.chief"]
+
+    async def _run_phase(agents: list[str], prior: dict[str, str] | None = None):
+        """Run a batch of agents, optionally with prior reports for context."""
+        nonlocal reports, successful_agents, failed_agents
+        tasks: list[asyncio.Task] = []
+        for agent_id in agents:
+            spec = registry.get(agent_id, {"name": agent_id})
+            name = localized_agent_name(agent_id, spec.get("name") or agent_id, config.language)
+            yield {"type": "agent_start", "agent_id": agent_id, "name": name}
+            tasks.append(asyncio.create_task(run_agent(agent_id, prior), name=f"agent:{agent_id}"))
+
+        try:
+            for completed in asyncio.as_completed(tasks):
+                agent_id, name, report, duration_ms, error_code = await completed
+                if error_code:
+                    failed_agents.append(agent_id)
+                    report = "This agent did not finish; the manager will continue with the remaining evidence." if config.language == "en" else "该 Agent 本轮未完成，经理将基于其余证据继续。"
+                    reports[name] = report
+                    yield {
+                        "type": "agent_error",
+                        "agent_id": agent_id,
+                        "name": name,
+                        "report": report,
+                        "duration_ms": duration_ms,
+                        "error_code": error_code,
+                        "message": ("Agent response timed out" if error_code == "timeout" else "Model service is temporarily unavailable") if config.language == "en" else ("Agent 响应超时" if error_code == "timeout" else "模型服务暂时不可用"),
+                    }
+                else:
+                    successful_agents.append(agent_id)
+                    reports[name] = report
+                    advisor_reports_raw[agent_id] = report
+                    yield {
+                        "type": "agent_done",
+                        "agent_id": agent_id,
+                        "name": name,
+                        "report": report,
+                        "duration_ms": duration_ms,
+                    }
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+
+    # Execute Phase 1 (all non-chief agents)
+    async for event in _run_phase(phase1_agents):
+        yield event
+
+    # Phase 2: Run chief advisor with prior advisor reports as context
+    if phase2_agents:
+        # Build prior context: only advisor reports (not all agents)
+        advisor_context = {
+            k: v for k, v in advisor_reports_raw.items()
+            if is_advisor(k) and k != "advisor.chief"
+        }
+        # For local mode, synthesize chief locally
+        if config.provider == "local" or not config.api_key:
+            spec = registry.get("advisor.chief", {"name": "advisor.chief"})
+            name = localized_agent_name("advisor.chief", spec.get("name") or "首席谋士", config.language)
+            yield {"type": "agent_start", "agent_id": "advisor.chief", "name": name}
+            chief_report = local_chief_synthesis(advisor_context, symbol, config.language) if advisor_context else local_agent_report("advisor.chief", message, symbol, market, config.language)
+            reports[name] = chief_report
+            advisor_reports_raw["advisor.chief"] = chief_report
+            successful_agents.append("advisor.chief")
+            yield {"type": "agent_done", "agent_id": "advisor.chief", "name": name, "report": chief_report, "duration_ms": 50}
+        else:
+            async for event in _run_phase(phase2_agents, advisor_context):
+                yield event
+
+    # --- Task #4: Backtest integration ---
+    # After chief advisor concludes, run a paper-trading backtest to validate
+    backtest_result: dict[str, Any] | None = None
+    chief_stance: str | None = None
+    for name, report in reports.items():
+        if "首席" in name or "chief" in name.lower():
+            parsed = parse_advisor_json(report)
+            if parsed and parsed.get("stance") in ("CALL", "PUT"):
+                chief_stance = parsed["stance"]
+            break
+
+    if chief_stance and market and market.get("closes") and len(market["closes"]) >= 12:
+        bt_started = time.perf_counter()
+        yield {
+            "type": "tool_start",
+            "tool": "paper_backtest",
+            "label": f"Backtest {chief_stance} strategy on {symbol}" if config.language == "en" else f"回测 {chief_stance} 策略 ({symbol})",
+        }
+        try:
+            from micro_trading import MicroTradeConfig, normalize_price_frame
+            from paper_trading import CircuitBreakerConfig, backtest_micro_strategy
+
+            # Build price frame from market closes
+            closes = market["closes"]
+            price_rows = [{"close": c, "timestamp": i} for i, c in enumerate(closes)]
+            frame = normalize_price_frame(price_rows)
+
+            # Configure strategy matching chief's stance
+            asset_kind = "deriv"
+            strategy_config = MicroTradeConfig(
+                symbol=symbol,
+                asset_kind=asset_kind,
+                max_trade_amount=1.0,
+                min_confidence=0.55,
+            )
+            circuit_config = CircuitBreakerConfig()
+
+            bt_result = backtest_micro_strategy(
+                frame,
+                strategy_config,
+                circuit_config,
+                lookback_bars=10,
+                exit_after_bars=1,
+            )
+            backtest_result = bt_result
+            bt_ok = bt_result.get("ok", False)
+            bt_error = None
+        except Exception as exc:
+            backtest_result = {"ok": False, "reason": "backtest_error", "error": str(exc)}
+            bt_ok = False
+            bt_error = str(exc)
+        bt_duration = int((time.perf_counter() - bt_started) * 1000)
+        yield {
+            "type": "tool_done",
+            "tool": "paper_backtest",
+            "ok": bt_ok,
+            "data": backtest_result,
+            "duration_ms": bt_duration,
+            "error": bt_error,
+        }
+
+        # Inject backtest summary into reports for manager
+        if backtest_result and backtest_result.get("ok"):
+            summary = backtest_result.get("summary", {})
+            if config.language == "zh":
+                bt_report = (
+                    f"回测验证：{summary.get('trade_count', 0)} 笔交易，"
+                    f"胜率 {summary.get('win_rate', 0) or 0:.1%}，"
+                    f"总盈亏 {summary.get('total_pnl', 0):+.4f}，"
+                    f"最大回撤 {summary.get('drawdown_pct', 0):.2f}%"
+                    f"{'（触发熔断）' if summary.get('halted') else ''}"
+                )
             else:
-                successful_agents.append(agent_id)
-                reports[name] = report
-                yield {
-                    "type": "agent_done",
-                    "agent_id": agent_id,
-                    "name": name,
-                    "report": report,
-                    "duration_ms": duration_ms,
-                }
-    finally:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
+                bt_report = (
+                    f"Backtest: {summary.get('trade_count', 0)} trades, "
+                    f"win rate {summary.get('win_rate', 0) or 0:.1%}, "
+                    f"total PnL {summary.get('total_pnl', 0):+.4f}, "
+                    f"max drawdown {summary.get('drawdown_pct', 0):.2f}%"
+                    f" (circuit breaker triggered)" if summary.get('halted') else ""
+                )
+            reports["回测验证" if config.language == "zh" else "Backtest"] = bt_report
 
     if config.provider == "local" or not config.api_key:
-        answer = local_manager_answer(message, symbol, reports)
+        answer = local_manager_answer(message, symbol, reports, config.language)
         for index in range(0, len(answer), 8):
             chunk = answer[index : index + 8]
             yield {"type": "answer_delta", "delta": chunk}
@@ -649,10 +1217,10 @@ async def stream_multi_agent_chat(
                 yield {"type": "answer_delta", "delta": delta}
     except Exception:
         manager_fallback = True
-        fallback = local_manager_answer(message, symbol, reports)
-        prefix = "\n\n模型经理未能完整返回，以下为本地降级总结：\n" if parts else ""
+        fallback = local_manager_answer(message, symbol, reports, config.language)
+        prefix = ("\n\nThe model manager did not return a complete response. Local fallback summary:\n" if config.language == "en" else "\n\n模型经理未能完整返回，以下为本地降级总结：\n") if parts else ""
         fallback_text = prefix + fallback
-        yield {"type": "manager_fallback", "message": "经理模型已降级到本地总结"}
+        yield {"type": "manager_fallback", "message": "Manager fell back to a local summary" if config.language == "en" else "经理模型已降级到本地总结"}
         for index in range(0, len(fallback_text), 12):
             delta = fallback_text[index : index + 12]
             parts.append(delta)

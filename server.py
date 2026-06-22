@@ -10,18 +10,32 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import ssl
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from itertools import count
-from typing import Any, Literal
+from typing import Any
 
-import certifi
 import pandas as pd
-import websockets
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 from typing_extensions import Annotated
 from websockets.exceptions import ConnectionClosed, WebSocketException
+
+from deriv_client import (  # type: ignore[import-not-found]
+    DerivWebSocketClient,
+    DerivAPIError,
+    DerivTimeoutError,
+    GatewayError,
+    account_type_from_authorize,
+    clean_json,
+    enforce_demo_or_explicit_live,
+    error_response,
+    extract_tick,
+    mask_secret,
+    normalize_candles,
+    ok_response,
+    summarize_portfolio,
+    utc_now_iso,
+)
 
 
 APP_ID = os.getenv("DERIV_APP_ID", "1089")

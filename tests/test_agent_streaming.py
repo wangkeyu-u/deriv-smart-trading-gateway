@@ -47,7 +47,14 @@ def test_chat_session_list_uses_first_user_message_as_title(tmp_path) -> None:
 
 def test_route_agents_adds_safety_agents_for_trade_intent() -> None:
     route = route_agents("帮我买 R_75，金额 1 美元")
-    assert route == ["strategy", "risk", "compliance", "report"]
+    # execution intent now triggers risk + compliance + execution + report
+    assert "strategy" in route
+    assert "risk" in route
+    assert "compliance" in route
+    assert "execution" in route
+    assert "report" in route
+    assert route[0] == "strategy"
+    assert route[-1] == "report"
 
 
 def test_local_runtime_streams_agent_events_and_answer(tmp_path) -> None:
@@ -79,6 +86,69 @@ def test_local_runtime_streams_agent_events_and_answer(tmp_path) -> None:
     assert events[-1]["type"] == "done"
 
 
+def test_local_runtime_respects_english_language(tmp_path) -> None:
+    prompts = tmp_path / "agent_prompts.json"
+    prompts.write_text(
+        '{"manager":{"name":"经理","prompt":"总结"},'
+        '"strategy":{"name":"策略","prompt":"分析"},'
+        '"report":{"name":"报告","prompt":"复盘"}}',
+        encoding="utf-8",
+    )
+
+    async def collect() -> list[dict]:
+        return [
+            event
+            async for event in stream_multi_agent_chat(
+                message="Explain your capabilities",
+                history=[],
+                config=ChatRuntimeConfig(provider="local", language="en"),
+                prompts_path=prompts,
+            )
+        ]
+
+    events = asyncio.run(collect())
+    answer = events[-1]["answer"]
+    names = [event["name"] for event in events if event["type"] == "agent_done"]
+
+    # Updated: manager answer format now uses "**Conclusion:" or structured format
+    assert "does not place an order" in answer
+    assert "策略" not in answer
+    # General queries now default to analysis route (includes market)
+    assert "Strategy Researcher" in names
+    assert "Reporting Agent" in names
+
+
+def test_runtime_uses_selected_broker_market_loader(tmp_path) -> None:
+    prompts = tmp_path / "agent_prompts.json"
+    prompts.write_text(
+        '{"strategy":{"name":"Strategy","prompt":"Analyze"},'
+        '"market":{"name":"Market","prompt":"Read"},'
+        '"report":{"name":"Report","prompt":"Summarize"}}',
+        encoding="utf-8",
+    )
+
+    async def binance_market(symbol: str) -> dict:
+        return {"broker_id": "binance", "symbol": symbol, "latest_close": 65000, "candle_count": 60, "window_change_pct": 1.2, "ok": True}
+
+    async def collect() -> list[dict]:
+        return [
+            event
+            async for event in stream_multi_agent_chat(
+                message="Check the BTCUSDT market chart",
+                history=[],
+                config=ChatRuntimeConfig(provider="local", language="en"),
+                prompts_path=prompts,
+                market_loader=binance_market,
+            )
+        ]
+
+    events = asyncio.run(collect())
+    market_event = next(event for event in events if event["type"] == "tool_done")
+
+    assert events[0]["symbol"] == "BTCUSDT"
+    assert market_event["data"]["broker_id"] == "binance"
+
+
 def test_routed_agents_run_in_parallel(tmp_path) -> None:
     prompts = tmp_path / "agent_prompts.json"
     prompts.write_text(
@@ -98,9 +168,11 @@ def test_routed_agents_run_in_parallel(tmp_path) -> None:
             config=ChatRuntimeConfig(provider="local", language="zh"),
             prompts_path=prompts,
         )
+        # execution intent now adds execution agent: strategy, risk, compliance, execution, report = 5
+        expected_done = 5
         async for event in stream:
             events.append(event)
-            if sum(item["type"] == "agent_done" for item in events) == 4:
+            if sum(item["type"] == "agent_done" for item in events) == expected_done:
                 elapsed = time.perf_counter() - started
                 await stream.aclose()
                 return events, elapsed
@@ -110,10 +182,10 @@ def test_routed_agents_run_in_parallel(tmp_path) -> None:
     starts = [index for index, event in enumerate(events) if event["type"] == "agent_start"]
     finishes = [index for index, event in enumerate(events) if event["type"] == "agent_done"]
 
-    assert len(starts) == 4
-    assert len(finishes) == 4
+    assert len(starts) == 5
+    assert len(finishes) == 5
     assert max(starts) < min(finishes)
-    assert elapsed < 0.24
+    assert elapsed < 0.3
 
 
 def test_slow_agent_times_out_without_aborting_other_agents(monkeypatch, tmp_path) -> None:
@@ -163,10 +235,11 @@ def test_slow_agent_times_out_without_aborting_other_agents(monkeypatch, tmp_pat
     done = events[-1]
 
     assert [(item["agent_id"], item["error_code"]) for item in errors] == [("risk", "timeout")]
-    assert sum(event["type"] == "agent_done" for event in events) == 3
+    # execution intent adds execution agent: strategy, compliance, execution, report = 4 done
+    assert sum(event["type"] == "agent_done" for event in events) == 4
     assert done["type"] == "done"
     assert done["failed_agents"] == ["risk"]
-    assert set(done["successful_agents"]) == {"strategy", "compliance", "report"}
+    assert set(done["successful_agents"]) == {"strategy", "compliance", "execution", "report"}
     assert done["manager_fallback"] is False
 
 

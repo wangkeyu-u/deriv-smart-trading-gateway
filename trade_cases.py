@@ -99,6 +99,9 @@ def init_trade_case_db(db_path: Path) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_trade_case_events_case ON trade_case_events(case_id, id)"
         )
+        columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(trade_cases)").fetchall()}
+        if "broker_id" not in columns:
+            conn.execute("ALTER TABLE trade_cases ADD COLUMN broker_id TEXT NOT NULL DEFAULT 'deriv'")
 
 
 def _decode_case(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -128,6 +131,7 @@ def create_trade_case(
     *,
     objective: str,
     symbol: str,
+    broker_id: str = "deriv",
     title: str = "",
     case_id: str | None = None,
 ) -> dict[str, Any]:
@@ -135,6 +139,7 @@ def create_trade_case(
     if not clean_objective:
         raise ValueError("objective is required")
     clean_symbol = symbol.strip() or "R_100"
+    clean_broker_id = broker_id.strip().lower() or "deriv"
     created_at = _now()
     new_id = case_id or f"TC-{uuid.uuid4().hex[:12].upper()}"
     clean_title = title.strip() or clean_objective[:80]
@@ -146,8 +151,8 @@ def create_trade_case(
             """
             INSERT INTO trade_cases (
                 id, created_at, updated_at, title, objective, symbol,
-                status, stage, version, context_json, last_error
-            ) VALUES (?, ?, ?, ?, ?, ?, 'active', 'draft', 1, ?, NULL)
+                status, stage, version, context_json, last_error, broker_id
+            ) VALUES (?, ?, ?, ?, ?, ?, 'active', 'draft', 1, ?, NULL, ?)
             """,
             (
                 new_id,
@@ -157,6 +162,7 @@ def create_trade_case(
                 clean_objective,
                 clean_symbol,
                 json.dumps(context, ensure_ascii=False, default=str),
+                clean_broker_id,
             ),
         )
         conn.execute(
@@ -170,7 +176,7 @@ def create_trade_case(
                 new_id,
                 created_at,
                 "交易任务已创建",
-                json.dumps({"objective": clean_objective, "symbol": clean_symbol}, ensure_ascii=False),
+                json.dumps({"objective": clean_objective, "symbol": clean_symbol, "broker_id": clean_broker_id}, ensure_ascii=False),
             ),
         )
     case = get_trade_case(db_path, new_id)
@@ -321,8 +327,10 @@ def record_trade_case_artifact(
     message: str,
     payload: dict[str, Any],
     expected_version: int | None = None,
+    advance_stage: bool = True,
+    target_stage: str | None = None,
 ) -> dict[str, Any]:
-    stage = ARTIFACT_STAGES.get(artifact_type)
+    stage = target_stage if target_stage is not None else (ARTIFACT_STAGES.get(artifact_type) if advance_stage else None)
     status = "completed" if artifact_type == "trade_receipt" else None
     return update_trade_case(
         db_path,

@@ -57,6 +57,38 @@ def test_consistency_gate_reports_symbol_direction_and_freshness_conflicts() -> 
     assert "direction_conflict" in result["blockers"]
 
 
+def test_consistency_gate_blocks_cross_broker_evidence() -> None:
+    case, advisor, market, micro, pending = valid_inputs()
+    case["broker_id"] = "binance"
+    case["symbol"] = advisor["symbol"] = market["symbol"] = pending["symbol"] = "BTCUSDT"
+    advisor.update({"broker_id": "binance", "stance": "BUY"})
+    market["broker_id"] = "kraken"
+    micro.update({"broker_id": "binance"})
+    micro["config"].update({"broker_id": "binance", "symbol": "BTCUSDT"})
+    micro["decision"]["action"] = "BUY"
+    pending.update({"broker_id": "binance", "contract_type": "BUY"})
+
+    result = trade_case_consistency_gate(case, advisor=advisor, market=market, micro=micro, pending_trade=pending)
+
+    assert result["ok"] is False
+    assert "broker_mismatch" in result["blockers"]
+
+
+def test_consistency_gate_supports_spot_action_vocabulary() -> None:
+    case, advisor, market, micro, pending = valid_inputs()
+    case.update({"broker_id": "binance", "symbol": "BTCUSDT"})
+    advisor.update({"broker_id": "binance", "symbol": "BTCUSDT", "stance": "BUY"})
+    market.update({"broker_id": "binance", "symbol": "BTCUSDT"})
+    micro.update({"broker_id": "binance"})
+    micro["config"].update({"broker_id": "binance", "symbol": "BTCUSDT"})
+    micro["decision"]["action"] = "BUY"
+    pending.update({"broker_id": "binance", "symbol": "BTCUSDT", "contract_type": "BUY"})
+
+    result = trade_case_consistency_gate(case, advisor=advisor, market=market, micro=micro, pending_trade=pending)
+
+    assert result["ok"] is True
+
+
 def test_workflow_resume_step_uses_persisted_failure() -> None:
     case = {
         "context": {

@@ -1,12 +1,30 @@
-# Deriv Smart Trading Gateway
+# Multi-Broker AI Trading Gateway
 
-An AI-native trading gateway for Deriv that combines a React operator workspace, a streaming FastAPI gateway, a native desktop shell, a FastMCP tool server, a LangGraph-powered advisor council, and a fast micro-strategy engine for short-horizon decision support.
+An AI-native, multi-broker trading operations platform that combines a React operator workspace, a streaming FastAPI gateway, persistent trade cases, broker adapters, a LangGraph-powered advisor council, and a deterministic micro-strategy engine.
 
 ![Deriv Smart Trading Gateway operator workspace](docs/assets/operator-workspace-preview.png)
 
 ## What It Is
 
-Deriv Smart Trading Gateway turns natural-language trading intent into a coordinated multi-agent workflow. It can read live Deriv market data, build candle snapshots, simulate trades, review risk, and prepare execution through a human-confirmed safety gate.
+The gateway turns natural-language trading intent into a coordinated multi-agent workflow across multiple financial platforms. Deriv remains the first full execution adapter, while the shared broker control plane now supports Deriv, Alpaca, OANDA, Interactive Brokers, Coinbase Advanced, Kraken, and Binance connection profiles. Binance and Kraken public candles are available directly in the market and micro-strategy modules.
+
+The **Broker Hub** separates platform capabilities from account credentials. It shows asset coverage, environments, authentication requirements, and official API documentation, and it can validate supported account connections. Profile metadata is persisted locally, but API tokens, secrets, passwords, and private keys are never written to SQLite or browser storage.
+
+### Broker Integration Coverage
+
+The directory distinguishes what each broker platform offers from what this repository currently implements. A platform capability is not presented as an installed order adapter.
+
+| Platform | Current integration in this project | Live orders from this app |
+| --- | --- | --- |
+| Deriv | Market data, account diagnostics, positions, paper workflow, and the guarded execution adapter | Supported behind token, risk, confirmation, and live-account gates |
+| Binance | Public live candles, account diagnostics, and paper micro-strategy analysis | Not implemented |
+| Kraken | Public live candles, account diagnostics, and paper micro-strategy analysis | Not implemented |
+| Alpaca | Account connection diagnostics and non-secret routing profiles | Not implemented |
+| OANDA | Account connection diagnostics and non-secret routing profiles | Not implemented |
+| Interactive Brokers | Local Client Portal authentication diagnostics and routing profiles | Not implemented |
+| Coinbase Advanced | Catalog metadata and adapter contract only | Not implemented |
+
+Authenticated diagnostics require the operator's own broker credentials and account access. The automated release suite validates credential rejection and adapter failure containment, but it cannot certify a real account connection without those credentials.
 
 The newest layer is the **Boss Advisor Room**: a LangGraph council where multiple advisor agents read market context, optional web research, and short-horizon signals before producing one clear `CALL`, `PUT`, or `WAIT` recommendation.
 
@@ -20,7 +38,8 @@ The primary browser workspace now uses **React + Vite** with a **FastAPI Server-
 | --- | --- | --- |
 | Agent orchestration | LangGraph | Models trading work as an explicit state graph instead of a single prompt. This makes routing, guardrails, memory, and tests easier to control. |
 | Tool server | FastMCP | Exposes Deriv market and execution tools to MCP-compatible clients while keeping tool boundaries explicit. |
-| Market data | Deriv WebSocket API | Provides live ticks, candle history, account checks, proposals, buys, open-contract status, and close-contract flows. |
+| Broker control plane | Python adapters + capability registry | Normalizes broker identity, environments, authentication requirements, account diagnostics, and supported asset/operation capabilities. |
+| Market data | Deriv WebSocket, Binance REST, Kraken REST | Provides normalized ticks and candle history while preserving the source broker on every artifact. |
 | Strategy engine | Python + pandas | Keeps numerical work deterministic: EMA, momentum, volatility, cost edge, confidence, paper PnL, and circuit breakers. |
 | AI providers | OpenAI-compatible chat API, DeepSeek, Anthropic, local rules | Lets every agent run with configurable prompts and provider choice instead of being locked to one model. |
 | Streaming API | FastAPI + SSE | Delivers tool activity, sub-agent progress, and model tokens incrementally instead of waiting for the complete response. |
@@ -39,13 +58,17 @@ The system is intentionally not an "AI says buy, then buys" demo. The architectu
 - Deterministic Python code calculates prices, indicators, budgets, and circuit breakers.
 - LangGraph controls which agent can run next and blocks execution before unsafe nodes are called.
 - SQLite keeps a local audit trail so the operator can reopen the app and continue from recent context.
-- Human confirmation remains the final write gate before any Deriv order submission.
+- Human confirmation remains the final write gate before any broker order submission.
+- Broker identity is part of every trade case. Evidence from one broker cannot approve a draft for another broker.
 
 This makes the project closer to a controlled AI operations system than a single chatbot.
 
 ## Highlights
 
 - **LangGraph trading team runtime** with supervisor routing, graph nodes, handoff-style routing, guardrails, shared state, and per-agent memory.
+- **Multi-broker control plane** with a normalized capability catalog for Deriv, Alpaca, OANDA, IBKR, Coinbase Advanced, Kraken, and Binance.
+- **Secret-safe connection profiles** that persist routing metadata but reject API keys, tokens, passwords, and private keys at the database boundary.
+- **Cross-broker consistency gate** that blocks approval when advisor, market, strategy, and order artifacts reference different platforms.
 - **Parallel routed-agent execution** so independent market, strategy, risk, compliance, and report work does not accumulate serial model latency.
 - **Persistent run tracing** with a run ID, per-agent latency, partial-failure isolation, cancellation state, restart recovery, and a refresh-safe operator ledger.
 - **Unified live event stream** for tool calls, agent starts/completions, errors, routes, and token-by-token manager output.
@@ -89,6 +112,9 @@ React Operator Workspace / Native Desktop App / Streamlit Compatibility Console
   +--> FastAPI SSE Gateway
   |      session memory -> agent events -> provider token stream -> browser
   |
+  +--> Broker Hub / Adapter Registry
+  |      capability catalog -> connection diagnostics -> default routing profile
+  |
   +--> Trade Case State Machine
   |      objective -> advisor -> market -> backtest -> risk -> confirm -> execute -> review
   |      SQLite versioning + append-only audit events
@@ -103,10 +129,12 @@ React Operator Workspace / Native Desktop App / Streamlit Compatibility Console
   |      supervisor -> routed worker nodes -> guardrails -> report
   |
   v
-FastMCP Deriv Tool Server
+Broker Adapter Boundary
   |
-  v
-Deriv WebSocket API
+  +--> Deriv WebSocket API
+  +--> Binance / Kraken public market REST
+  +--> Alpaca / OANDA / IBKR account diagnostics
+  +--> Coinbase / additional adapters through the same capability contract
 ```
 
 ## Repository Layout
@@ -115,6 +143,7 @@ Deriv WebSocket API
 .
 ├── agent_prompts.json              # Editable prompt registry for manager, workers, and advisors
 ├── agent_streaming.py              # Provider streaming, per-agent calls, routing, and chat memory
+├── broker_hub.py                   # Broker catalog, profile store, diagnostics, and public market adapters
 ├── advisor_evaluation.py           # Paper evaluation logic for advisor outcomes and horizons
 ├── case_workflow.py                # One-click workflow order, consistency gate, and retry checkpoints
 ├── desktop_app.py                  # Native PySide6 desktop shell
@@ -195,10 +224,11 @@ On macOS, `Deriv Gateway.command` performs the same dependency check, frontend b
 The workspace includes:
 
 - **Command Center**: persistent conversations, true streaming model output, and live sub-agent activity.
+- **Broker Hub**: broker capability comparison, environment selection, session-only connection verification, and persistent non-secret routing profiles.
 - **Conversation History**: reopen earlier local sessions without losing their stored context; empty sessions stay out of the history list.
 - **Trade Cases**: create persisted tasks, bind one to a manager conversation, and watch advisor, market, risk, workflow, version, and audit evidence synchronize back over the live SSE stream. Chat analysis never creates an order draft or bypasses human confirmation.
 - **Advisor Team**: the active agent roster and each agent's independent prompt.
-- **Markets**: selectable Deriv symbols, live Tick data, 60 one-minute closes, and an uncropped responsive trend chart.
+- **Markets**: broker-aware symbols with normalized Deriv, Binance, and Kraken candles and an uncropped responsive trend chart.
 - **Micro Strategy**: strict per-trade budget, plain-language action, confidence, signal evidence, paper backtest, and circuit-breaker result.
 - **System Monitor**: FastAPI, SSE, SQLite, agent registry, provider, and frontend-build health.
 - **Run Ledger**: recent multi-agent runs, status, symbol, model, successful/degraded agent counts, and end-to-end latency persisted in SQLite.
