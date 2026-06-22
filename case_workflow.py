@@ -25,6 +25,7 @@ BLOCKER_MESSAGES = {
     "no_paper_trades": "The paper backtest produced no trades.",
     "missing_trade_draft": "No executable trade draft was produced.",
     "symbol_mismatch": "Artifacts do not reference the same symbol.",
+    "broker_mismatch": "Artifacts do not reference the same broker.",
     "direction_conflict": "Advisor, strategy, and trade draft directions conflict.",
     "invalid_amount": "Trade amount is invalid or exceeds the strategy limit.",
     "live_execution": "One-click simulation cannot prepare a live-account order.",
@@ -57,13 +58,21 @@ def trade_case_consistency_gate(
     blockers: list[str] = []
     warnings: list[str] = []
     expected_symbol = _symbol(case.get("symbol"))
+    expected_broker = _symbol(case.get("broker_id") or "deriv")
+    actionable_actions = {"CALL", "PUT"} if expected_broker == "deriv" else {"BUY", "SELL"}
+
+    def check_broker(payload: dict[str, Any] | None) -> None:
+        broker = _symbol((payload or {}).get("broker_id"))
+        if broker and broker != expected_broker:
+            blockers.append("broker_mismatch")
 
     if not advisor:
         blockers.append("missing_advisor")
         advisor_action = ""
     else:
+        check_broker(advisor)
         advisor_action = _action(advisor.get("stance"))
-        if advisor_action not in {"CALL", "PUT"}:
+        if advisor_action not in actionable_actions:
             blockers.append("advisor_not_actionable")
         if _symbol(advisor.get("symbol")) != expected_symbol:
             blockers.append("symbol_mismatch")
@@ -71,6 +80,7 @@ def trade_case_consistency_gate(
     if not market:
         blockers.append("missing_market")
     else:
+        check_broker(market)
         if _symbol(market.get("symbol")) != expected_symbol:
             blockers.append("symbol_mismatch")
         integrity = market.get("integrity") or {}
@@ -87,10 +97,12 @@ def trade_case_consistency_gate(
     if not micro:
         blockers.append("missing_micro_strategy")
     else:
+        check_broker(micro)
+        check_broker(micro.get("config") or {})
         config = micro.get("config") or {}
         if _symbol(config.get("symbol")) != expected_symbol:
             blockers.append("symbol_mismatch")
-        if micro_action not in {"CALL", "PUT"}:
+        if micro_action not in actionable_actions:
             blockers.append("micro_not_actionable")
         if not budget.get("ok"):
             blockers.append("budget_blocked")
@@ -101,10 +113,11 @@ def trade_case_consistency_gate(
             blockers.append("no_paper_trades")
 
     if not pending_trade:
-        if advisor_action in {"CALL", "PUT"}:
+        if advisor_action in actionable_actions:
             blockers.append("missing_trade_draft")
         pending_action = ""
     else:
+        check_broker(pending_trade)
         pending_action = _action(pending_trade.get("contract_type"))
         if _symbol(pending_trade.get("symbol")) != expected_symbol:
             blockers.append("symbol_mismatch")
@@ -122,7 +135,7 @@ def trade_case_consistency_gate(
     actionable = [
         action
         for action in (advisor_action, micro_action, pending_action)
-        if action in {"CALL", "PUT"}
+        if action in actionable_actions
     ]
     if actionable and len(set(actionable)) > 1:
         blockers.append("direction_conflict")
@@ -171,6 +184,9 @@ def trade_case_decision_snapshot(case: dict[str, Any]) -> dict[str, Any]:
     risk = _artifact_payload(case, "risk")
     workflow = _artifact_payload(case, "workflow_run")
     pending = _artifact_payload(case, "pending_trade")
+    artifacts = ((case.get("context") or {}).get("artifacts") or {})
+    operator_record = artifacts.get("operator_decision") or {}
+    operator_decision = _artifact_payload(case, "operator_decision")
 
     decision = micro.get("decision") or {}
     budget = micro.get("budget_guard") or {}
@@ -192,6 +208,7 @@ def trade_case_decision_snapshot(case: dict[str, Any]) -> dict[str, Any]:
         "case_status": case_status,
         "status": status,
         "symbol": case.get("symbol"),
+        "broker_id": case.get("broker_id", "deriv"),
         "stage": case.get("stage"),
         "retry_step": workflow.get("failed_step"),
         "workflow_step": workflow.get("current_step"),
@@ -235,5 +252,11 @@ def trade_case_decision_snapshot(case: dict[str, Any]) -> dict[str, Any]:
             "duration": pending.get("duration"),
             "duration_unit": pending.get("duration_unit"),
             "allow_live": bool(pending.get("allow_live")),
+        },
+        "operator_decision": {
+            "decision": operator_decision.get("decision"),
+            "note": operator_decision.get("note"),
+            "decided_at": operator_decision.get("decided_at"),
+            "version": operator_record.get("version"),
         },
     }

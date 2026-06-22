@@ -111,3 +111,37 @@ def test_trade_case_serializes_parallel_writes(tmp_path) -> None:
     assert restored["version"] == 3
     assert set(restored["context"]["artifacts"]) == {"advisor", "chart"}
     assert "market_validation" in stages
+
+
+def test_preliminary_risk_can_be_saved_without_skipping_required_backtest(tmp_path) -> None:
+    db_path = tmp_path / "gateway.sqlite3"
+    case = create_trade_case(db_path, objective="Preserve workflow order", symbol="R_75")
+    case = record_trade_case_artifact(
+        db_path,
+        case["id"],
+        artifact_type="market",
+        actor="market",
+        message="market saved",
+        payload={"latest_close": 100},
+    )
+    case = record_trade_case_artifact(
+        db_path,
+        case["id"],
+        artifact_type="risk",
+        actor="risk",
+        message="preliminary blockers saved",
+        payload={"ok": False, "blockers": ["micro_strategy_not_run"]},
+        advance_stage=False,
+    )
+    case = record_trade_case_artifact(
+        db_path,
+        case["id"],
+        artifact_type="workflow_run",
+        actor="manager",
+        message="backtest required",
+        payload={"current_step": "micro_backtest"},
+        target_stage="micro_backtest",
+    )
+
+    assert case["stage"] == "micro_backtest"
+    assert case["context"]["artifacts"]["risk"]["payload"]["ok"] is False
