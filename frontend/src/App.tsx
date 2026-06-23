@@ -53,6 +53,7 @@ import Sidebar from "./components/Sidebar";
 import ChatPanel from "./components/ChatPanel";
 import DecisionPanel from "./components/DecisionPanel";
 import MarketPanel from "./components/MarketPanel";
+import ErrorBoundary from "./components/ErrorBoundary";
 
 type Message = { role: "user" | "assistant"; content: string; streaming?: boolean };
 type AgentActivity = {
@@ -243,6 +244,14 @@ const brokerVisual = (brokerId: string) => BROKER_VISUALS[brokerId as keyof type
 const brokerDefaultSymbol = (brokerId: string) => brokerVisual(brokerId).defaultSymbol;
 
 function App() {
+  return (
+    <ErrorBoundary>
+      <AppInner />
+    </ErrorBoundary>
+  );
+}
+
+function AppInner() {
   const [language, setLanguage] = useState<Language>(() => localStorage.getItem("gateway-language") === "en" ? "en" : "zh");
   const tr = (zh: string, en: string) => bilingual(language, zh, en);
   const [active, setActive] = useState("command");
@@ -1372,3 +1381,4 @@ function SettingsDrawer({ provider, setProvider, apiKey, setApiKey, model, setMo
 }
 
 export default App;
+

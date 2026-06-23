@@ -18,6 +18,13 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from deriv_client import get_historical_candles, get_market_ticks
+from advisor_council import (
+    is_advisor,
+    parse_advisor_json,
+    local_chief_synthesis,
+    local_advisor_report,
+    extract_chief_stance,
+)
 
 
 DEFAULT_MODEL_BY_PROVIDER = {
@@ -407,98 +414,7 @@ def route_agents(message: str) -> list[str]:
     return list(dict.fromkeys(routes))
 
 
-def is_advisor(agent_id: str) -> bool:
-    """Check if an agent is an advisor (part of the council)."""
-    return agent_id.startswith("advisor.")
-
-
-def parse_advisor_json(report: str) -> dict[str, Any] | None:
-    """Try to parse an advisor's JSON report. Returns None on failure."""
-    if not report:
-        return None
-    # Try direct parse first
-    try:
-        return json.loads(report)
-    except json.JSONDecodeError:
-        pass
-    # Try to extract JSON block from markdown
-    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", report, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(1))
-        except json.JSONDecodeError:
-            pass
-    return None
-
-
-def local_chief_synthesis(
-    advisor_reports: dict[str, str],
-    symbol: str,
-    language: str = "zh",
-) -> str:
-    """Local fallback: synthesize advisor reports into a chief conclusion."""
-    stances: dict[str, int] = {"CALL": 0, "PUT": 0, "WAIT": 0, "BLOCK": 0}
-    parsed_count = 0
-
-    for agent_id, report in advisor_reports.items():
-        if not is_advisor(agent_id) or agent_id == "advisor.chief":
-            continue
-        parsed = parse_advisor_json(report)
-        if parsed and "stance" in parsed:
-            stances[parsed["stance"]] = stances.get(parsed["stance"], 0) + 1
-            parsed_count += 1
-
-    if parsed_count == 0:
-        # Fallback to text heuristics
-        for report in advisor_reports.values():
-            upper = report.upper()
-            if "CALL" in upper:
-                stances["CALL"] += 1
-            elif "PUT" in upper:
-                stances["PUT"] += 1
-            elif "BLOCK" in upper:
-                stances["BLOCK"] += 1
-            else:
-                stances["WAIT"] += 1
-
-    # Determine winning stance
-    if stances.get("BLOCK", 0) > 0:
-        winner = "WAIT"
-        confidence = 0.3
-    elif stances["CALL"] > stances["PUT"] and stances["CALL"] > stances["WAIT"]:
-        winner = "CALL"
-        confidence = min(0.75, stances["CALL"] / max(1, sum(stances.values())))
-    elif stances["PUT"] > stances["CALL"] and stances["PUT"] > stances["WAIT"]:
-        winner = "PUT"
-        confidence = min(0.75, stances["PUT"] / max(1, sum(stances.values())))
-    else:
-        winner = "WAIT"
-        confidence = 0.5
-
-    if language == "en":
-        return json.dumps({
-            "advisor": "chief",
-            "stance": winner,
-            "confidence": round(confidence, 2),
-            "vote_breakdown": stances,
-            "winning_side": winner,
-            "dissent": "See individual advisor reports",
-            "reasoning": f"Synthesized from {parsed_count} advisor votes",
-            "preconditions": ["human_confirmation", "market_stability"],
-            "invalidation": "If any advisor's preconditions are not met",
-        }, ensure_ascii=False, indent=2)
-
-    return json.dumps({
-        "advisor": "chief",
-        "stance": winner,
-        "confidence": round(confidence, 2),
-        "vote_breakdown": stances,
-        "winning_side": winner,
-        "dissent": "见各谋士报告",
-        "reasoning": f"基于 {parsed_count} 位谋士投票综合得出",
-        "preconditions": ["人工确认", "行情稳定"],
-        "invalidation": "任一谋士前提条件未满足时结论失效",
-    }, ensure_ascii=False, indent=2)
+# Note: is_advisor, parse_advisor_json, local_chief_synthesis moved to advisor_council.py
 
 
 async def market_context(symbol: str) -> dict[str, Any]:
@@ -712,84 +628,11 @@ def localized_agent_name(agent_id: str, default: str, language: str) -> str:
 def local_agent_report(agent_id: str, message: str, symbol: str, market: dict[str, Any] | None, language: str = "zh") -> str:
     latest = (market or {}).get("latest_close")
     change = (market or {}).get("window_change_pct")
-    closes = (market or {}).get("closes") or []
 
-    # --- Advisor agents: return structured JSON ---
-    if is_advisor(agent_id):
-        ma5 = round(sum(closes[-5:]) / len(closes[-5:]), 4) if len(closes) >= 5 else None
-        ma20 = round(sum(closes[-20:]) / len(closes[-20:]), 4) if len(closes) >= 20 else None
-        trend = "up" if (change or 0) > 0.1 else "down" if (change or 0) < -0.1 else "sideways"
-        # Compute volatility if enough data
-        volatility_pct = None
-        if len(closes) >= 21:
-            returns = [(closes[i] / closes[i - 1] - 1) for i in range(-20, 0)]
-            mean_ret = sum(returns) / len(returns)
-            variance = sum((r - mean_ret) ** 2 for r in returns) / len(returns)
-            volatility_pct = round((variance ** 0.5) * 100, 4)
-
-        if agent_id == "advisor.macro":
-            return json.dumps({
-                "advisor": "macro", "stance": "WAIT", "confidence": 0.35,
-                "catalysts": [], "macro_bias": "neutral",
-                "reasoning": "No external news feed; macro view deferred" if language == "en" else "无外部新闻源，宏观判断暂缓",
-                "preconditions": ["news_catalyst"],
-            }, ensure_ascii=False)
-        if agent_id == "advisor.quant":
-            ma_signal = "golden_cross" if (ma5 and ma20 and ma5 > ma20) else "death_cross" if (ma5 and ma20 and ma5 < ma20) else "neutral"
-            return json.dumps({
-                "advisor": "quant", "stance": "CALL" if ma_signal == "golden_cross" else "PUT" if ma_signal == "death_cross" else "WAIT",
-                "confidence": 0.55, "ma5": round(ma5, 4) if ma5 else None,
-                "ma20": round(ma20, 4) if ma20 else None, "ma_signal": ma_signal,
-                "momentum": "strong" if abs(change or 0) > 0.5 else "weak",
-                "volatility": "medium",
-                "reasoning": f"MA5={'above' if ma5 and ma20 and ma5 > ma20 else 'below'} MA20, change={change or 0:.3f}%",
-                "preconditions": ["ma_cross_confirmed"],
-            }, ensure_ascii=False)
-        if agent_id == "advisor.flow":
-            # Data-driven: flow follows momentum
-            flow_stance = "CALL" if (change or 0) > 0.3 else "PUT" if (change or 0) < -0.3 else "WAIT"
-            flow_conf = min(0.7, abs(change or 0) / 2.0) if change else 0.3
-            return json.dumps({
-                "advisor": "flow", "stance": flow_stance, "confidence": round(flow_conf, 2),
-                "tick_speed": "fast" if abs(change or 0) > 1.0 else "normal",
-                "flow_pressure": "buy_pressure" if (change or 0) > 0 else "sell_pressure" if (change or 0) < 0 else "balanced",
-                "entry_window": "now" if abs(change or 0) > 0.5 else "wait_5min",
-                "reasoning": f"Window change {change or 0:.3f}% indicates {flow_stance}" if language == "en" else f"窗口变化 {change or 0:.3f}% 指向 {flow_stance}",
-                "preconditions": ["tick_stream_stable"] if flow_stance != "WAIT" else ["wait_for_clearer_signal"],
-            }, ensure_ascii=False)
-        if agent_id == "advisor.risk":
-            # Data-driven: risk allows trade if volatility is manageable
-            vol_ok = volatility_pct is None or volatility_pct < 3.0
-            risk_stance = "WAIT" if not vol_ok else "CALL" if (change or 0) > 0 and ma5 and ma20 and ma5 > ma20 else "PUT" if (change or 0) < 0 and ma5 and ma20 and ma5 < ma20 else "WAIT"
-            return json.dumps({
-                "advisor": "risk", "stance": risk_stance, "confidence": 0.5 if vol_ok else 0.3,
-                "account_health": "healthy" if vol_ok else "warning",
-                "max_affordable_loss": 1.0,
-                "risk_reward_ratio": 1.8 if vol_ok else 0.8,
-                "reasoning": f"Volatility {volatility_pct}% is {'acceptable' if vol_ok else 'too high'}" if language == "en" else f"波动率 {volatility_pct}% {'可接受' if vol_ok else '过高'}",
-                "preconditions": ["demo_account_only", "max_loss_1usd"],
-            }, ensure_ascii=False)
-        if agent_id == "advisor.contrarian":
-            # Contrarian: opposite of trend
-            contrarian_stance = "PUT" if (change or 0) > 0.5 else "CALL" if (change or 0) < -0.5 else "WAIT"
-            return json.dumps({
-                "advisor": "contrarian", "stance": contrarian_stance, "confidence": 0.35,
-                "consensus_challenge": "Trend may already be priced in" if language == "en" else "趋势可能已被价格吸收",
-                "hidden_risks": ["momentum_exhaustion"] if abs(change or 0) > 1.0 else ["sample_too_small"],
-                "reasoning": f"Counter-trend view against {change or 0:.3f}% move" if language == "en" else f"逆当前 {change or 0:.3f}% 走势",
-                "preconditions": ["pullback_confirmation"],
-            }, ensure_ascii=False)
-        if agent_id == "advisor.chief":
-            # Chief synthesis happens after other advisors in stream_multi_agent_chat
-            return json.dumps({
-                "advisor": "chief", "stance": "WAIT", "confidence": 0.4,
-                "vote_breakdown": {"CALL": 0, "PUT": 0, "WAIT": 0, "BLOCK": 0},
-                "winning_side": "WAIT",
-                "dissent": "Pending advisor inputs" if language == "en" else "待谋士输入",
-                "reasoning": "Chief synthesis pending" if language == "en" else "首席汇总待定",
-                "preconditions": ["advisor_votes"],
-                "invalidation": "N/A",
-            }, ensure_ascii=False)
+    # --- Advisor agents: delegate to advisor_council module ---
+    advisor_report = local_advisor_report(agent_id, symbol, market, language)
+    if advisor_report is not None:
+        return advisor_report
 
     # --- Non-advisor agents: text reports ---
     if language == "en":
@@ -822,14 +665,9 @@ def local_agent_report(agent_id: str, message: str, symbol: str, market: dict[st
 
 
 def local_manager_answer(message: str, symbol: str, reports: dict[str, str], language: str = "zh") -> str:
-    # Try to extract chief advisor's structured conclusion
-    chief_report = None
-    for name, report in reports.items():
-        if "首席" in name or "chief" in name.lower():
-            chief_report = report
-            break
+    from advisor_council import extract_chief_conclusion
 
-    chief_parsed = parse_advisor_json(chief_report) if chief_report else None
+    chief_parsed = extract_chief_conclusion(reports)
 
     if language == "en":
         lines = [f"The team has completed one analysis round for {symbol}."]
@@ -1100,13 +938,7 @@ async def stream_multi_agent_chat(
     # --- Task #4: Backtest integration ---
     # After chief advisor concludes, run a paper-trading backtest to validate
     backtest_result: dict[str, Any] | None = None
-    chief_stance: str | None = None
-    for name, report in reports.items():
-        if "首席" in name or "chief" in name.lower():
-            parsed = parse_advisor_json(report)
-            if parsed and parsed.get("stance") in ("CALL", "PUT"):
-                chief_stance = parsed["stance"]
-            break
+    chief_stance = extract_chief_stance(reports)
 
     if chief_stance and market and market.get("closes") and len(market["closes"]) >= 12:
         bt_started = time.perf_counter()
