@@ -567,26 +567,17 @@ function AppInner() {
   return (
     <LanguageContext.Provider value={language}>
     <div className="app-shell" lang={language === "zh" ? "zh-CN" : "en"} data-broker={linkedCase?.broker_id || brokerId}>
-      <aside className={`side-nav ${mobileNav ? "side-nav--open" : ""}`}>
-        <div className="brand-block">
-          <div className="brand-mark"><Waypoints size={20} /></div>
-          <div><strong>MARKET GATEWAY</strong><span>Multi-Broker Agent Operations</span></div>
-          <button className="icon-btn mobile-only" onClick={() => setMobileNav(false)} aria-label={tr("关闭导航", "Close navigation")}><X size={18} /></button>
-        </div>
-        <nav>
-          <p className="nav-caption">WORKSPACE</p>
-          {NAV_ITEMS.map((item) => (
-            <button key={item.id} className={`nav-item ${active === item.id ? "nav-item--active" : ""}`} aria-current={active === item.id ? "page" : undefined} onClick={() => { setActive(item.id); setMobileNav(false); }}>
-              <item.icon size={18} /><span>{item[language]}</span>{active === item.id && <ChevronRight size={16} />}
-            </button>
-          ))}
-        </nav>
-        <div className="nav-bottom">
-          <button className="nav-item" onClick={() => setSettingsOpen(true)}><Settings2 size={18} /><span>{tr("模型与密钥", "Models & API Keys")}</span></button>
-          <button className="nav-item language-switch" onClick={() => { const next = language === "zh" ? "en" : "zh"; setLanguage(next); localStorage.setItem("gateway-language", next); }} aria-label={tr("切换到英文", "Switch to Chinese")}><Languages size={18} /><span>{language === "zh" ? "English" : "ZH"}</span></button>
-          <div className="runtime-line"><span className={`status-dot status-dot--${health}`} /> FastAPI · {health === "online" ? "ONLINE" : "OFFLINE"}</div>
-        </div>
-      </aside>
+      <Sidebar
+        active={active}
+        mobileNav={mobileNav}
+        health={health}
+        language={language}
+        onNavigate={(id) => { setActive(id); setMobileNav(false); }}
+        onCloseMobile={() => setMobileNav(false)}
+        onSettingsOpen={() => setSettingsOpen(true)}
+        onLanguageToggle={() => { const next = language === "zh" ? "en" : "zh"; setLanguage(next); localStorage.setItem("gateway-language", next); }}
+        tr={tr}
+      />
 
       <main className="main-stage">
         <header className="top-bar">

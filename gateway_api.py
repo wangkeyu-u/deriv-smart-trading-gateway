@@ -86,11 +86,22 @@ class ChatRequest(BaseModel):
     session_id: str | None = None
     case_id: str | None = None
     provider: str = "local"
-    api_key: str = ""
+    api_key: str = ""  # Kept for backward compat; prefer Authorization header
     model: str = ""
     base_url: str = ""
     language: str = "zh"
     broker_id: str = Field(default="deriv", min_length=2, max_length=32)
+
+
+def _resolve_api_key(body: ChatRequest, request: Request) -> str:
+    """Resolve API key from Authorization header (preferred) or request body.
+
+    Header format: Authorization: Bearer sk-xxxx
+    """
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+    return body.api_key.strip()
 
 
 class SessionRequest(BaseModel):
@@ -290,8 +301,9 @@ async def chat_stream(request: ChatRequest, request_obj: Request) -> StreamingRe
     provider = request.provider.strip().lower()
     if provider not in {"local", "openai", "deepseek", "anthropic", "compatible"}:
         raise HTTPException(status_code=400, detail="unsupported provider")
-    if provider != "local" and not request.api_key.strip():
-        raise HTTPException(status_code=400, detail="api_key is required for the selected provider")
+    resolved_api_key = _resolve_api_key(request, request_obj)
+    if provider != "local" and not resolved_api_key:
+        raise HTTPException(status_code=400, detail="api_key is required (send via Authorization: Bearer <key> or request body)")
     if provider == "compatible" and not request.base_url.strip():
         raise HTTPException(status_code=400, detail="base_url is required for compatible providers")
 
@@ -325,7 +337,7 @@ async def chat_stream(request: ChatRequest, request_obj: Request) -> StreamingRe
     save_chat_message(DB_PATH, session_id, "user", request.message)
     config = ChatRuntimeConfig(
         provider=provider,
-        api_key=request.api_key.strip(),
+        api_key=resolved_api_key,
         model=request.model.strip(),
         base_url=request.base_url.strip(),
         language="en" if request.language == "en" else "zh",
