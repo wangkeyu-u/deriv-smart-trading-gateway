@@ -13,6 +13,7 @@ import html
 import operator
 import json
 import math
+import os
 import re
 import sqlite3
 import time
@@ -29,6 +30,26 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from advisor_evaluation import (
+    advisor_entry_price,
+    advisor_evaluation_ready,
+    advisor_horizon_readiness,
+    evaluate_advisor_horizons,
+    evaluate_advisor_outcome,
+    future_closes_after_created_at,
+    summarize_advisor_evaluations,
+    summarize_advisor_performance,
+)
+from budget_guard import BudgetLimits, budget_guard_check
+from case_workflow import (
+    BLOCKER_MESSAGES,
+    WORKFLOW_STEPS,
+    trade_case_consistency_gate,
+    trade_case_decision_snapshot,
+    workflow_resume_step,
+)
+from micro_trading import MicroTradeConfig, analyze_micro_trade, normalize_price_frame
+from paper_trading import CircuitBreakerConfig, backtest_micro_strategy
 from server import (
     check_account_status,
     close_open_contract,
@@ -38,6 +59,19 @@ from server import (
     get_market_ticks,
     mask_secret,
 )
+from trade_cases import (
+    CASE_STAGES,
+    TradeCaseConflict,
+    TradeCaseTransitionError,
+    control_trade_case,
+    create_trade_case,
+    get_trade_case,
+    init_trade_case_db,
+    list_trade_case_events,
+    list_trade_cases,
+    record_trade_case_artifact,
+    update_trade_case,
+)
 
 
 Provider = Literal["本地规则", "OpenAI", "DeepSeek", "Anthropic", "OpenAI-Compatible"]
@@ -46,35 +80,107 @@ Action = Literal["get_market_ticks", "get_historical_candles", "execute_simulate
 DEFAULT_SYMBOL = "R_100"
 DEFAULT_GRANULARITY = 60
 DEFAULT_COUNT = 60
+FRESHNESS_LIMITS_SECONDS = {
+    "tick": 15,
+    "chart": 180,
+    "advisor": 300,
+}
 COMMON_DERIV_SYMBOLS = [
+    # --- Volatility ---
     "R_10",
     "R_25",
     "R_50",
     "R_75",
     "R_100",
+    # --- 1-second Volatility ---
     "1HZ10V",
+    "1HZ15V",
     "1HZ25V",
+    "1HZ30V",
     "1HZ50V",
     "1HZ75V",
+    "1HZ90V",
     "1HZ100V",
+    # --- Boom ---
+    "BOOM50",
+    "BOOM150N",
+    "BOOM300N",
     "BOOM500",
+    "BOOM600",
+    "BOOM900",
     "BOOM1000",
+    # --- Crash ---
+    "CRASH50",
+    "CRASH150N",
+    "CRASH300N",
     "CRASH500",
+    "CRASH600",
+    "CRASH900",
     "CRASH1000",
+    # --- Jump ---
     "JD10",
     "JD25",
     "JD50",
     "JD75",
     "JD100",
+    # --- Step ---
+    "stpRNG",
+    "stpRNG2",
+    "stpRNG3",
+    "stpRNG4",
+    "stpRNG5",
+    # --- Range Break ---
+    "RB100",
+    "RB200",
+    # --- Bear / Bull ---
+    "RDBEAR",
+    "RDBULL",
+    # --- Baskets ---
+    "WLDAUD",
+    "WLDEUR",
+    "WLDGBP",
+    "WLDUSD",
+    "WLDXAU",
+    # --- Major forex ---
+    "frxAUDJPY",
+    "frxAUDUSD",
+    "frxEURAUD",
+    "frxEURCAD",
+    "frxEURCHF",
+    "frxEURGBP",
+    "frxEURJPY",
     "frxEURUSD",
+    "frxGBPAUD",
+    "frxGBPJPY",
     "frxGBPUSD",
+    "frxUSDCAD",
+    "frxUSDCHF",
     "frxUSDJPY",
+    # --- Minor forex ---
+    "frxAUDCAD",
+    "frxAUDCHF",
+    "frxAUDNZD",
+    "frxEURNZD",
+    "frxGBPCAD",
+    "frxGBPCHF",
+    "frxGBPNOK",
+    "frxGBPNZD",
+    "frxNZDJPY",
+    "frxNZDUSD",
 ]
+CHART_GRANULARITY_OPTIONS = [60, 120, 300, 900, 1800, 3600]
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "local_data"
 DB_PATH = DATA_DIR / "gateway.sqlite3"
 AGENT_PROMPTS_PATH = APP_DIR / "agent_prompts.json"
 LOCAL_TZ = ZoneInfo("Asia/Kuala_Lumpur")
+
+
+def display_local_path(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(APP_DIR))
+    except ValueError:
+        return path.name
 
 I18N = {
     "zh": {
@@ -91,7 +197,7 @@ I18N = {
         "llm_api": "大模型 API",
         "model": "模型",
         "connection": "连接状态",
-        "clear_chat": "清空聊天记录",
+        "clear_chat": "新对话",
         "hero_kicker": "层级多智能体交易网关",
         "hero_title": "Deriv Smart Trading Gateway",
         "hero_subtitle": "交易经理调度行情、策略、风控、合规、图表、执行和报告 Agent，完成实时行情读取、条件判断、模拟盘下单和可审计复盘。",
@@ -110,24 +216,37 @@ I18N = {
         "direct_done": "已完成直派任务",
         "chart_snapshots": "图表快照",
         "new_chart": "新建图表",
-        "no_chart_snapshots": "还没有图表快照。可以让图表工程师生成，也可以直接加载默认图表。",
+        "no_chart_snapshots": "还没有图表快照。请选择市场、周期和K线数量后加载。",
         "snapshot_time": "生成时间",
+        "chart_loader_title": "加载市场图表",
+        "chart_loader_caption": "不用写命令，直接选择市场、周期和K线数量。",
+        "chart_symbol_select": "选择市场",
+        "chart_custom_symbol": "自定义 Symbol（可选）",
+        "chart_custom_placeholder": "例如 frxEURUSD / BOOM1000 / R_75",
+        "chart_granularity": "K线周期",
+        "chart_candle_count": "K线数量",
+        "chart_load_selected": "加载所选图表",
+        "chart_loaded": "图表已加载",
+        "chart_load_failed": "图表加载失败",
         "sync_bus": "实时同步总线",
         "sync_bus_hint": "API 调用、Agent 事件、图谱状态、图表快照都写入这里。",
         "api_trace": "API 调用 Trace",
         "sync_version": "同步版本",
         "chat_title": "交易经理指令台",
-        "chat_caption": "输入自然语言目标，经理会自动派活给两个子 Agent。",
+        "chat_caption": "输入自然语言目标；经理用大模型决策派活，每个子 Agent 会用自己的 prompt 和模型 Key 产出判断。",
         "command_title": "交易指令工作台",
         "command_hint": "Enter 只用于中文输入法确认或换行；点击发送按钮才会提交。",
         "send": "发送指令",
         "clear_input": "清空输入",
         "clear_input_short": "清空",
         "send_note": "不会因为 Enter 自动发送，适合中文输入法选词。",
-        "agent_log": "智能体自动执行日志",
+        "agent_log": "智能体行动时间线",
+        "agent_memory": "Agent 上下文记忆",
+        "memory_empty": "还没有记忆。每个 Agent 完成任务后会自动沉淀上下文。",
+        "timeline_empty": "还没有行动记录。发送指令后会显示经理和各 Agent 的协作过程。",
         "results": "实时交易工作台",
         "results_hint": "K 线图、订单回执、子 Agent 状态和最新 tick 会在这里显示。",
-        "load_default": "加载 R_100 最近 120 根 1分钟K线",
+        "load_default": "加载所选图表",
         "history": "本地历史",
         "active": "运行中",
         "standby": "待命",
@@ -146,7 +265,7 @@ I18N = {
         "local_db": "本地数据",
         "db_path": "SQLite 保存路径",
         "chart_workbench": "交易图工作台",
-        "no_candles": "还没有 K 线数据。可以通过聊天指令生成，也可以直接加载默认 R_100 图表。",
+        "no_candles": "还没有 K 线数据。可以通过聊天指令生成，也可以在图表页选择市场后加载。",
         "latest_tick": "最新 Tick",
         "live_results": "实时结果",
         "initial_message": "你好，我可以帮你查 Deriv 行情、画 K 线，或基于已配置的 Deriv Token 执行模拟交易。",
@@ -183,10 +302,11 @@ I18N = {
         "measure_data": "测量、区间分析和完整数据",
         "full_ohlcv": "完整 OHLCV",
         "download_ohlcv": "下载 OHLCV CSV",
-        "download_log": "下载执行日志",
+        "download_log": "下载行动时间线",
         "success_badge": "绿色成功勋章 · Deriv 订单回执已确认",
-        "chart_empty_info": "还没有可绘制的 K 线数据。先输入：画 R_100 最近 60 根 1分钟K线",
+        "chart_empty_info": "没有拿到可绘制的 K 线数据。请换一个市场、周期或减少 K 线数量后重试。",
         "chart_title_suffix": "K 线交易图",
+        "chart_advisor_overlay": "谋士参考",
         "local_provider_label": "本地规则",
         "example_tick": "查 R_100 最新价",
         "example_candles": "画 R_100 最近 120 根 1分钟K线",
@@ -211,6 +331,170 @@ I18N = {
         "advisor_confidence": "置信度",
         "advisor_elapsed": "耗时",
         "advisor_disclaimer": "谋士结论不会绕过交易安全闸门；下单仍需走执行交易员和人工确认。",
+        "advisor_evaluation": "谋士评估",
+        "advisor_evaluation_caption": "用当前最新价和 1m/5m/10m K 线窗口复盘最近谋士判断，只做纸面评估，不代表真实成交。",
+        "advisor_entry_price": "入场参考价",
+        "advisor_exit_price": "复盘价",
+        "advisor_direction_accuracy": "方向准确率",
+        "advisor_paper_return": "纸面收益",
+        "advisor_mark_recent": "复盘最近谋士判断",
+        "advisor_no_evaluations": "还没有可评估的谋士记录。",
+        "advisor_outcome": "结果",
+        "advisor_horizon_scores": "多窗口评分",
+        "workspace": "工作台",
+        "page_advisor": "谋士室",
+        "page_cases": "任务中心",
+        "page_micro": "小笔策略",
+        "page_trading": "交易台",
+        "page_charts": "图表",
+        "page_monitor": "监控",
+        "page_advisor_caption": "限时谋士讨论、网页/行情分析和多窗口纸面复盘。",
+        "page_cases_caption": "统一跟踪谋士、行情、回测、风控、确认、执行和复盘。",
+        "page_micro_caption": "小额频繁策略、预算闸门、paper trading 回测和熔断器。",
+        "page_trading_caption": "交易经理调度执行团队，处理自然语言交易任务和人工确认。",
+        "page_charts_caption": "K 线快照、对比走势、测量和最新 Tick。",
+        "page_monitor_caption": "Agent 图谱、角色状态、API trace 和同步总线。",
+        "case_new": "新建交易任务",
+        "case_title": "任务名称",
+        "case_objective": "老板目标",
+        "case_symbol": "目标市场",
+        "case_create": "创建并激活",
+        "case_active": "当前任务",
+        "case_none": "还没有交易任务。先创建一个，后续模块会自动同步到这里。",
+        "case_status": "状态",
+        "case_stage": "当前阶段",
+        "case_version": "同步版本",
+        "case_updated": "最近更新",
+        "case_progress": "流程进度",
+        "case_events": "审计时间线",
+        "case_artifacts": "已同步产物",
+        "case_pause": "暂停",
+        "case_resume": "恢复",
+        "case_cancel": "取消",
+        "case_retry": "重试",
+        "case_open_module": "继续下一步",
+        "case_created": "交易任务已创建",
+        "case_conflict": "任务刚被其他模块更新，请刷新后重试。",
+        "case_auto_run": "一键完整模拟",
+        "case_auto_run_caption": "自动运行谋士、行情完整性检查、小笔回测和一致性闸门；最多只生成待人工确认订单，不会自动成交。",
+        "case_run_now": "运行完整模拟",
+        "case_retry_from_failure": "从失败步骤重试",
+        "case_trade_amount": "模拟金额",
+        "case_candle_count": "验证 K 线数",
+        "case_time_budget": "谋士限时",
+        "case_use_web": "允许谋士联网",
+        "case_ready_confirmation": "一致性检查通过，订单草稿正在等待人工确认。",
+        "case_no_confirmation": "本轮已完成分析，但一致性闸门未通过，因此没有生成待确认订单。",
+        "case_failed_step": "重试起点",
+        "case_gate_result": "一致性闸门",
+        "case_blockers": "阻止原因",
+        "case_decision_brief": "老板决策简报",
+        "case_current_decision": "当前决定",
+        "case_latest_price": "最新价格",
+        "case_paper_result": "纸面结果",
+        "case_next_action": "下一步",
+        "case_evidence": "判断依据",
+        "case_run_details": "运行与恢复细节",
+        "status_symbol": "Symbol",
+        "status_advisor": "谋士结论",
+        "status_entry": "入场价",
+        "status_freshness": "数据时效",
+        "status_api_calls": "API 调用",
+        "status_sync": "同步",
+        "status_pending": "待确认",
+        "status_none": "无",
+        "status_yes": "有",
+        "advisor_performance": "谋士表现汇总",
+        "safety_gate_panel": "执行安全闸门",
+        "safety_token": "Token",
+        "safety_confirmation": "人工确认",
+        "safety_live": "Live 执行",
+        "safety_pending_order": "待确认订单",
+        "safety_freshness": "数据时效",
+        "safety_ready": "就绪",
+        "safety_blocked": "阻断",
+        "safety_required": "需要确认",
+        "safety_disabled": "关闭",
+        "safety_enabled": "开启",
+        "pending_action": "动作",
+        "pending_direction": "方向",
+        "pending_amount": "金额",
+        "pending_duration": "时长",
+        "pending_advisor_alignment": "谋士一致性",
+        "pending_freshness": "数据时效",
+        "pending_flags": "风险提示",
+        "pending_raw_payload": "原始参数",
+        "advisor_trade_draft": "生成交易草稿",
+        "advisor_trade_draft_caption": "只生成待确认交易，不会自动下单。",
+        "advisor_trade_amount": "草稿金额",
+        "advisor_trade_duration": "草稿时长",
+        "advisor_trade_created": "已生成待确认交易草稿，请到交易台/侧边栏确认。",
+        "advisor_trade_wait_blocked": "当前谋士结论是 WAIT，不生成交易草稿。",
+        "audit_export": "审计导出",
+        "audit_export_caption": "导出当前决策链状态，不包含 API Token。",
+        "download_audit": "下载审计 JSON",
+        "system_health": "系统健康",
+        "system_health_caption": "本地运行状态检查，不触发网络交易调用。",
+        "health_ready": "正常",
+        "health_attention": "需关注",
+        "health_db": "本地数据库",
+        "health_langgraph": "LangGraph",
+        "health_token": "Token",
+        "health_pending": "待确认",
+        "micro_strategy": "小笔频繁策略",
+        "micro_strategy_caption": "独立策略实验室：只做分析、回测和预算检查，不影响普通交易台。",
+        "micro_goal": "策略目标",
+        "micro_symbol": "资产 / Symbol",
+        "micro_asset_kind": "资产类型",
+        "micro_prices": "近期收盘价",
+        "micro_data_source": "数据来源",
+        "micro_source_live": "Deriv 最新K线",
+        "micro_source_manual": "手动输入收盘价",
+        "micro_live_count": "实时K线数量",
+        "micro_live_granularity": "实时K线周期",
+        "micro_budget": "小笔预算",
+        "micro_amount": "单次金额",
+        "micro_daily_budget": "日预算",
+        "micro_total_budget": "总预算",
+        "micro_spent_today": "今日已用",
+        "micro_spent_total": "总已用",
+        "micro_circuit": "熔断器",
+        "micro_max_losses": "连续亏损上限",
+        "micro_max_loss_amount": "最大亏损金额",
+        "micro_max_drawdown": "最大回撤 %",
+        "micro_max_trades": "最大纸面交易数",
+        "micro_run": "运行分析和回测",
+        "micro_decision": "当前信号",
+        "micro_operator_brief": "员工视角结论",
+        "micro_operator_recommendation": "行动建议",
+        "micro_trade_direction": "观察方向",
+        "micro_data_quality": "数据可信度",
+        "micro_paper_return": "纸面收益",
+        "micro_risk_brief": "风险与预算",
+        "micro_evidence": "信号证据",
+        "micro_next_steps": "下一步",
+        "micro_trade_log": "回测明细",
+        "micro_backtest": "纸面回测",
+        "micro_no_trade": "当前预算或熔断条件不允许交易。",
+        "micro_recent_runs": "最近小笔策略记录",
+        "micro_saved": "已保存本轮小笔策略记录",
+        "chart_data_status": "图表数据状态",
+        "chart_last_candle": "最新 K 线",
+        "chart_data_age": "数据年龄",
+        "chart_time_zone": "时间显示",
+        "chart_local_time_note": "图表横轴显示本地时间 MYT；表格同时保留 UTC 和 MYT。",
+        "chart_stale": "可能过期",
+        "chart_fresh": "新鲜",
+        "chart_refresh_hint": "如果最新 K 线时间落后，请点击刷新当前 K 线。",
+        "chart_integrity": "行情数据完整性",
+        "chart_integrity_ok": "通过",
+        "chart_integrity_attention": "需检查",
+        "chart_duplicate_bars": "重复时间戳",
+        "chart_gap_count": "检测到的断档",
+        "chart_invalid_ohlc": "异常 OHLC",
+        "chart_order_errors": "时间乱序",
+        "chart_integrity_hint": "完整性检查用于发现重复、乱序、异常价格和可能的数据断档；它是操作提示，不会自动触发交易。",
+        "sync_test_status": "同步测试状态",
     },
     "en": {
         "sidebar_title": "Deriv Gateway",
@@ -226,7 +510,7 @@ I18N = {
         "llm_api": "Model API",
         "model": "Model",
         "connection": "Connection",
-        "clear_chat": "Clear Chat",
+        "clear_chat": "New Conversation",
         "hero_kicker": "Hierarchical Multi-Agent Trading Gateway",
         "hero_title": "Deriv Smart Trading Gateway",
         "hero_subtitle": "A trading manager coordinates a market analyst and a risk execution agent for market reads, condition checks, demo execution, and auditable receipts.",
@@ -245,24 +529,37 @@ I18N = {
         "direct_done": "Direct task completed",
         "chart_snapshots": "Chart Snapshots",
         "new_chart": "New Chart",
-        "no_chart_snapshots": "No chart snapshots yet. Ask the Chart Engineer to create one or load the default chart.",
+        "no_chart_snapshots": "No chart snapshots yet. Choose a market, timeframe, and candle count to load one.",
         "snapshot_time": "Generated",
+        "chart_loader_title": "Load Market Chart",
+        "chart_loader_caption": "No command needed. Choose the market, timeframe, and candle count.",
+        "chart_symbol_select": "Market",
+        "chart_custom_symbol": "Custom Symbol (optional)",
+        "chart_custom_placeholder": "Example: frxEURUSD / BOOM1000 / R_75",
+        "chart_granularity": "Candle Timeframe",
+        "chart_candle_count": "Candle Count",
+        "chart_load_selected": "Load Selected Chart",
+        "chart_loaded": "Chart loaded",
+        "chart_load_failed": "Chart load failed",
         "sync_bus": "Live Sync Bus",
         "sync_bus_hint": "API calls, agent events, graph state, and chart snapshots all write here.",
         "api_trace": "API Trace",
         "sync_version": "Sync Version",
         "chat_title": "Trading Manager Console",
-        "chat_caption": "Enter a natural-language goal; the manager delegates work to two sub-agents.",
+        "chat_caption": "Enter a natural-language goal; the manager uses the model to delegate work, and each sub-agent uses its own prompt plus your model key for judgment.",
         "command_title": "Order Command Pad",
         "command_hint": "Enter only confirms IME text or inserts a new line; click Send to submit.",
         "send": "Send Order",
         "clear_input": "Clear Input",
         "clear_input_short": "Clear",
         "send_note": "Enter will not auto-send, so IME composition is safe.",
-        "agent_log": "Agent Execution Log",
+        "agent_log": "Agent Action Timeline",
+        "agent_memory": "Agent Context Memory",
+        "memory_empty": "No memory yet. Each agent stores context after completing work.",
+        "timeline_empty": "No actions yet. Send a command to see the manager and agents collaborate.",
         "results": "Live Trading Workbench",
         "results_hint": "Candles, receipts, sub-agent state, and latest ticks appear here.",
-        "load_default": "Load R_100 · 120 candles · 1m",
+        "load_default": "Load Selected Chart",
         "history": "Local History",
         "active": "Active",
         "standby": "Standby",
@@ -281,7 +578,7 @@ I18N = {
         "local_db": "Local Data",
         "db_path": "SQLite path",
         "chart_workbench": "Trading Chart Workbench",
-        "no_candles": "No candle data yet. Ask in chat or load the default R_100 chart.",
+        "no_candles": "No candle data yet. Ask in chat or choose a market on the Charts page.",
         "latest_tick": "Latest Tick",
         "live_results": "Live Results",
         "initial_message": "Hi. I can check Deriv markets, draw candlestick charts, or execute demo trades with your configured Deriv token.",
@@ -318,10 +615,11 @@ I18N = {
         "measure_data": "Measurement, Range Analysis, and Full Data",
         "full_ohlcv": "Full OHLCV",
         "download_ohlcv": "Download OHLCV CSV",
-        "download_log": "Download Execution Log",
+        "download_log": "Download Timeline",
         "success_badge": "Success badge · Deriv order receipt confirmed",
-        "chart_empty_info": "No drawable candle data yet. Try: Draw the latest 60 one-minute candles for R_100.",
+        "chart_empty_info": "No drawable candle data was returned. Try another market, timeframe, or a smaller candle count.",
         "chart_title_suffix": "Candlestick Trading Chart",
+        "chart_advisor_overlay": "Advisor Reference",
         "local_provider_label": "Local Rules",
         "example_tick": "R_100 latest tick",
         "example_candles": "R_100 · 120 candles · 1m",
@@ -346,6 +644,170 @@ I18N = {
         "advisor_confidence": "Confidence",
         "advisor_elapsed": "Elapsed",
         "advisor_disclaimer": "Advisor output does not bypass the execution safety gate; orders still require the execution agent and human confirmation.",
+        "advisor_evaluation": "Advisor Evaluation",
+        "advisor_evaluation_caption": "Mark recent advisor calls against the latest price and 1m/5m/10m candle horizons. Paper evaluation only; not real execution.",
+        "advisor_entry_price": "Entry Reference",
+        "advisor_exit_price": "Mark Price",
+        "advisor_direction_accuracy": "Direction Accuracy",
+        "advisor_paper_return": "Paper Return",
+        "advisor_mark_recent": "Evaluate Recent Advisors",
+        "advisor_no_evaluations": "No evaluable advisor records yet.",
+        "advisor_outcome": "Outcome",
+        "advisor_horizon_scores": "Horizon Scores",
+        "workspace": "Workspace",
+        "page_advisor": "Advisor Room",
+        "page_cases": "Trade Cases",
+        "page_micro": "Micro Strategy",
+        "page_trading": "Trading Desk",
+        "page_charts": "Charts",
+        "page_monitor": "Monitor",
+        "page_advisor_caption": "Time-boxed advisor debate, market/web context, and multi-horizon paper evaluation.",
+        "page_cases_caption": "Track advisor, market, backtest, risk, confirmation, execution, and review as one workflow.",
+        "page_micro_caption": "Small-budget frequent strategy, budget guard, paper trading, and circuit breakers.",
+        "page_trading_caption": "The trading manager routes natural-language work through the execution team and safety gates.",
+        "page_charts_caption": "Candlestick snapshots, comparison overlays, measurement, and latest ticks.",
+        "page_monitor_caption": "Agent graph, role state, API traces, and live sync bus.",
+        "case_new": "New Trade Case",
+        "case_title": "Case Title",
+        "case_objective": "Objective",
+        "case_symbol": "Market",
+        "case_create": "Create And Activate",
+        "case_active": "Active Case",
+        "case_none": "No trade case yet. Create one and other modules will sync their output here.",
+        "case_status": "Status",
+        "case_stage": "Current Stage",
+        "case_version": "Sync Version",
+        "case_updated": "Last Updated",
+        "case_progress": "Workflow Progress",
+        "case_events": "Audit Timeline",
+        "case_artifacts": "Synced Artifacts",
+        "case_pause": "Pause",
+        "case_resume": "Resume",
+        "case_cancel": "Cancel",
+        "case_retry": "Retry",
+        "case_open_module": "Continue Next Step",
+        "case_created": "Trade case created",
+        "case_conflict": "Another module updated this case. Refresh and retry.",
+        "case_auto_run": "One-click Full Simulation",
+        "case_auto_run_caption": "Runs advisors, market integrity, micro backtest, and consistency checks. It can only prepare a human-confirmed order and never executes automatically.",
+        "case_run_now": "Run Full Simulation",
+        "case_retry_from_failure": "Retry From Failed Step",
+        "case_trade_amount": "Demo Amount",
+        "case_candle_count": "Validation Candles",
+        "case_time_budget": "Advisor Time Limit",
+        "case_use_web": "Allow Advisor Web Research",
+        "case_ready_confirmation": "Consistency checks passed. The order draft is waiting for human confirmation.",
+        "case_no_confirmation": "Analysis completed, but the consistency gate blocked the order draft.",
+        "case_failed_step": "Retry From",
+        "case_gate_result": "Consistency Gate",
+        "case_blockers": "Blockers",
+        "case_decision_brief": "Operator Decision Brief",
+        "case_current_decision": "Decision",
+        "case_latest_price": "Latest Price",
+        "case_paper_result": "Paper Result",
+        "case_next_action": "Next Action",
+        "case_evidence": "Evidence",
+        "case_run_details": "Run And Recovery Details",
+        "status_symbol": "Symbol",
+        "status_advisor": "Advisor",
+        "status_entry": "Entry",
+        "status_freshness": "Freshness",
+        "status_api_calls": "API Calls",
+        "status_sync": "Sync",
+        "status_pending": "Pending",
+        "status_none": "None",
+        "status_yes": "Yes",
+        "advisor_performance": "Advisor Performance",
+        "safety_gate_panel": "Execution Safety Gate",
+        "safety_token": "Token",
+        "safety_confirmation": "Human Confirm",
+        "safety_live": "Live Execution",
+        "safety_pending_order": "Pending Order",
+        "safety_freshness": "Data Freshness",
+        "safety_ready": "Ready",
+        "safety_blocked": "Blocked",
+        "safety_required": "Required",
+        "safety_disabled": "Disabled",
+        "safety_enabled": "Enabled",
+        "pending_action": "Action",
+        "pending_direction": "Direction",
+        "pending_amount": "Amount",
+        "pending_duration": "Duration",
+        "pending_advisor_alignment": "Advisor Alignment",
+        "pending_freshness": "Data Freshness",
+        "pending_flags": "Risk Flags",
+        "pending_raw_payload": "Raw Payload",
+        "advisor_trade_draft": "Create Trade Draft",
+        "advisor_trade_draft_caption": "Creates a pending trade only. It does not submit an order.",
+        "advisor_trade_amount": "Draft Amount",
+        "advisor_trade_duration": "Draft Duration",
+        "advisor_trade_created": "Pending trade draft created. Review it in the trading desk/sidebar.",
+        "advisor_trade_wait_blocked": "Advisor stance is WAIT, so no trade draft was created.",
+        "audit_export": "Audit Export",
+        "audit_export_caption": "Export the current decision-chain state. API tokens are not included.",
+        "download_audit": "Download Audit JSON",
+        "system_health": "System Health",
+        "system_health_caption": "Local runtime checks without network trading calls.",
+        "health_ready": "Ready",
+        "health_attention": "Attention",
+        "health_db": "Local DB",
+        "health_langgraph": "LangGraph",
+        "health_token": "Token",
+        "health_pending": "Pending",
+        "micro_strategy": "Micro Strategy",
+        "micro_strategy_caption": "Standalone strategy lab: analysis, paper trading, and budget checks only. It does not change the main trading desk.",
+        "micro_goal": "Strategy Goal",
+        "micro_symbol": "Asset / Symbol",
+        "micro_asset_kind": "Asset Kind",
+        "micro_prices": "Recent Closes",
+        "micro_data_source": "Data Source",
+        "micro_source_live": "Latest Deriv Candles",
+        "micro_source_manual": "Manual Close Input",
+        "micro_live_count": "Live Candle Count",
+        "micro_live_granularity": "Live Granularity",
+        "micro_budget": "Micro Budget",
+        "micro_amount": "Trade Amount",
+        "micro_daily_budget": "Daily Budget",
+        "micro_total_budget": "Total Budget",
+        "micro_spent_today": "Spent Today",
+        "micro_spent_total": "Spent Total",
+        "micro_circuit": "Circuit Breaker",
+        "micro_max_losses": "Max Loss Streak",
+        "micro_max_loss_amount": "Max Loss Amount",
+        "micro_max_drawdown": "Max Drawdown %",
+        "micro_max_trades": "Max Paper Trades",
+        "micro_run": "Run Analysis & Backtest",
+        "micro_decision": "Current Signal",
+        "micro_operator_brief": "Operator Brief",
+        "micro_operator_recommendation": "Recommendation",
+        "micro_trade_direction": "Observed Direction",
+        "micro_data_quality": "Data Quality",
+        "micro_paper_return": "Paper Return",
+        "micro_risk_brief": "Risk And Budget",
+        "micro_evidence": "Signal Evidence",
+        "micro_next_steps": "Next Steps",
+        "micro_trade_log": "Paper Trading Log",
+        "micro_backtest": "Paper Trading Backtest",
+        "micro_no_trade": "Budget or circuit conditions do not allow a trade.",
+        "micro_recent_runs": "Recent Micro Strategy Runs",
+        "micro_saved": "Saved this micro strategy run",
+        "chart_data_status": "Chart Data Status",
+        "chart_last_candle": "Latest Candle",
+        "chart_data_age": "Data Age",
+        "chart_time_zone": "Time Display",
+        "chart_local_time_note": "The chart x-axis uses local MYT time; the table keeps both UTC and MYT.",
+        "chart_stale": "Possibly Stale",
+        "chart_fresh": "Fresh",
+        "chart_refresh_hint": "If the latest candle is behind, refresh the current chart.",
+        "chart_integrity": "Market Data Integrity",
+        "chart_integrity_ok": "Healthy",
+        "chart_integrity_attention": "Attention",
+        "chart_duplicate_bars": "Duplicate Timestamps",
+        "chart_gap_count": "Detected Gaps",
+        "chart_invalid_ohlc": "Invalid OHLC",
+        "chart_order_errors": "Out-of-order Bars",
+        "chart_integrity_hint": "Integrity checks detect duplicates, ordering errors, invalid prices, and possible data gaps. They inform the operator and never trigger a trade automatically.",
+        "sync_test_status": "Sync Test Status",
     },
 }
 
@@ -391,6 +853,25 @@ class TeamRunResult:
     execution_report: dict[str, Any] | None = None
     ok: bool = True
     agent_reports: dict[str, Any] | None = None
+
+
+class TeamGraphState(TypedDict, total=False):
+    user_text: str
+    symbol: str
+    amount: float
+    contract_type: str
+    duration: int
+    duration_unit: str
+    route: list[str]
+    cursor: int
+    missing_fields: list[str]
+    guardrails: list[str]
+    events: list[AgentEvent]
+    market_report: dict[str, Any] | None
+    execution_report: dict[str, Any] | None
+    agent_reports: dict[str, Any]
+    final_answer: str
+    ok: bool
 
 
 AGENT_SPECS: dict[str, dict[str, str]] = {
@@ -586,7 +1067,9 @@ def default_agent_prompts() -> dict[str, dict[str, str]]:
         },
         "advisor.chief": {
             "name": "首席谋士",
-            "prompt": "你汇总所有谋士观点，只输出一个短线结论：CALL、PUT 或 WAIT；必须包含置信度、执行前提和失效条件。",
+            "prompt": ("你汇总所有谋士观点，只输出一个短线结论：CALL、PUT 或 WAIT；必须包含置信度、执行前提和失效条件。"
+                       if current_lang() == "zh"
+                       else "Synthesize all advisor opinions into one short-term conclusion: CALL, PUT, or WAIT. Must include confidence, execution prerequisite, and invalidation condition."),
         },
     }
 
@@ -672,6 +1155,315 @@ def t(key: str) -> str:
     return I18N.get(current_lang(), I18N["zh"]).get(key, I18N["zh"].get(key, key))
 
 
+CASE_BLOCKER_MESSAGES_ZH = {
+    "missing_advisor": "缺少谋士团分析结果",
+    "advisor_not_actionable": "谋士团建议等待，当前不应生成订单",
+    "missing_market": "缺少行情快照",
+    "market_data_unhealthy": "行情数据不完整、过期或数量不足",
+    "missing_micro_strategy": "缺少小笔策略结果",
+    "micro_not_actionable": "小笔策略没有产生 CALL 或 PUT 信号",
+    "budget_blocked": "交易金额未通过预算限制",
+    "backtest_halted": "纸面回测触发风险熔断",
+    "no_paper_trades": "纸面回测没有产生可评估的交易",
+    "missing_trade_draft": "分析方向有效，但没有生成待确认订单",
+    "symbol_mismatch": "谋士、行情、策略或订单使用了不同的 Symbol",
+    "direction_conflict": "谋士、策略与订单的 CALL/PUT 方向不一致",
+    "invalid_amount": "交易金额无效或超过单笔上限",
+    "live_execution": "一键模拟禁止准备真实账户订单",
+}
+
+
+def case_blocker_message(code: str, lang: str | None = None) -> str:
+    if (lang or current_lang()) == "zh":
+        return CASE_BLOCKER_MESSAGES_ZH.get(code, code)
+    return BLOCKER_MESSAGES.get(code, code)
+
+
+def display_case_blockers(blockers: list[str], detail: dict[str, Any] | None = None) -> list[str]:
+    detail = detail or {}
+    advisor_action = str(detail.get("advisor_action") or "").upper()
+    directions = {
+        str(detail.get(key) or "").upper()
+        for key in ("advisor_action", "micro_action", "pending_action")
+        if str(detail.get(key) or "").upper() in {"CALL", "PUT"}
+    }
+    visible = list(dict.fromkeys(str(code) for code in blockers))
+    if advisor_action not in {"CALL", "PUT"}:
+        visible = [code for code in visible if code != "missing_trade_draft"]
+    if len(directions) < 2:
+        visible = [code for code in visible if code != "direction_conflict"]
+    return visible
+
+
+def workflow_step_label(step: str | None, lang: str | None = None) -> str:
+    labels = {
+        "zh": {
+            "advisor": "重新咨询谋士",
+            "market": "重新获取行情",
+            "micro_strategy": "重新运行小笔回测",
+            "consistency_gate": "重新检查证据",
+            "human_confirmation": "人工确认",
+        },
+        "en": {
+            "advisor": "Run advisors again",
+            "market": "Refresh market data",
+            "micro_strategy": "Run paper backtest again",
+            "consistency_gate": "Recheck evidence",
+            "human_confirmation": "Human confirmation",
+        },
+    }
+    selected = lang or current_lang()
+    return labels.get(selected, labels["zh"]).get(str(step or ""), "-" if selected == "zh" else "-")
+
+
+def workflow_phase_label(step: str | None, lang: str | None = None) -> str:
+    labels = {
+        "zh": {
+            "advisor": "谋士分析",
+            "market": "行情验证",
+            "micro_strategy": "小笔回测",
+            "consistency_gate": "风险复核",
+            "human_confirmation": "人工确认",
+        },
+        "en": {
+            "advisor": "Advisor Review",
+            "market": "Market Validation",
+            "micro_strategy": "Paper Backtest",
+            "consistency_gate": "Risk Review",
+            "human_confirmation": "Human Confirmation",
+        },
+    }
+    selected = lang or current_lang()
+    return labels.get(selected, labels["zh"]).get(str(step or ""), "-")
+
+
+def workflow_status_label(status: str | None, lang: str | None = None) -> str:
+    labels = {
+        "zh": {
+            "running": "分析中",
+            "blocked": "不下单",
+            "awaiting_confirmation": "等待确认",
+            "failed": "运行失败",
+        },
+        "en": {
+            "running": "Running",
+            "blocked": "No Order",
+            "awaiting_confirmation": "Awaiting Confirmation",
+            "failed": "Failed",
+        },
+    }
+    selected = lang or current_lang()
+    return labels.get(selected, labels["zh"]).get(str(status or ""), str(status or "-").replace("_", " ").title())
+
+
+def case_halt_reason(reason: str | None, losses: int, lang: str) -> str:
+    if lang == "zh":
+        messages = {
+            "max_consecutive_losses": f"纸面回测连续亏损 {losses} 次，已触发熔断",
+            "max_total_loss": "纸面回测累计亏损达到上限，已触发熔断",
+            "max_drawdown": "纸面回测回撤达到上限，已触发熔断",
+            "max_trade_count": "纸面回测已达到本轮交易次数上限",
+        }
+        return messages.get(str(reason or ""), "纸面回测触发风险熔断")
+    messages = {
+        "max_consecutive_losses": f"Paper backtest hit {losses} consecutive losses and stopped.",
+        "max_total_loss": "Paper backtest reached the total-loss limit and stopped.",
+        "max_drawdown": "Paper backtest reached the drawdown limit and stopped.",
+        "max_trade_count": "Paper backtest reached its trade-count cap.",
+    }
+    return messages.get(str(reason or ""), "The paper backtest triggered a risk circuit breaker.")
+
+
+def trade_case_operator_brief(
+    case: dict[str, Any],
+    *,
+    has_session_pending: bool = False,
+    lang: str | None = None,
+) -> dict[str, Any]:
+    selected = lang or current_lang()
+    snapshot = trade_case_decision_snapshot(case)
+    status = str(snapshot["status"])
+    advisor = snapshot["advisor"]
+    market = snapshot["market"]
+    strategy = snapshot["strategy"]
+    paper = snapshot["paper"]
+    gate = snapshot["gate"]
+    blockers = display_case_blockers(
+        list(gate.get("blockers") or []),
+        {
+            "advisor_action": advisor.get("action"),
+            "micro_action": strategy.get("action"),
+            "pending_action": snapshot["pending"].get("action"),
+        },
+    )
+    reasons = [case_blocker_message(code, selected) for code in blockers]
+    if "backtest_halted" in blockers:
+        detailed_halt = case_halt_reason(paper.get("halt_reason"), int(paper.get("losses") or 0), selected)
+        reasons = [detailed_halt if code == "backtest_halted" else case_blocker_message(code, selected) for code in blockers]
+
+    advisor_action = str(advisor.get("action") or "-")
+    strategy_action = str(strategy.get("action") or "-")
+    pending_action = str(snapshot["pending"].get("action") or "-")
+    decision = pending_action if status == "awaiting_confirmation" and has_session_pending else "NO_TRADE"
+    tone = "info"
+    if selected == "zh":
+        headline = "任务尚未开始"
+        summary = "运行完整模拟后，这里会汇总谋士、行情、回测和风控结论。"
+        next_action = "运行完整模拟"
+        if status in {"running", "in_progress"}:
+            headline, summary, next_action = "分析进行中", "系统正在收集并同步决策证据。", "等待本轮分析完成"
+        elif status == "blocked":
+            tone, headline = "warning", "本轮不下单"
+            summary = "；".join(reasons) or "证据未通过一致性检查。"
+            next_action = workflow_step_label(snapshot.get("retry_step"), selected)
+        elif status == "failed":
+            tone, headline = "error", "本轮分析失败"
+            summary = str(case.get("last_error") or "某个模块运行失败，已保存恢复点。")
+            next_action = workflow_step_label(snapshot.get("retry_step"), selected)
+        elif status == "awaiting_confirmation" and has_session_pending:
+            tone, headline, decision = "success", "订单草稿已准备，等待你确认", pending_action
+            summary = "全部证据通过一致性检查，但系统不会自动成交。"
+            next_action = "前往交易台核对金额、方向和时效后人工确认"
+        elif status == "awaiting_confirmation":
+            tone, headline = "warning", "原确认草稿已失效，需要重新验证"
+            summary = "应用重启后不会恢复旧订单确认，避免使用过期行情成交。"
+            next_action = "重新运行完整模拟"
+        elif status == "paused":
+            headline, summary, next_action = "任务已暂停", "后台模块不会继续写入这个任务。", "恢复任务后继续"
+        elif status == "cancelled":
+            headline, summary, next_action = "任务已取消", "这个任务不会再接受新的分析结果。", "新建交易任务"
+        elif status == "completed":
+            tone, headline, decision = "success", "交易流程已完成", pending_action
+            summary, next_action = "成交记录和决策证据已保存。", "复盘审计时间线"
+    else:
+        headline = "Case not started"
+        summary = "Run the full simulation to combine advisor, market, backtest, and risk evidence."
+        next_action = "Run full simulation"
+        if status in {"running", "in_progress"}:
+            headline, summary, next_action = "Analysis in progress", "The system is collecting and synchronizing decision evidence.", "Wait for this run to finish"
+        elif status == "blocked":
+            tone, headline = "warning", "Do not place an order"
+            summary = "; ".join(reasons) or "The evidence did not pass consistency checks."
+            next_action = workflow_step_label(snapshot.get("retry_step"), selected)
+        elif status == "failed":
+            tone, headline = "error", "Analysis failed"
+            summary = str(case.get("last_error") or "A module failed and a recovery checkpoint was saved.")
+            next_action = workflow_step_label(snapshot.get("retry_step"), selected)
+        elif status == "awaiting_confirmation" and has_session_pending:
+            tone, headline, decision = "success", "Order draft ready for your confirmation", pending_action
+            summary = "All evidence passed, but the system will not execute automatically."
+            next_action = "Review direction, amount, and freshness in Trading Desk, then confirm"
+        elif status == "awaiting_confirmation":
+            tone, headline = "warning", "The previous confirmation draft expired"
+            summary = "Order confirmations are not restored after restart to prevent stale execution."
+            next_action = "Run the full simulation again"
+        elif status == "paused":
+            headline, summary, next_action = "Case paused", "Background modules cannot update this case.", "Resume the case"
+        elif status == "cancelled":
+            headline, summary, next_action = "Case cancelled", "This case no longer accepts evidence.", "Create a new trade case"
+        elif status == "completed":
+            tone, headline, decision = "success", "Trading workflow completed", pending_action
+            summary, next_action = "The receipt and decision evidence are stored.", "Review the audit timeline"
+
+    evidence = [
+        {
+            "area": "谋士" if selected == "zh" else "Advisor",
+            "status": advisor_action,
+            "detail": (
+                f"置信度 {float(advisor.get('confidence') or 0):.0%}"
+                if selected == "zh"
+                else f"Confidence {float(advisor.get('confidence') or 0):.0%}"
+            ),
+        },
+        {
+            "area": "行情" if selected == "zh" else "Market",
+            "status": "正常" if market.get("healthy") and market.get("fresh") and selected == "zh" else "Healthy" if market.get("healthy") and market.get("fresh") else "需关注" if selected == "zh" else "Needs attention",
+            "detail": (
+                f"{int(market.get('candle_count') or 0)} 根K线，最新价 {market.get('latest_close') if market.get('latest_close') is not None else '-'}"
+                if selected == "zh"
+                else f"{int(market.get('candle_count') or 0)} candles, latest {market.get('latest_close') if market.get('latest_close') is not None else '-'}"
+            ),
+        },
+        {
+            "area": "小笔策略" if selected == "zh" else "Micro Strategy",
+            "status": strategy_action,
+            "detail": (
+                f"置信度 {float(strategy.get('confidence') or 0):.0%}，预算{'通过' if strategy.get('budget_ok') else '未通过'}"
+                if selected == "zh"
+                else f"Confidence {float(strategy.get('confidence') or 0):.0%}, budget {'passed' if strategy.get('budget_ok') else 'blocked'}"
+            ),
+        },
+        {
+            "area": "纸面回测" if selected == "zh" else "Paper Backtest",
+            "status": "熔断" if paper.get("halted") and selected == "zh" else "Halted" if paper.get("halted") else "完成" if selected == "zh" else "Complete",
+            "detail": (
+                f"{paper.get('trade_count')} 笔，胜率 {float(paper.get('win_rate') or 0):.0%}，PnL {float(paper.get('total_pnl') or 0):+.5f}"
+                if selected == "zh"
+                else f"{paper.get('trade_count')} trades, win rate {float(paper.get('win_rate') or 0):.0%}, PnL {float(paper.get('total_pnl') or 0):+.5f}"
+            ),
+        },
+    ]
+    return {
+        "tone": tone,
+        "headline": headline,
+        "summary": summary,
+        "decision": decision,
+        "next_action": next_action,
+        "reasons": reasons,
+        "evidence": evidence,
+        "snapshot": snapshot,
+    }
+
+
+def render_trade_case_operator_brief(case: dict[str, Any]) -> None:
+    session_pending = st.session_state.get("pending_trade") or {}
+    has_session_pending = bool(session_pending) and normalize_deriv_symbol(
+        str(session_pending.get("symbol") or "")
+    ) == normalize_deriv_symbol(str(case.get("symbol") or ""))
+    brief = trade_case_operator_brief(
+        case,
+        has_session_pending=has_session_pending,
+        lang=current_lang(),
+    )
+    st.markdown(f"#### {t('case_decision_brief')}")
+    message = f"**{brief['headline']}**  \n{brief['summary']}"
+    getattr(st, str(brief["tone"]))(message)
+
+    snapshot = brief["snapshot"]
+    advisor = snapshot["advisor"]
+    market = snapshot["market"]
+    paper = snapshot["paper"]
+    decision = str(brief["decision"])
+    if decision == "NO_TRADE":
+        decision = "不下单" if current_lang() == "zh" else "NO ORDER"
+    metrics = st.columns(4)
+    metrics[0].metric(t("case_current_decision"), decision)
+    advisor_value = str(advisor.get("action") or "-")
+    if advisor.get("confidence") is not None:
+        advisor_value += f" · {float(advisor['confidence']):.0%}"
+    metrics[1].metric(t("status_advisor"), advisor_value)
+    latest_close = market.get("latest_close")
+    metrics[2].metric(t("case_latest_price"), "-" if latest_close is None else f"{float(latest_close):.5g}")
+    metrics[3].metric(
+        t("case_paper_result"),
+        f"{int(paper.get('trade_count') or 0)} / {float(paper.get('total_pnl') or 0):+.5f}",
+    )
+    st.markdown(f"**{t('case_next_action')}：** {brief['next_action']}")
+    if snapshot["status"] != "not_started":
+        st.markdown(f"**{t('case_evidence')}**")
+        if current_lang() == "zh":
+            evidence_rows = [
+                {"模块": row["area"], "结论": row["status"], "数据说明": row["detail"]}
+                for row in brief["evidence"]
+            ]
+        else:
+            evidence_rows = [
+                {"Area": row["area"], "Result": row["status"], "Evidence": row["detail"]}
+                for row in brief["evidence"]
+            ]
+        st.dataframe(evidence_rows, width="stretch", hide_index=True)
+
+
 def text_for(lang: str, key: str) -> str:
     return I18N.get(lang, I18N["zh"]).get(key, I18N["zh"].get(key, key))
 
@@ -717,9 +1509,33 @@ def has_cjk(text: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", text))
 
 
+def translate_message(text: str) -> str:
+    """Translate Chinese agent names embedded in a message string."""
+    if current_lang() == "zh":
+        return text
+    for zh, en in {
+        "用户": "User",
+        "经理": "Manager",
+        "行情分析师": "Market Analyst",
+        "风控执行员": "Risk & Execution Agent",
+        "执行交易员": "Execution Trader",
+        "策略研究员": "Strategy Researcher",
+        "风控官": "Risk Sentinel",
+        "合规审查员": "Compliance Reviewer",
+        "图表工程师": "Chart Engineer",
+        "报告员": "Report Agent",
+        "系统": "System",
+    }.items():
+        text = text.replace(zh, en)
+    return text
+
 def role_label(role: str) -> str:
     if current_lang() == "zh":
         return role
+    return role_name(role)
+
+def role_name(role: str) -> str:
+    """Translate internal Chinese role names to display names."""
     return {
         "用户": "User",
         "经理": "Manager",
@@ -733,6 +1549,11 @@ def role_label(role: str) -> str:
         "报告员": "Report Agent",
         "系统": "System",
     }.get(role, role)
+
+
+def llm_lang_instruction() -> str:
+    """Returns output language instruction for LLM system prompts."""
+    return "请用中文输出。" if current_lang() == "zh" else "Output in English."
 
 
 def localize_event_message(event: AgentEvent) -> str:
@@ -859,6 +1680,7 @@ def agent_state_fallback(agent_id: str) -> str:
 
 def init_local_db() -> None:
     DATA_DIR.mkdir(exist_ok=True)
+    init_trade_case_db(DB_PATH)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
@@ -904,6 +1726,36 @@ def init_local_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS micro_strategy_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                goal TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                asset_kind TEXT NOT NULL,
+                action TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                budget_ok INTEGER NOT NULL,
+                trade_count INTEGER NOT NULL,
+                total_pnl REAL NOT NULL,
+                halted INTEGER NOT NULL,
+                run_json TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_memory_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                task TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                ok INTEGER NOT NULL
+            )
+            """
+        )
 
 
 def save_team_run(user_prompt: str, result: TeamRunResult) -> None:
@@ -946,12 +1798,68 @@ def save_team_run(user_prompt: str, result: TeamRunResult) -> None:
                     str(receipt.get("contract_id") or ""),
                     str(receipt.get("symbol") or ""),
                     str(receipt.get("contract_type") or ""),
-                    float(receipt.get("purchase_price") or 0),
+                    float(receipt.get("amount") or 0),
                     float(receipt.get("purchase_price") or 0),
                     str(receipt.get("currency") or ""),
                     json.dumps(receipt, ensure_ascii=False, default=str),
                 ),
             )
+    if result.market_report:
+        sync_active_trade_case_artifact(
+            "market",
+            actor="market_agent",
+            message="Trading team market validation saved",
+            payload=result.market_report,
+            auto_create_objective=user_prompt,
+            symbol=str(result.market_report.get("symbol") or DEFAULT_SYMBOL),
+        )
+    execution_report = result.execution_report or {}
+    if execution_report.get("receipt"):
+        sync_active_trade_case_artifact(
+            "trade_receipt",
+            actor="execution_agent",
+            message="Trading team receipt saved; case completed",
+            payload=execution_report.get("receipt") or {},
+        )
+    elif execution_report and execution_report.get("reason") not in {"pending_human_confirmation"}:
+        sync_active_trade_case_artifact(
+            "risk",
+            actor="execution_agent",
+            message="Execution review saved",
+            payload=execution_report,
+            auto_create_objective=user_prompt,
+            symbol=str((result.market_report or {}).get("symbol") or DEFAULT_SYMBOL),
+        )
+
+
+def _json_load(value: Any, fallback: Any) -> Any:
+    try:
+        return json.loads(str(value or ""))
+    except (TypeError, json.JSONDecodeError):
+        return fallback
+
+
+def load_latest_team_run() -> dict[str, Any] | None:
+    init_local_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT
+                id, created_at, user_prompt, final_answer, ok, events_json,
+                market_report_json, execution_report_json, log_text
+            FROM team_runs
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    if not row:
+        return None
+    record = dict(row)
+    record["events"] = _json_load(record.get("events_json"), [])
+    record["market_report"] = _json_load(record.get("market_report_json"), None)
+    record["execution_report"] = _json_load(record.get("execution_report_json"), None)
+    return record
 
 
 def load_recent_runs(limit: int = 5) -> list[dict[str, Any]]:
@@ -989,6 +1897,14 @@ def save_advisor_run(result: dict[str, Any]) -> None:
                 json.dumps(result, ensure_ascii=False, default=str),
             ),
         )
+    sync_active_trade_case_artifact(
+        "advisor",
+        actor="advisor_council",
+        message="Advisor council conclusion saved",
+        payload=result,
+        auto_create_objective=str(result.get("question") or "Advisor review"),
+        symbol=str(result.get("symbol") or DEFAULT_SYMBOL),
+    )
 
 
 def load_recent_advisor_runs(limit: int = 3) -> list[dict[str, Any]]:
@@ -1005,6 +1921,172 @@ def load_recent_advisor_runs(limit: int = 3) -> list[dict[str, Any]]:
             (limit,),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def load_advisor_run_records(limit: int = 12) -> list[dict[str, Any]]:
+    init_local_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT id, created_at, question, symbol, consensus, confidence, elapsed_ms, result_json
+            FROM advisor_runs
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        record = dict(row)
+        try:
+            payload = json.loads(str(record.get("result_json") or "{}"))
+        except json.JSONDecodeError:
+            payload = {}
+        record["result"] = payload if isinstance(payload, dict) else {}
+        records.append(record)
+    return records
+
+
+def save_micro_strategy_run(
+    *,
+    goal: str,
+    config: MicroTradeConfig,
+    decision: dict[str, Any],
+    budget_check: dict[str, Any],
+    backtest: dict[str, Any],
+    operator_brief: dict[str, Any] | None = None,
+    data_source: str = "manual",
+) -> None:
+    init_local_db()
+    summary = backtest.get("summary") or {}
+    payload = {
+        "goal": goal,
+        "config": {
+            "symbol": config.symbol,
+            "asset_kind": config.asset_kind,
+            "cadence_seconds": config.cadence_seconds,
+            "max_trade_amount": config.max_trade_amount,
+            "min_confidence": config.min_confidence,
+            "max_volatility_pct": config.max_volatility_pct,
+            "fee_bps": config.fee_bps,
+            "slippage_bps": config.slippage_bps,
+            "cooldown_seconds": config.cooldown_seconds,
+            "max_daily_loss_pct": config.max_daily_loss_pct,
+        },
+        "decision": decision,
+        "budget_guard": budget_check,
+        "backtest": backtest,
+        "operator_brief": operator_brief or {},
+        "data_source": data_source,
+    }
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO micro_strategy_runs (
+                created_at, goal, symbol, asset_kind, action, confidence,
+                budget_ok, trade_count, total_pnl, halted, run_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now(timezone.utc).isoformat(),
+                goal,
+                config.symbol,
+                config.asset_kind,
+                str(decision.get("action") or ""),
+                float(decision.get("confidence") or 0),
+                1 if budget_check.get("ok") else 0,
+                int(summary.get("trade_count") or 0),
+                float(summary.get("total_pnl") or 0),
+                1 if summary.get("halted") else 0,
+                json.dumps(payload, ensure_ascii=False, default=str),
+            ),
+        )
+    sync_active_trade_case_artifact(
+        "micro_strategy",
+        actor="micro_strategy",
+        message="Micro strategy and paper backtest saved",
+        payload=payload,
+        auto_create_objective=goal,
+        symbol=config.symbol,
+    )
+
+
+def load_recent_micro_strategy_runs(limit: int = 8) -> list[dict[str, Any]]:
+    init_local_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT
+                id, created_at, goal, symbol, asset_kind, action, confidence,
+                budget_ok, trade_count, total_pnl, halted, run_json
+            FROM micro_strategy_runs
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        record = dict(row)
+        try:
+            payload = json.loads(str(record.get("run_json") or "{}"))
+        except json.JSONDecodeError:
+            payload = {}
+        record["payload"] = payload if isinstance(payload, dict) else {}
+        records.append(record)
+    return records
+
+
+def save_agent_memory_item(agent_id: str, item: dict[str, Any]) -> None:
+    init_local_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO agent_memory_items (created_at, agent_id, task, summary, ok)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now(timezone.utc).isoformat(),
+                str(agent_id),
+                str(item.get("task") or "")[:500],
+                str(item.get("summary") or "")[:1200],
+                1 if item.get("ok", True) else 0,
+            ),
+        )
+
+
+def load_agent_memory_items(limit_per_agent: int = 5) -> dict[str, list[dict[str, Any]]]:
+    init_local_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT id, created_at, agent_id, task, summary, ok
+            FROM agent_memory_items
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (max(1, int(limit_per_agent)) * max(1, len(AGENT_SPECS) + len(advisor_specs()) + 4),),
+        ).fetchall()
+    memory: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        record = dict(row)
+        agent_id = str(record.pop("agent_id"))
+        items = memory.setdefault(agent_id, [])
+        if len(items) >= limit_per_agent:
+            continue
+        items.append(
+            {
+                "time": local_time_label(record.get("created_at"), "%H:%M:%S"),
+                "task": record.get("task") or "",
+                "summary": record.get("summary") or "",
+                "ok": bool(record.get("ok")),
+            }
+        )
+    return {agent_id: list(reversed(items)) for agent_id, items in memory.items()}
 
 
 SYSTEM_PROMPT = """
@@ -1234,17 +2316,41 @@ def manager_system_prompt() -> str:
         MANAGER_SYSTEM_PROMPT
         + "\n\n每个员工的专属 prompt，请调度时尊重：\n"
         + "\n".join(prompt_lines)
+        + "\n\n经理自己的最近上下文记忆：\n"
+        + agent_memory_summary("manager")
     )
 
 
 def init_state() -> None:
+    deriv_token_default = os.environ.get("DERIV_API_TOKEN", "").strip()
+    llm_provider_default: Provider = "本地规则"
+    llm_api_key_default = ""
+    llm_model_default = "local-rule-engine"
+    custom_base_url_default = os.environ.get("OPENAI_COMPATIBLE_BASE_URL", "").strip()
+    if os.environ.get("OPENAI_API_KEY"):
+        llm_provider_default = "OpenAI"
+        llm_api_key_default = os.environ["OPENAI_API_KEY"].strip()
+        llm_model_default = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip()
+    elif os.environ.get("DEEPSEEK_API_KEY"):
+        llm_provider_default = "DeepSeek"
+        llm_api_key_default = os.environ["DEEPSEEK_API_KEY"].strip()
+        llm_model_default = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat").strip()
+    elif os.environ.get("ANTHROPIC_API_KEY"):
+        llm_provider_default = "Anthropic"
+        llm_api_key_default = os.environ["ANTHROPIC_API_KEY"].strip()
+        llm_model_default = os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest").strip()
+    elif os.environ.get("OPENAI_COMPATIBLE_API_KEY"):
+        llm_provider_default = "OpenAI-Compatible"
+        llm_api_key_default = os.environ["OPENAI_COMPATIBLE_API_KEY"].strip()
+        llm_model_default = os.environ.get("OPENAI_COMPATIBLE_MODEL", "custom-model").strip()
+
     defaults = {
-        "deriv_token": "",
-        "llm_provider": "本地规则",
-        "llm_api_key": "",
-        "llm_model": "local-rule-engine",
-        "custom_base_url": "",
-        "provider": "本地规则",
+        "deriv_token": deriv_token_default,
+        "llm_provider": llm_provider_default,
+        "llm_api_key": llm_api_key_default,
+        "llm_model": llm_model_default,
+        "custom_base_url": custom_base_url_default,
+        "provider": llm_provider_default,
         "require_trade_confirmation": True,
         "confirm_next_trade": False,
         "allow_live_execution": False,
@@ -1258,11 +2364,16 @@ def init_state() -> None:
         "last_plan": None,
         "prompt_nonce": 0,
         "chart_height": 620,
+        "chart_loader_symbol": DEFAULT_SYMBOL,
+        "chart_custom_symbol": "",
+        "chart_loader_granularity": DEFAULT_GRANULARITY,
+        "chart_loader_count": 120,
         "compare_symbol": "R_75",
         "compare_result": None,
         "agent_execution_log": text_for("zh", "default_log"),
         "team_events": [],
         "agent_reports": {},
+        "agent_memory": {},
         "runtime_events": [],
         "api_trace": [],
         "sync_version": 0,
@@ -1273,7 +2384,11 @@ def init_state() -> None:
         "advisor_use_web": True,
         "advisor_symbol": DEFAULT_SYMBOL,
         "advisor_runs": [],
+        "advisor_evaluations": [],
         "last_advisor_result": None,
+        "last_case_workflow_result": None,
+        "active_page": "advisor",
+        "active_trade_case_id": None,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -1293,6 +2408,72 @@ def init_state() -> None:
             )
 
 
+def is_initial_message_stack(messages: list[dict[str, Any]] | None) -> bool:
+    if not messages or len(messages) != 1:
+        return False
+    message = messages[0]
+    return message.get("role") == "assistant" and message.get("content") in {
+        text_for("zh", "initial_message"),
+        text_for("en", "initial_message"),
+    }
+
+
+def hydrate_persisted_session_state() -> None:
+    if st.session_state.get("persisted_state_loaded"):
+        return
+
+    advisor_records = load_advisor_run_records(6)
+    advisor_results = [
+        record.get("result")
+        for record in advisor_records
+        if isinstance(record.get("result"), dict) and record.get("result")
+    ]
+    if advisor_results and not st.session_state.get("last_advisor_result"):
+        st.session_state.last_advisor_result = advisor_results[0]
+        st.session_state.advisor_runs = advisor_results[:6]
+        st.session_state.advisor_symbol = str(advisor_results[0].get("symbol") or DEFAULT_SYMBOL)
+
+    latest_team = load_latest_team_run()
+    if latest_team:
+        if is_initial_message_stack(st.session_state.get("messages")):
+            st.session_state.messages = [
+                {"role": "user", "content": str(latest_team.get("user_prompt") or "")},
+                {"role": "assistant", "content": str(latest_team.get("final_answer") or "")},
+            ]
+        if latest_team.get("log_text"):
+            st.session_state.agent_execution_log = str(latest_team.get("log_text"))
+        events = latest_team.get("events")
+        if isinstance(events, list) and events:
+            st.session_state.team_events = [str(event) for event in events][-80:]
+        reports: dict[str, dict[str, Any]] = {}
+        if latest_team.get("market_report"):
+            reports["market"] = {
+                "updated_at": str(latest_team.get("created_at") or ""),
+                "report": latest_team["market_report"],
+            }
+        execution_report = latest_team.get("execution_report")
+        if execution_report:
+            reports["execution"] = {
+                "updated_at": str(latest_team.get("created_at") or ""),
+                "report": execution_report,
+            }
+            if isinstance(execution_report, dict) and execution_report.get("ok"):
+                st.session_state.last_trade_receipt = {"ok": True, "data": {"receipt": execution_report.get("receipt") or {}}}
+        if reports and not st.session_state.get("agent_reports"):
+            st.session_state.agent_reports = reports
+
+    if not st.session_state.get("agent_memory"):
+        st.session_state.agent_memory = load_agent_memory_items()
+
+    if not st.session_state.get("active_trade_case_id"):
+        cases = list_trade_cases(DB_PATH, limit=20)
+        active = next((item for item in cases if item.get("status") in {"active", "paused", "failed"}), None)
+        if active:
+            st.session_state.active_trade_case_id = active["id"]
+
+    st.session_state.persisted_state_loaded = True
+
+
 def configure_page() -> None:
     st.set_page_config(
         page_title="Deriv Smart Trading Gateway",
@@ -1304,26 +2485,30 @@ def configure_page() -> None:
         """
         <style>
         :root {
-            --bg: #08110f;
+            --bg: #07100f;
             --panel: #101a17;
-            --panel-2: #13231f;
-            --line: #263b34;
-            --text: #e8f2ed;
+            --panel-2: #15231f;
+            --panel-3: #0b1513;
+            --line: #2a3a36;
+            --line-strong: #3f5650;
+            --text: #eef6f2;
             --muted: #91a49b;
-            --soft: #c6d7cf;
+            --soft: #c8d7d1;
             --green: #00b894;
             --green-2: #7dffcb;
+            --cyan: #71d7ff;
             --red: #ff5d5d;
             --amber: #f5b84b;
             --blue: #7aa7ff;
+            --accent: #71d7ff;
         }
         .stApp {
             background:
-                linear-gradient(90deg, rgba(0,184,148,.055) 1px, transparent 1px),
-                linear-gradient(0deg, rgba(122,167,255,.04) 1px, transparent 1px),
-                radial-gradient(circle at 78% -10%, rgba(0,184,148,.18), transparent 34%),
+                linear-gradient(135deg, rgba(0,184,148,.06), transparent 32%, rgba(245,184,75,.035) 68%, transparent),
+                linear-gradient(90deg, rgba(113,215,255,.04) 1px, transparent 1px),
+                linear-gradient(0deg, rgba(0,184,148,.035) 1px, transparent 1px),
                 var(--bg);
-            background-size: 44px 44px, 44px 44px, auto;
+            background-size: auto, 44px 44px, 44px 44px;
             color: var(--text);
         }
         [data-testid="stAppViewContainer"],
@@ -1347,8 +2532,11 @@ def configure_page() -> None:
             max-width: 1500px;
         }
         [data-testid="stSidebar"] {
-            background: #06100d;
+            background: linear-gradient(180deg, #06100d, #091714);
             border-right: 1px solid var(--line);
+        }
+        [data-testid="stSidebar"] > div:first-child {
+            padding-top: 1rem;
         }
         [data-testid="stSidebar"] label,
         [data-testid="stSidebar"] p,
@@ -1362,10 +2550,24 @@ def configure_page() -> None:
         }
         .terminal-hero {
             border: 1px solid var(--line);
-            background: linear-gradient(135deg, rgba(16,26,23,.98), rgba(19,35,31,.94));
-            padding: 1.05rem 1.15rem;
+            background:
+                linear-gradient(135deg, rgba(17,28,25,.98), rgba(11,21,19,.98) 58%, rgba(19,28,24,.98)),
+                repeating-linear-gradient(90deg, rgba(255,255,255,.035) 0, rgba(255,255,255,.035) 1px, transparent 1px, transparent 16px);
+            padding: 1rem 1.1rem;
             margin-bottom: 1rem;
-            box-shadow: 0 22px 70px rgba(0,0,0,.25);
+            border-radius: 8px;
+            box-shadow: 0 16px 42px rgba(0,0,0,.24);
+            position: relative;
+            overflow: hidden;
+        }
+        .terminal-hero::after {
+            content: "";
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            background: linear-gradient(120deg, transparent 0%, rgba(255,255,255,.045) 42%, transparent 64%);
+            transform: translateX(-46%);
+            animation: panelSheen 9s ease-in-out infinite;
         }
         .terminal-hero-top {
             display: flex;
@@ -1376,7 +2578,7 @@ def configure_page() -> None:
         .terminal-kicker {
             color: var(--green-2) !important;
             font-size: .74rem;
-            letter-spacing: .12em;
+            letter-spacing: .08em;
             text-transform: uppercase;
             font-weight: 900;
             margin-bottom: .25rem;
@@ -1394,13 +2596,14 @@ def configure_page() -> None:
             max-width: 780px;
         }
         .live-chip {
-            border: 1px solid rgba(0,184,148,.45);
-            background: rgba(0,184,148,.12);
-            color: var(--green-2) !important;
+            border: 1px solid rgba(113,215,255,.42);
+            background: rgba(113,215,255,.1);
+            color: var(--cyan) !important;
             padding: .4rem .6rem;
             font-size: .78rem;
             font-weight: 900;
             white-space: nowrap;
+            border-radius: 7px;
         }
         .agent-stage {
             display: grid;
@@ -1413,7 +2616,14 @@ def configure_page() -> None:
             background: linear-gradient(180deg, rgba(19,35,31,.96), rgba(9,18,16,.98));
             padding: .9rem;
             min-height: 150px;
-            box-shadow: 0 18px 50px rgba(0,0,0,.22);
+            border-radius: 8px;
+            box-shadow: 0 14px 36px rgba(0,0,0,.2);
+            transition: transform .16s ease, border-color .16s ease, background .16s ease;
+        }
+        .agent-card:hover {
+            transform: translateY(-1px);
+            border-color: rgba(125,255,203,.34);
+            background: linear-gradient(180deg, rgba(23,43,38,.97), rgba(10,20,17,.98));
         }
         .agent-head {
             display: flex;
@@ -1430,7 +2640,8 @@ def configure_page() -> None:
             background: rgba(0,184,148,.12);
             color: var(--green-2) !important;
             font-weight: 950;
-            animation: agentPulse 1.9s ease-in-out infinite;
+            border-radius: 8px;
+            box-shadow: inset 0 0 18px rgba(0,184,148,.1), 0 0 0 1px rgba(0,184,148,.06);
         }
         .agent-icon.exec {
             border-color: rgba(245,184,75,.55);
@@ -1440,6 +2651,11 @@ def configure_page() -> None:
         @keyframes agentPulse {
             0%, 100% { box-shadow: 0 0 0 0 rgba(0,184,148,.3); }
             50% { box-shadow: 0 0 0 8px rgba(0,184,148,0); }
+        }
+        @keyframes panelSheen {
+            0%, 72%, 100% { transform: translateX(-48%); opacity: 0; }
+            82% { opacity: .7; }
+            92% { transform: translateX(54%); opacity: 0; }
         }
         .agent-name {
             font-weight: 900;
@@ -1464,6 +2680,7 @@ def configure_page() -> None:
             color: var(--green-2) !important;
             padding: .18rem .42rem;
             text-transform: uppercase;
+            border-radius: 999px;
         }
         .agent-chip.exec {
             border-color: rgba(245,184,75,.45);
@@ -1477,6 +2694,7 @@ def configure_page() -> None:
             padding: .65rem .7rem;
             font-size: .86rem;
             line-height: 1.45;
+            border-radius: 8px;
         }
         .agent-bubble strong {
             color: var(--green-2) !important;
@@ -1485,7 +2703,8 @@ def configure_page() -> None:
         [data-testid="stChatMessage"] {
             border-color: var(--line) !important;
             background: rgba(16,26,23,.92) !important;
-            box-shadow: 0 20px 60px rgba(0,0,0,.22);
+            border-radius: 8px !important;
+            box-shadow: 0 14px 38px rgba(0,0,0,.2);
         }
         [data-testid="stChatMessage"] p,
         [data-testid="stChatMessage"] span,
@@ -1499,6 +2718,7 @@ def configure_page() -> None:
             padding: .85rem 1rem;
             font-weight: 900;
             font-size: 1rem;
+            border-radius: 8px;
         }
         .small-muted {
             color: var(--muted) !important;
@@ -1510,6 +2730,7 @@ def configure_page() -> None:
             padding: 1rem;
             margin: .55rem 0 1rem;
             box-shadow: inset 0 1px 0 rgba(255,255,255,.04);
+            border-radius: 8px;
         }
         .command-title {
             color: var(--text) !important;
@@ -1536,18 +2757,280 @@ def configure_page() -> None:
             padding: .28rem .55rem;
             font-size: .78rem;
             font-weight: 700;
+            border-radius: 999px;
         }
         .send-note {
             color: var(--muted) !important;
             font-size: .82rem;
             padding-top: .45rem;
         }
+        .agent-timeline {
+            display: grid;
+            gap: .65rem;
+            margin: .45rem 0 .85rem;
+        }
+        .timeline-item,
+        .memory-item {
+            border: 1px solid rgba(145,164,155,.22);
+            background: rgba(11,25,21,.72);
+            border-radius: 8px;
+            padding: .8rem .9rem;
+        }
+        .timeline-title,
+        .memory-time {
+            color: var(--green-2) !important;
+            font-size: .76rem;
+            font-weight: 900;
+            letter-spacing: 0;
+            margin-bottom: .25rem;
+        }
+        .timeline-body,
+        .memory-summary {
+            color: var(--text) !important;
+            font-size: .9rem;
+            line-height: 1.5;
+        }
+        .timeline-empty {
+            border: 1px dashed rgba(145,164,155,.28);
+            background: rgba(11,25,21,.52);
+            color: var(--muted) !important;
+            border-radius: 8px;
+            padding: .9rem;
+            font-size: .9rem;
+        }
+        div[role="radiogroup"] {
+            gap: .45rem;
+        }
+        div[role="radiogroup"] label {
+            border: 1px solid rgba(145,164,155,.26);
+            background: rgba(12,24,20,.74);
+            padding: .35rem .75rem;
+            min-height: 2.25rem;
+            border-radius: 8px;
+        }
+        div[role="radiogroup"] label:hover {
+            border-color: rgba(125,255,203,.52);
+            background: rgba(28,55,48,.82);
+        }
+        .page-context {
+            border: 1px solid rgba(113,215,255,.22);
+            border-left: 3px solid var(--accent);
+            background: linear-gradient(90deg, rgba(113,215,255,.09), rgba(15,28,24,.62));
+            padding: .72rem .9rem;
+            margin: .6rem 0 1rem;
+            border-radius: 8px;
+        }
+        .page-context strong {
+            color: var(--text);
+            font-weight: 950;
+            margin-right: .7rem;
+        }
+        .page-context span {
+            color: var(--muted);
+            font-size: .88rem;
+        }
+        .workspace-head {
+            display: flex;
+            align-items: end;
+            justify-content: space-between;
+            gap: 1rem;
+            margin: .25rem 0 .55rem;
+        }
+        .workspace-title {
+            color: var(--text) !important;
+            font-size: 1rem;
+            font-weight: 950;
+            text-transform: uppercase;
+            letter-spacing: .06em;
+        }
+        .workspace-route {
+            color: var(--muted) !important;
+            font-size: .78rem;
+            font-weight: 800;
+        }
+        .nav-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: .55rem;
+            margin-bottom: .55rem;
+        }
+        .nav-card {
+            border: 1px solid rgba(145,164,155,.2);
+            background: linear-gradient(180deg, rgba(16,30,26,.82), rgba(8,17,15,.88));
+            border-radius: 8px;
+            padding: .68rem .72rem;
+            min-height: 94px;
+            box-shadow: 0 10px 26px rgba(0,0,0,.16);
+        }
+        .nav-card.active {
+            border-color: rgba(113,215,255,.54);
+            background: linear-gradient(180deg, rgba(22,42,38,.95), rgba(9,20,18,.95));
+            box-shadow: inset 0 1px 0 rgba(255,255,255,.06), 0 14px 34px rgba(0,0,0,.2);
+        }
+        .nav-top {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: .5rem;
+            margin-bottom: .42rem;
+        }
+        .nav-code {
+            width: 30px;
+            height: 30px;
+            display: grid;
+            place-items: center;
+            border: 1px solid rgba(113,215,255,.34);
+            background: rgba(113,215,255,.1);
+            color: var(--cyan) !important;
+            border-radius: 8px;
+            font-weight: 950;
+            font-size: .78rem;
+        }
+        .nav-state {
+            color: var(--muted) !important;
+            font-size: .68rem;
+            font-weight: 900;
+            text-transform: uppercase;
+        }
+        .nav-card.active .nav-state {
+            color: var(--green-2) !important;
+        }
+        .nav-label {
+            color: var(--text) !important;
+            font-size: .94rem;
+            font-weight: 950;
+            line-height: 1.15;
+        }
+        .nav-caption {
+            color: var(--muted) !important;
+            font-size: .74rem;
+            line-height: 1.35;
+            margin-top: .25rem;
+        }
+        .global-status {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: .55rem;
+            margin: -.2rem 0 1rem;
+        }
+        .status-cell {
+            border: 1px solid rgba(145,164,155,.22);
+            background: linear-gradient(180deg, rgba(18,31,28,.86), rgba(7,16,14,.9));
+            border-radius: 8px;
+            padding: .58rem .7rem;
+            min-height: 58px;
+            box-shadow: 0 10px 24px rgba(0,0,0,.14);
+        }
+        .status-cell span {
+            display: block;
+            color: var(--muted) !important;
+            font-size: .72rem;
+            font-weight: 850;
+            text-transform: uppercase;
+            margin-bottom: .15rem;
+        }
+        .status-cell strong {
+            color: var(--text) !important;
+            font-size: .98rem;
+            font-weight: 950;
+            line-height: 1.18;
+        }
+        .status-cell.attention {
+            border-color: rgba(245,184,75,.5);
+            background: linear-gradient(180deg, rgba(72,53,20,.72), rgba(22,18,10,.84));
+        }
+        .safety-panel {
+            border: 1px solid rgba(145,164,155,.24);
+            background: linear-gradient(180deg, rgba(13,27,23,.88), rgba(7,15,13,.9));
+            border-radius: 8px;
+            padding: .85rem;
+            margin: 0 0 1rem;
+            box-shadow: 0 14px 34px rgba(0,0,0,.18);
+        }
+        .safety-title {
+            color: var(--text) !important;
+            font-weight: 950;
+            margin-bottom: .65rem;
+        }
+        .safety-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+            gap: .55rem;
+        }
+        .safety-cell {
+            border: 1px solid rgba(145,164,155,.22);
+            background: rgba(255,255,255,.045);
+            border-radius: 8px;
+            padding: .55rem .65rem;
+        }
+        .safety-cell.ok {
+            border-color: rgba(0,184,148,.34);
+        }
+        .safety-cell.warn {
+            border-color: rgba(245,184,75,.45);
+            background: rgba(245,184,75,.08);
+        }
+        .safety-cell span {
+            display: block;
+            color: var(--muted) !important;
+            font-size: .72rem;
+            font-weight: 850;
+            text-transform: uppercase;
+        }
+        .safety-cell strong {
+            color: var(--text) !important;
+            font-size: .95rem;
+            font-weight: 950;
+        }
+        .pending-panel {
+            border: 1px solid rgba(245,184,75,.34);
+            background: linear-gradient(180deg, rgba(54,41,19,.62), rgba(15,14,10,.88));
+            border-radius: 8px;
+            padding: .85rem;
+            margin: 0 0 1rem;
+        }
+        .pending-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: .5rem;
+        }
+        .pending-grid > div {
+            border: 1px solid rgba(255,255,255,.12);
+            background: rgba(255,255,255,.045);
+            border-radius: 8px;
+            padding: .52rem .62rem;
+            min-width: 0;
+        }
+        .pending-grid > div.ok {
+            border-color: rgba(0,184,148,.34);
+        }
+        .pending-grid > div.warn {
+            border-color: rgba(245,184,75,.5);
+            background: rgba(245,184,75,.09);
+        }
+        .pending-grid span {
+            display: block;
+            color: var(--muted) !important;
+            font-size: .7rem;
+            font-weight: 850;
+            text-transform: uppercase;
+            margin-bottom: .15rem;
+        }
+        .pending-grid strong {
+            display: block;
+            color: var(--text) !important;
+            font-size: .9rem;
+            font-weight: 900;
+            line-height: 1.18;
+            overflow-wrap: anywhere;
+        }
         .advisor-room {
             border: 1px solid var(--line);
             background: linear-gradient(135deg, rgba(17,30,27,.98), rgba(9,18,16,.98));
             padding: 1rem;
             margin: 0 0 1rem;
-            box-shadow: 0 22px 70px rgba(0,0,0,.26);
+            border-radius: 8px;
+            box-shadow: 0 16px 44px rgba(0,0,0,.22);
         }
         .advisor-room-head {
             display: flex;
@@ -1575,6 +3058,7 @@ def configure_page() -> None:
             font-size: .76rem;
             font-weight: 900;
             white-space: nowrap;
+            border-radius: 7px;
         }
         .advisor-grid {
             display: grid;
@@ -1587,6 +3071,7 @@ def configure_page() -> None:
             background: rgba(255,255,255,.045);
             padding: .75rem;
             min-height: 150px;
+            border-radius: 8px;
         }
         .advisor-card-top {
             display: flex;
@@ -1603,6 +3088,7 @@ def configure_page() -> None:
             background: rgba(122,167,255,.12);
             color: var(--text) !important;
             font-weight: 950;
+            border-radius: 8px;
         }
         .advisor-name {
             font-weight: 900;
@@ -1623,6 +3109,7 @@ def configure_page() -> None:
             background: rgba(0,184,148,.11);
             font-size: .76rem;
             font-weight: 950;
+            border-radius: 999px;
         }
         .advisor-copy {
             color: var(--soft) !important;
@@ -1634,6 +3121,7 @@ def configure_page() -> None:
             background: rgba(0,184,148,.1);
             padding: .85rem;
             margin-top: .75rem;
+            border-radius: 8px;
         }
         .advisor-result strong {
             color: var(--green-2) !important;
@@ -1655,11 +3143,16 @@ def configure_page() -> None:
             box-shadow: 0 0 0 3px rgba(0,184,148,.16);
         }
         .stButton > button {
-            border-radius: 0;
+            border-radius: 8px;
             border: 1px solid var(--line);
             background: #13231f;
             color: var(--text);
             font-weight: 900;
+            transition: transform .14s ease, border-color .14s ease, background .14s ease;
+        }
+        .stButton > button:hover {
+            transform: translateY(-1px);
+            border-color: rgba(125,255,203,.42);
         }
         .stButton > button[kind="primary"] {
             background: var(--green);
@@ -1671,7 +3164,8 @@ def configure_page() -> None:
             background: linear-gradient(180deg, #111c18, #0a1411);
             color: var(--text);
             padding: 1rem;
-            box-shadow: 0 22px 70px rgba(0,0,0,.28);
+            border-radius: 8px;
+            box-shadow: 0 16px 44px rgba(0,0,0,.22);
             margin-bottom: 1rem;
         }
         .chart-workbench strong,
@@ -1691,6 +3185,7 @@ def configure_page() -> None:
             background: rgba(16,26,23,.92);
             padding: .75rem .85rem;
             min-height: 78px;
+            border-radius: 8px;
         }
         .chart-stat span {
             display: block;
@@ -1709,6 +3204,7 @@ def configure_page() -> None:
             background: #050b09 !important;
             border: 1px solid var(--line);
             color: var(--green-2) !important;
+            border-radius: 8px;
         }
         div[data-baseweb="select"] * {
             color: var(--text) !important;
@@ -1722,12 +3218,38 @@ def configure_page() -> None:
                 grid-template-columns: 1fr;
                 display: grid;
             }
+            .workspace-head {
+                display: block;
+            }
+            .nav-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
             .terminal-title {
                 font-size: 1.55rem;
             }
             .block-container {
                 padding-left: .85rem;
                 padding-right: .85rem;
+            }
+            .global-status {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+            .safety-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+        }
+        @media (max-width: 560px) {
+            .nav-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            .terminal-hero::after {
+                animation: none;
+            }
+            .agent-card,
+            .stButton > button {
+                transition: none;
             }
         }
         </style>
@@ -1797,9 +3319,7 @@ def render_sidebar() -> None:
             value=bool(st.session_state.allow_live_execution),
             help="默认关闭。开启后服务端仍会要求显式 allow_live=true。",
         )
-        if st.session_state.pending_trade:
-            with st.expander(t("pending_trade"), expanded=True):
-                st.json(st.session_state.pending_trade)
+        render_pending_trade_panel(show_raw=True)
 
         if selected_provider == "本地规则":
             st.session_state.llm_api_key = ""
@@ -1856,8 +3376,8 @@ def render_sidebar() -> None:
             f"{t('model_key')}: `{mask_secret(st.session_state.llm_api_key) if st.session_state.llm_api_key else t('not_configured_or_not_needed')}`"
         )
         st.write(f"{t('model_name')}: `{st.session_state.llm_model}`")
-        st.caption(f"{t('db_path')}: `{DB_PATH}`")
-        st.caption(f"Agent prompts: `{AGENT_PROMPTS_PATH}`")
+        st.caption(f"{t('db_path')}: `{display_local_path(DB_PATH)}`")
+        st.caption(f"Agent prompts: `{display_local_path(AGENT_PROMPTS_PATH)}`")
 
         st.divider()
         st.subheader(t("history"))
@@ -1875,22 +3395,7 @@ def render_sidebar() -> None:
                 st.write(row["consensus"])
 
         if st.button(t("clear_chat"), width="stretch"):
-            st.session_state.messages = []
-            st.session_state.last_candles = None
-            st.session_state.last_trade_receipt = None
-            st.session_state.last_tick = None
-            st.session_state.last_plan = None
-            st.session_state.prompt_nonce += 1
-            st.session_state.team_events = []
-            st.session_state.runtime_events = []
-            st.session_state.api_trace = []
-            st.session_state.sync_version = 0
-            st.session_state.agent_reports = {}
-            st.session_state.chart_snapshots = []
-            st.session_state.advisor_runs = []
-            st.session_state.last_advisor_result = None
-            st.session_state.agent_execution_log = default_agent_log()
-            st.session_state.messages = [{"role": "assistant", "content": initial_message()}]
+            reset_conversation_state()
             st.rerun()
 
 
@@ -1945,7 +3450,7 @@ def plan_with_openai_compatible(user_text: str, provider: Provider) -> ToolPlan 
         request: dict[str, Any] = {
             "model": st.session_state.llm_model,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": SYSTEM_PROMPT + "\n\n" + llm_lang_instruction()},
                 {"role": "user", "content": user_text},
             ],
             "temperature": 0.1,
@@ -1974,7 +3479,7 @@ def plan_with_anthropic(user_text: str) -> ToolPlan | None:
             model=st.session_state.llm_model,
             max_tokens=700,
             temperature=0.1,
-            system=SYSTEM_PROMPT,
+            system=SYSTEM_PROMPT + "\n\n" + llm_lang_instruction(),
             messages=[{"role": "user", "content": user_text}],
         )
         content = "\n".join(
@@ -2075,7 +3580,7 @@ def local_rule_plan(user_text: str) -> ToolPlan:
             return ToolPlan(
                 action="chat",
                 params={},
-                rationale=f"交易指令缺少 {', '.join(missing)}。",
+                rationale=("交易指令缺少 {" + ", ".join(missing) + "}。" if current_lang() == "zh" else "Trade instruction missing: " + ", ".join(missing) + "."),
             )
         return ToolPlan(
             action="execute_simulated_trade",
@@ -2089,27 +3594,27 @@ def local_rule_plan(user_text: str) -> ToolPlan:
                 "market_read": "tick",
                 "auto_execute": True,
             },
-            rationale="本地规则识别为模拟交易指令。",
+            rationale=("本地规则识别为模拟交易指令。" if current_lang() == "zh" else "Local rule engine identified a simulated trade intent."),
         )
 
     if any(keyword in user_text for keyword in ["K线", "k线", "蜡烛", "历史", "走势"]):
         return ToolPlan(
             action="get_historical_candles",
             params={"symbol": symbol, "granularity": granularity, "count": count},
-            rationale="本地规则识别为 K 线数据查询。",
+            rationale=("本地规则识别为 K 线数据查询。" if current_lang() == "zh" else "Local rule engine identified a candle data query."),
         )
 
     if any(keyword in user_text for keyword in ["最新", "行情", "报价", "tick", "价格"]):
         return ToolPlan(
             action="get_market_ticks",
             params={"symbol": symbol, "subscribe": False},
-            rationale="本地规则识别为最新行情查询。",
+            rationale=("本地规则识别为最新行情查询。" if current_lang() == "zh" else "Local rule engine identified a latest tick query."),
         )
 
     return ToolPlan(
         action="chat",
         params={},
-        rationale="没有识别到明确工具调用，进入普通说明。",
+        rationale=("没有识别到明确工具调用，进入普通说明。" if current_lang() == "zh" else "No specific tool call identified. Entering chat mode."),
     )
 
 
@@ -2121,6 +3626,7 @@ def has_trade_intent(text: str) -> bool:
         "建仓",
         "开仓",
         "平仓",
+        "买",
         "买入",
         "交易",
         "买涨",
@@ -2155,6 +3661,9 @@ def normalize_deriv_symbol(symbol: str) -> str:
     if not raw:
         return DEFAULT_SYMBOL
     upper = raw.upper()
+    compact_volatility = re.fullmatch(r"R(\d+)", upper)
+    if compact_volatility:
+        return f"R_{compact_volatility.group(1)}"
     if upper == "STPRNG":
         return "stpRNG"
     if upper.startswith("FRX") and len(upper) == 9:
@@ -2162,9 +3671,23 @@ def normalize_deriv_symbol(symbol: str) -> str:
     return upper
 
 
+def selected_chart_symbol(selection: str, custom_symbol: str) -> str:
+    raw = (custom_symbol or "").strip() or (selection or "").strip() or DEFAULT_SYMBOL
+    return normalize_deriv_symbol(raw)
+
+
+def chart_granularity_label(seconds: int) -> str:
+    seconds = int(seconds)
+    if seconds >= 3600 and seconds % 3600 == 0:
+        hours = seconds // 3600
+        return f"{hours}小时" if current_lang() == "zh" else f"{hours}h"
+    minutes = max(1, seconds // 60)
+    return f"{minutes}分钟" if current_lang() == "zh" else f"{minutes}m"
+
+
 def extract_symbol(text: str) -> str:
     symbol_match = re.search(
-        r"\b(?:R_\d+|1HZ\d+V|BOOM\d+|CRASH\d+|JD\d+|RDBULL|RDBEAR|stpRNG|frx[A-Za-z]{6})\b",
+        r"\b(?:R_?\d+|1HZ\d+V|BOOM\d+|CRASH\d+|JD\d+|RDBULL|RDBEAR|stpRNG|frx[A-Za-z]{6})\b",
         text,
         flags=re.IGNORECASE,
     )
@@ -2232,6 +3755,72 @@ def extract_duration_unit(text: str) -> str:
     return "m"
 
 
+def trade_missing_fields(user_text: str) -> list[str]:
+    missing = []
+    if extract_amount(user_text) <= 0:
+        missing.append("金额 amount")
+    if extract_contract_type(user_text) not in {"CALL", "PUT"}:
+        missing.append("方向 CALL/PUT")
+    return missing
+
+
+def determine_agent_route(user_text: str) -> dict[str, Any]:
+    symbol = extract_symbol(user_text)
+    amount = extract_amount(user_text)
+    contract_type = extract_contract_type(user_text)
+    duration = extract_duration(user_text)
+    duration_unit = extract_duration_unit(user_text)
+    if duration <= 0:
+        duration = 5
+        duration_unit = "t"
+
+    trade_intent = has_trade_intent(user_text)
+    missing = trade_missing_fields(user_text) if trade_intent else []
+    wants_chart = any(keyword in user_text for keyword in ["图", "K线", "k线", "chart", "表格", "走势", "蜡烛"])
+    wants_market = any(
+        keyword in user_text for keyword in ["走势", "Tick", "tick", "行情", "价格", "报价", "连续", "最新价"]
+    )
+
+    route = ["strategy"]
+    if wants_chart:
+        route.append("chart")
+    if trade_intent:
+        if missing:
+            route.extend(["risk", "compliance"])
+        else:
+            route.extend(["market", "risk", "compliance", "execution"])
+    elif wants_market and "chart" not in route:
+        route.append("market")
+    route.append("report")
+
+    compact_route = []
+    for agent_id in route:
+        if agent_id not in compact_route:
+            compact_route.append(agent_id)
+
+    guardrails = []
+    if trade_intent and missing:
+        guardrails.append("missing_trade_parameters")
+    if any(word in user_text.lower() for word in ["all in", "满仓", "梭哈"]):
+        guardrails.append("excessive_risk_language")
+
+    return {
+        "symbol": symbol,
+        "amount": amount,
+        "contract_type": contract_type,
+        "duration": duration,
+        "duration_unit": duration_unit,
+        "route": compact_route,
+        "missing_fields": missing,
+        "guardrails": guardrails,
+    }
+
+
+def team_graph_route_label(route: list[str]) -> str:
+    names = [agent_name(agent_id) if agent_id in AGENT_SPECS else agent_id for agent_id in route]
+    return " -> ".join(names)
+
+
 def extract_condition(text: str) -> dict[str, Any] | None:
     patterns = [
         (r"(?:价格|报价|最新价|tick)?\s*(?:大于等于|不低于|高于等于)\s*(\d+(?:\.\d+)?)", ">="),
@@ -2250,6 +3839,26 @@ def extract_condition(text: str) -> dict[str, Any] | None:
 
 def advisor_name(advisor: dict[str, str], lang: str | None = None) -> str:
     return advisor["zh_name"] if (lang or current_lang()) == "zh" else advisor["en_name"]
+def translate_advisor_role(role: str) -> str:
+    """Translate a Chinese advisor role to the current language."""
+    if current_lang() == "zh":
+        return role
+    role_map = {a["zh_role"]: a["en_role"] for a in ADVISOR_SPECS}
+    return role_map.get(role, role)
+
+def translate_advisor_name(name: str) -> str:
+    """Translate a Chinese advisor name to the current language."""
+    if current_lang() == "zh":
+        return name
+    name_map = {a["zh_name"]: a["en_name"] for a in ADVISOR_SPECS}
+    return name_map.get(name, name)
+
+def translate_advisor_votes(vote_counts: dict[str, int]) -> dict[str, int]:
+    """Translate Chinese advisor names in vote counts to current language."""
+    if current_lang() == "zh":
+        return vote_counts
+    name_map = {a["zh_name"]: a["en_name"] for a in ADVISOR_SPECS}
+    return {name_map.get(k, k): v for k, v in vote_counts.items()}
 
 
 def advisor_role(advisor: dict[str, str], lang: str | None = None) -> str:
@@ -2439,7 +4048,7 @@ def advisor_market_snapshot(
                 "change_pct": change_pct,
                 "ma5": ma5,
                 "ma20": ma20,
-                "summary": f"{symbol} 60m window trend={trend}, change={change_pct:+.2f}%, ma5={ma5:.5g}, ma20={ma20:.5g}",
+                "summary": f"{symbol} 60m window trend={trend}, change={change_pct:+.2f}%, ma5={ma5:.5g}, ma20={ma20:.5g}" if current_lang() == "zh" else f"{symbol} 60m trend={trend}, change={change_pct:+.2f}%, ma5={ma5:.5g}, ma20={ma20:.5g}",
             }
         )
     elif latest_quote is not None:
@@ -2483,24 +4092,44 @@ def local_advisor_opinion(
     latest = market.get("latest_close") or (market.get("tick") or {}).get("quote")
     if advisor_id == "risk":
         stance = "WAIT" if base_stance != "WAIT" and source_count == 0 else base_stance
-        rationale = "没有网页确认时降低仓位和冲动；若要做，只做 demo 小额并保留撤退条件。"
-        invalidation = "最新 Tick 反向突破或连续三根反向波动。"
+        rationale = ("没有网页确认时降低仓位和冲动；若要做，只做 demo 小额并保留撤退条件。"
+                     if (lang or current_lang()) == "zh"
+                     else "No web confirmation; reduce sizing and impulse. If trading, use demo micro-size and keep exit conditions.")
+        invalidation = ("最新 Tick 反向突破或连续三根反向波动。"
+                        if (lang or current_lang()) == "zh"
+                        else "Latest tick reverses direction or three consecutive opposing candles.")
     elif advisor_id == "contrarian":
         stance = "WAIT" if base_stance in {"CALL", "PUT"} else "CALL" if trend == "down" else "PUT"
-        rationale = "反方视角：短线共识可能已经被价格吸收，必须等下一根确认。"
-        invalidation = "若价格继续沿原方向扩大并伴随新闻确认，反方观点失效。"
+        rationale = ("反方视角：短线共识可能已经被价格吸收，必须等下一根确认。"
+                     if (lang or current_lang()) == "zh"
+                     else "Devil's advocate: short-term consensus may already be priced in. Wait for the next candle to confirm.")
+        invalidation = ("若价格继续沿原方向扩大并伴随新闻确认，反方观点失效。"
+                        if (lang or current_lang()) == "zh"
+                        else "If price continues in the original direction with news confirmation, the contrarian view is invalidated.")
     elif advisor_id == "quant":
         stance = base_stance
-        rationale = f"量化视角看 {market.get('summary')}；趋势不干净就不追。"
-        invalidation = "MA5/MA20 关系反转，或最新价跌回本轮窗口中位。"
+        rationale = (f"量化视角看 {market.get('summary')}；趋势不干净就不追。"
+                     if (lang or current_lang()) == "zh"
+                     else f"Quant view of {market.get('summary')}; don't chase unless the trend is clean.")
+        invalidation = ("MA5/MA20 关系反转，或最新价跌回本轮窗口中位。"
+                        if (lang or current_lang()) == "zh"
+                        else "MA5/MA20 reverses, or latest price falls back to the mid-point of the current window.")
     elif advisor_id == "macro":
         stance = base_stance if news_signal.get("label") != "mixed" else "WAIT"
-        rationale = f"网页情绪={news_signal.get('label')}，来源={source_count} 条；没有外部催化就不加速。"
-        invalidation = "出现新的高影响消息或相关新闻标题方向反转。"
+        rationale = (f"网页情绪={news_signal.get('label')}，来源={source_count} 条；没有外部催化就不加速。"
+                     if (lang or current_lang()) == "zh"
+                     else f"Web sentiment={news_signal.get('label')}, sources={source_count}; don't accelerate without external catalysts.")
+        invalidation = ("出现新的高影响消息或相关新闻标题方向反转。"
+                        if (lang or current_lang()) == "zh"
+                        else "New high-impact news appears or related headlines reverse direction.")
     else:
         stance = base_stance
-        rationale = f"盘口节奏倾向 {base_stance}，最新价/收盘={latest}；等待短周期确认后再交给执行链。"
-        invalidation = "报价停滞、跳动变慢或连续反向 Tick。"
+        rationale = (f"盘口节奏倾向 {base_stance}，最新价/收盘={latest}；等待短周期确认后再交给执行链。"
+                     if (lang or current_lang()) == "zh"
+                     else f"Flow rhythm leans {base_stance}, latest/close={latest}; wait for short-cycle confirmation before passing to execution.")
+        invalidation = ("报价停滞、跳动变慢或连续反向 Tick。"
+                        if (lang or current_lang()) == "zh"
+                        else "Quotes stall, ticks slow, or consecutive opposing ticks appear.")
     return {
         "advisor_id": advisor_id,
         "name": advisor_name(advisor, lang),
@@ -2522,11 +4151,17 @@ def consensus_from_opinions(opinions: list[dict[str, Any]], market: dict[str, An
     web_bonus = min(len(sources), 6) * 0.025
     confidence = min(0.92, max(0.25, support * 0.62 + data_bonus + web_bonus))
     if winner == "CALL":
-        summary = "谋士团偏向看涨/做多，但只建议进入原交易链复核，不直接下单。"
+        summary = ("谋士团偏向看涨/做多，但只建议进入原交易链复核，不直接下单。"
+                   if current_lang() == "zh"
+                   else "Council leans bullish/long, but only recommends review by the trading chain; do not place orders directly.")
     elif winner == "PUT":
-        summary = "谋士团偏向看跌/做空，但只建议进入原交易链复核，不直接下单。"
+        summary = ("谋士团偏向看跌/做空，但只建议进入原交易链复核，不直接下单。"
+                   if current_lang() == "zh"
+                   else "Council leans bearish/short, but only recommends review by the trading chain; do not place orders directly.")
     else:
-        summary = "谋士团建议等待，当前信息不足以支持短线立即出手。"
+        summary = ("谋士团建议等待，当前信息不足以支持短线立即出手。"
+                   if current_lang() == "zh"
+                   else "Council recommends waiting; current data is insufficient for short-term action.")
     return {
         "stance": winner,
         "summary": summary,
@@ -2557,12 +4192,17 @@ def advisor_llm_synthesis(
         f"- {item['name']}: {item['stance']} | {item['rationale']} | invalidation: {item['invalidation']}"
         for item in opinions
     )
+    _zdir = "方向" if current_lang() == "zh" else "Direction"
+    _zconf = "置信度" if current_lang() == "zh" else "Confidence"
+    _zpreq = "执行前提" if current_lang() == "zh" else "Execution prerequisite"
+    _zfail = "失效条件" if current_lang() == "zh" else "Invalidation condition"
+    _zentry = "入场参考价" if current_lang() == "zh" else "Entry reference price"
     prompt = f"""
 你是首席谋士。你的专属 prompt：
 {agent_prompt("advisor.chief")}
 
 请基于下列材料，在 120 字以内给老板一个短线交易决策建议。
-要求：必须包含 方向(CALL/PUT/WAIT)、置信度、执行前提、失效条件。不要建议绕过人工确认。
+要求：必须包含 {_zdir}(CALL/PUT/WAIT)、{_zconf}、{_zpreq}、{_zfail}。不要建议绕过人工确认。
 
 问题: {question}
 Symbol: {symbol}
@@ -2592,7 +4232,7 @@ Symbol: {symbol}
             response = client.chat.completions.create(
                 model=st.session_state.llm_model,
                 messages=[
-                    {"role": "system", "content": "你输出简洁、可审计、适合短线交易前复核的中文建议。"},
+                    {"role": "system", "content": ("你输出简洁、可审计、适合短线交易前复核的中文建议。" if current_lang() == "zh" else "You output concise, auditable recommendations suitable for short-term trading review. Output in English.")},
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.15,
@@ -2607,7 +4247,7 @@ Symbol: {symbol}
                 model=st.session_state.llm_model,
                 max_tokens=220,
                 temperature=0.15,
-                system="你输出简洁、可审计、适合短线交易前复核的中文建议。",
+                system=("你输出简洁、可审计、适合短线交易前复核的中文建议。" if current_lang() == "zh" else "You output concise, auditable recommendations suitable for short-term trading review. Output in English."),
                 messages=[{"role": "user", "content": prompt}],
             )
             return "\n".join(
@@ -2616,6 +4256,103 @@ Symbol: {symbol}
     except Exception:
         return None
     return None
+
+
+def llm_provider_ready() -> bool:
+    if not in_streamlit_runtime():
+        return False
+    provider: Provider = st.session_state.llm_provider
+    if provider == "本地规则" or not st.session_state.llm_api_key:
+        return False
+    if provider == "OpenAI-Compatible" and not st.session_state.custom_base_url.strip():
+        return False
+    return True
+
+
+def agent_ai_brief(
+    agent_id: str,
+    *,
+    task: str,
+    context: dict[str, Any],
+    max_tokens: int = 220,
+) -> str | None:
+    if not llm_provider_ready():
+        return None
+    provider: Provider = st.session_state.llm_provider
+    prompt = f"""
+你是一个多 Agent 交易系统里的独立子 Agent。
+你的身份 prompt：
+{agent_prompt(agent_id)}
+
+你自己的最近上下文记忆：
+{agent_memory_summary(agent_id)}
+
+请只基于给定上下文输出你的专业结论。
+要求：
+- 用中文，80-160 字。
+- 说清楚你看到的数据、你的判断、下一步。
+- 如果是执行/风控/合规相关，不允许建议绕过人工确认、Token 检查、demo/live 安全边界。
+- 不要输出 Markdown 表格，不要输出隐藏推理。
+
+任务: {task}
+上下文 JSON:
+{json.dumps(context, ensure_ascii=False, default=str)[:4000]}
+""".strip()
+    try:
+        if provider in {"OpenAI", "DeepSeek", "OpenAI-Compatible"}:
+            from openai import OpenAI
+
+            base_url = OPENAI_COMPATIBLE_BASE_URLS.get(provider)
+            if provider == "OpenAI-Compatible":
+                base_url = st.session_state.custom_base_url.strip() or None
+            kwargs: dict[str, Any] = {"api_key": st.session_state.llm_api_key, "timeout": 8.0}
+            if base_url:
+                kwargs["base_url"] = base_url
+            client = OpenAI(**kwargs)
+            response = client.chat.completions.create(
+                model=st.session_state.llm_model,
+                messages=[
+                    {"role": "system", "content": ("你是交易系统里的专业子 Agent，只输出可审计的中文行动结论。" if current_lang() == "zh" else "You are a specialized sub-agent in the trading system. Output only auditable, actionable conclusions in English.")},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.15,
+                max_tokens=max_tokens,
+            )
+            return (response.choices[0].message.content or "").strip() or None
+        if provider == "Anthropic":
+            from anthropic import Anthropic
+
+            client = Anthropic(api_key=st.session_state.llm_api_key, timeout=8.0)
+            response = client.messages.create(
+                model=st.session_state.llm_model,
+                max_tokens=max_tokens,
+                temperature=0.15,
+                system=("你是交易系统里的专业子 Agent，只输出可审计的中文行动结论。" if current_lang() == "zh" else "You are a specialized sub-agent in the trading system. Output only auditable, actionable conclusions in English."),
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return "\n".join(
+                block.text for block in response.content if getattr(block, "type", None) == "text"
+            ).strip() or None
+    except Exception as exc:
+        return f"AI 子 Agent 调用失败，已使用本地安全逻辑兜底：{exc}"
+    return None
+
+
+def attach_agent_ai_brief(
+    report: dict[str, Any],
+    agent_id: str,
+    *,
+    task: str,
+    context: dict[str, Any],
+    events: list[AgentEvent],
+    writer: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    brief = agent_ai_brief(agent_id, task=task, context=context)
+    report["ai_enabled"] = llm_provider_ready()
+    if brief:
+        report["ai_brief"] = brief
+        append_team_event(events, agent_name(agent_id), "经理", f"AI判断：{brief}", writer)
+    return report
 
 
 def advisor_langgraph_available() -> bool:
@@ -2820,6 +4557,7 @@ def run_advisor_council(
         runtime = "local_fallback"
 
     elapsed_ms = (time.perf_counter() - started) * 1000
+    entry_price = advisor_entry_price(market)
     result = {
         "ok": True,
         "question": question,
@@ -2837,6 +4575,8 @@ def run_advisor_council(
         "stance": stance,
         "confidence": confidence,
         "vote_counts": vote_counts,
+        "entry_price": entry_price,
+        "evaluation": evaluate_advisor_outcome(stance, entry_price, None, confidence),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     if in_streamlit_runtime():
@@ -2903,8 +4643,170 @@ def push_runtime_event(
         "message": message,
         "payload": payload or {},
     }
-    st.session_state.runtime_events = (st.session_state.runtime_events + [event])[-120:]
-    st.session_state.sync_version = int(st.session_state.get("sync_version", 0)) + 1
+    append_runtime_event_to_state(st.session_state, event)
+
+
+def append_runtime_event_to_state(state: Any, event: dict[str, Any], limit: int = 120) -> None:
+    current_events = list(state.get("runtime_events", []))
+    state["runtime_events"] = (current_events + [event])[-limit:]
+    state["sync_version"] = int(state.get("sync_version", 0)) + 1
+
+
+def active_trade_case() -> dict[str, Any] | None:
+    case_id = st.session_state.get("active_trade_case_id")
+    if not case_id:
+        return None
+    case = get_trade_case(DB_PATH, str(case_id))
+    if case is None:
+        st.session_state.active_trade_case_id = None
+    return case
+
+
+def create_active_trade_case(objective: str, symbol: str, title: str = "") -> dict[str, Any]:
+    case = create_trade_case(
+        DB_PATH,
+        objective=objective,
+        symbol=normalize_deriv_symbol(symbol),
+        title=title,
+    )
+    st.session_state.active_trade_case_id = case["id"]
+    push_runtime_event(
+        "trade_case",
+        "Operator",
+        "Trade Case",
+        f"{case['id']} created",
+        {"case_id": case["id"], "symbol": case["symbol"], "version": case["version"]},
+    )
+    return case
+
+
+def sync_active_trade_case_artifact(
+    artifact_type: str,
+    *,
+    actor: str,
+    message: str,
+    payload: dict[str, Any],
+    auto_create_objective: str | None = None,
+    symbol: str = DEFAULT_SYMBOL,
+) -> dict[str, Any] | None:
+    if not in_streamlit_runtime():
+        return None
+    case = active_trade_case()
+    if case is None and auto_create_objective:
+        case = create_active_trade_case(auto_create_objective, symbol)
+    if case is None or case.get("status") != "active":
+        return case
+
+    for _attempt in range(3):
+        try:
+            updated = record_trade_case_artifact(
+                DB_PATH,
+                str(case["id"]),
+                artifact_type=artifact_type,
+                actor=actor,
+                message=message,
+                payload=payload,
+                expected_version=int(case["version"]),
+            )
+            push_runtime_event(
+                "trade_case",
+                actor,
+                str(case["id"]),
+                message,
+                {
+                    "case_id": case["id"],
+                    "artifact_type": artifact_type,
+                    "stage": updated["stage"],
+                    "version": updated["version"],
+                },
+            )
+            return updated
+        except TradeCaseConflict:
+            refreshed = get_trade_case(DB_PATH, str(case["id"]))
+            if refreshed is None or refreshed.get("status") != "active":
+                return refreshed
+            case = refreshed
+        except TradeCaseTransitionError:
+            return get_trade_case(DB_PATH, str(case["id"]))
+    return get_trade_case(DB_PATH, str(case["id"]))
+
+
+def set_pending_trade_state(pending: dict[str, Any], *, source: str) -> None:
+    st.session_state.pending_trade = pending
+    sync_active_trade_case_artifact(
+        "pending_trade",
+        actor=source,
+        message="Trade proposal is waiting for human confirmation",
+        payload={key: value for key, value in pending.items() if key != "api_token"},
+        auto_create_objective=f"Review and execute {pending.get('symbol') or DEFAULT_SYMBOL} trade",
+        symbol=str(pending.get("symbol") or DEFAULT_SYMBOL),
+    )
+
+
+def record_trade_receipt_state(receipt_result: dict[str, Any], *, source: str) -> None:
+    st.session_state.last_trade_receipt = receipt_result
+    receipt = ((receipt_result.get("data") or {}).get("receipt") or (receipt_result.get("data") or {}).get("sell") or {})
+    sync_active_trade_case_artifact(
+        "trade_receipt",
+        actor=source,
+        message="Trade receipt recorded; case completed",
+        payload=receipt,
+    )
+
+
+def append_agent_memory_to_state(
+    state: Any,
+    agent_id: str,
+    memory: dict[str, Any],
+    limit: int = 20,
+    persist: bool = False,
+) -> None:
+    memories = dict(state.get("agent_memory", {}) or {})
+    current = list(memories.get(agent_id, []))
+    memories[agent_id] = (current + [memory])[-limit:]
+    state["agent_memory"] = memories
+    if persist:
+        save_agent_memory_item(agent_id, memory)
+
+
+def recent_agent_memory(agent_id: str, limit: int = 5) -> list[dict[str, Any]]:
+    memories = st.session_state.get("agent_memory", {}) or {}
+    return list(memories.get(agent_id, []))[-limit:]
+
+
+def agent_memory_summary(agent_id: str, limit: int = 5) -> str:
+    memories = recent_agent_memory(agent_id, limit)
+    if not memories:
+        return "无历史记忆。"
+    lines = []
+    for item in memories:
+        summary = str(item.get("summary") or item.get("task") or "").strip()
+        if not summary:
+            continue
+        lines.append(f"- {item.get('time', '')} {summary}")
+    return "\n".join(lines) or "无历史记忆。"
+
+
+def reset_conversation_state() -> None:
+    st.session_state.messages = [{"role": "assistant", "content": initial_message()}]
+    st.session_state.last_candles = None
+    st.session_state.last_trade_receipt = None
+    st.session_state.last_tick = None
+    st.session_state.last_plan = None
+    st.session_state.pending_trade = None
+    st.session_state.confirm_next_trade = False
+    st.session_state.prompt_nonce += 1
+    st.session_state.team_events = []
+    st.session_state.runtime_events = []
+    st.session_state.api_trace = []
+    st.session_state.sync_version = 0
+    st.session_state.agent_reports = {}
+    st.session_state.agent_memory = {}
+    st.session_state.chart_snapshots = []
+    st.session_state.advisor_runs = []
+    st.session_state.advisor_evaluations = []
+    st.session_state.last_advisor_result = None
+    st.session_state.agent_execution_log = default_agent_log()
 
 
 def format_runtime_events(limit: int = 30) -> str:
@@ -2915,6 +4817,61 @@ def format_runtime_events(limit: int = 30) -> str:
         f"{item['time']} [{item['kind']}] {item['source']} -> {item['target']}: {item['message']}"
         for item in events
     )
+
+
+def agent_timeline_html(limit: int = 24) -> str:
+    events = st.session_state.get("team_events", [])[-limit:]
+    if not events:
+        return f"*{html.escape(t('timeline_empty'))}*"
+    items = []
+    for line in events:
+        if "➔" in line:
+            route, _, message = line.partition("：")
+            route = route.strip("[] ")
+            source, _, target = route.partition("➔")
+            src = role_name(source.strip())
+            tgt = role_name(target.strip())
+            body = translate_message(message.strip())
+            if tgt == "Graph":
+                title = f"{src} planned"
+            elif tgt == "User":
+                title = f"{src} summarized"
+            elif src == "User":
+                title = f"{src} asked {tgt}"
+            else:
+                title = f"{src} → {tgt}"
+            body = re.sub(r"^LangGraph 路由[：:]\s*", "", body)
+            body = re.sub(r"^AI判断[：:]\s*", "", body)
+        else:
+            title = "Agent"
+            body = translate_message(line)
+        items.append(f"**{title}**  \n{body}\n")
+    return "\n\n".join(items)
+
+
+def render_agent_timeline(limit: int = 24) -> None:
+    st.markdown(agent_timeline_html(limit), unsafe_allow_html=True)
+
+
+def render_agent_memory_panel() -> None:
+    st.markdown(f"#### {t('agent_memory')}")
+    memories = st.session_state.get("agent_memory", {}) or {}
+    if not memories:
+        st.caption(t("memory_empty"))
+        return
+    tabs = st.tabs([agent_name(agent_id) if agent_id in AGENT_SPECS else agent_id for agent_id in memories.keys()])
+    for tab, (agent_id, items) in zip(tabs, memories.items(), strict=False):
+        with tab:
+            for item in list(items)[-8:]:
+                st.markdown(
+                    f"""
+                    <div class="memory-item">
+                      <div class="memory-time">{html.escape(str(item.get('time') or ''))}</div>
+                      <div class="memory-summary">{html.escape(str(item.get('summary') or item.get('task') or ''))}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
 
 def record_api_trace(
@@ -3054,6 +5011,23 @@ def agent_role(agent_id: str) -> str:
 
 
 def remember_agent_report(agent_id: str, report: dict[str, Any]) -> None:
+    summary = (
+        str(report.get("ai_brief") or "")
+        or str(report.get("summary") or "")
+        or str(report.get("status") or "")
+        or str(report.get("role") or "")
+    )
+    append_agent_memory_to_state(
+        st.session_state,
+        agent_id,
+        {
+            "time": datetime.now(LOCAL_TZ).strftime("%H:%M:%S"),
+            "task": str(report.get("task") or report.get("symbol") or report.get("role") or agent_id),
+            "summary": summary[:800],
+            "ok": bool(report.get("ok", True)),
+        },
+        persist=True,
+    )
     st.session_state.agent_reports[agent_id] = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "report": report,
@@ -3067,15 +5041,21 @@ def remember_agent_report(agent_id: str, report: dict[str, Any]) -> None:
     )
 
 
+def chart_snapshot_id(symbol: str, created_at: datetime) -> str:
+    return f"{symbol}-{created_at.strftime('%Y%m%dT%H%M%S%fZ')}"
+
+
 def add_chart_snapshot(result: dict[str, Any], source: str = "agent") -> None:
     if not result or not result.get("ok"):
         return
     data = result.get("data") or {}
+    created_at = datetime.now(timezone.utc)
+    symbol = str(data.get("symbol", DEFAULT_SYMBOL))
     snapshot = {
-        "id": f"{data.get('symbol', DEFAULT_SYMBOL)}-{datetime.now(timezone.utc).strftime('%H%M%S')}",
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "id": chart_snapshot_id(symbol, created_at),
+        "created_at": created_at.isoformat(),
         "source": source,
-        "symbol": data.get("symbol", DEFAULT_SYMBOL),
+        "symbol": symbol,
         "granularity": data.get("granularity", DEFAULT_GRANULARITY),
         "count": data.get("returned_count", DEFAULT_COUNT),
         "result": result,
@@ -3094,6 +5074,18 @@ def add_chart_snapshot(result: dict[str, Any], source: str = "agent") -> None:
         "Chart Snapshots",
         f"{snapshot['symbol']} snapshot synced",
         {"snapshot_id": snapshot["id"], "count": snapshot["count"]},
+    )
+    sync_active_trade_case_artifact(
+        "chart",
+        actor=source,
+        message=f"{snapshot['symbol']} chart snapshot validated",
+        payload={
+            "snapshot_id": snapshot["id"],
+            "symbol": snapshot["symbol"],
+            "granularity": snapshot["granularity"],
+            "count": snapshot["count"],
+            "created_at": snapshot["created_at"],
+        },
     )
 
 
@@ -3229,6 +5221,14 @@ def market_analyst_agent(
         )
     report["summary"] = summary
     append_team_event(events, "行情分析师", "经理", summary, writer)
+    attach_agent_ai_brief(
+        report,
+        "market",
+        task=task,
+        context={"symbol": symbol, "tick_analysis": tick_analysis, "candle_result": candle_result},
+        events=events,
+        writer=writer,
+    )
     remember_agent_report("market", report)
     return report
 
@@ -3257,6 +5257,14 @@ def strategy_agent(
         f"我把目标拆成 5 步：先看 {symbol} 行情，再做风控和合规检查，条件满足才交给执行交易员。"
     )
     append_team_event(events, "策略研究员", "经理", summary, writer)
+    attach_agent_ai_brief(
+        plan,
+        "strategy",
+        task=task,
+        context={"symbol": symbol, "market": market, "local_plan": plan},
+        events=events,
+        writer=writer,
+    )
     remember_agent_report("strategy", plan)
     return plan
 
@@ -3278,6 +5286,14 @@ def risk_sentinel_agent(
             "reason": "missing_deriv_api_token",
         }
         append_team_event(events, "风控官", "经理", "我无法检查账户：还没有配置 Deriv API Token。", writer)
+        attach_agent_ai_brief(
+            report,
+            "risk",
+            task=task,
+            context={"symbol": symbol, "amount": amount, "risk_status": report},
+            events=events,
+            writer=writer,
+        )
         remember_agent_report("risk", report)
         return report
     account_result = call_deriv_tool(
@@ -3295,6 +5311,14 @@ def risk_sentinel_agent(
         "status": "cleared" if account_result.get("ok") else "blocked",
     }
     append_team_event(events, "风控官", "经理", "账户检查完成。若金额和方向明确，可进入合规审查和执行。", writer)
+    attach_agent_ai_brief(
+        report,
+        "risk",
+        task=task,
+        context={"symbol": symbol, "amount": amount, "account_result": account_result, "risk_status": report},
+        events=events,
+        writer=writer,
+    )
     remember_agent_report("risk", report)
     return report
 
@@ -3326,6 +5350,14 @@ def compliance_agent(
     else:
         summary = "合规检查通过：指令边界清楚，可以继续。"
     append_team_event(events, "合规审查员", "经理", summary, writer)
+    attach_agent_ai_brief(
+        report,
+        "compliance",
+        task=task,
+        context={"amount": amount, "contract_type": contract_type, "local_compliance": report},
+        events=events,
+        writer=writer,
+    )
     remember_agent_report("compliance", report)
     return report
 
@@ -3365,6 +5397,14 @@ def chart_engineer_agent(
         else f"图表生成失败：{(result.get('error') or {}).get('message', 'unknown error')}",
         writer,
     )
+    attach_agent_ai_brief(
+        report,
+        "chart",
+        task=task,
+        context={"symbol": symbol, "granularity": granularity, "count": count, "chart_result": result},
+        events=events,
+        writer=writer,
+    )
     remember_agent_report("chart", report)
     return report
 
@@ -3384,6 +5424,14 @@ def report_agent(
         "chart_snapshots": len(st.session_state.chart_snapshots),
         "latest_receipt": ((st.session_state.last_trade_receipt or {}).get("data") or {}).get("receipt"),
     }
+    attach_agent_ai_brief(
+        report,
+        "report",
+        task=task,
+        context={"events": [event.line() for event in events], "report": report},
+        events=events,
+        writer=writer,
+    )
     append_team_event(events, "报告员", "经理", "我已整理执行时间线、活跃 Agent 和本地可审计记录。", writer)
     remember_agent_report("report", report)
     return report
@@ -3426,6 +5474,22 @@ def execution_agent(
             "无法执行：左侧未配置 Deriv API Token。请使用 demo token 后再下单。",
             writer,
         )
+        attach_agent_ai_brief(
+            report,
+            "execution",
+            task=task,
+            context={
+                "symbol": symbol,
+                "amount": amount,
+                "contract_type": contract_type,
+                "duration": duration,
+                "duration_unit": duration_unit,
+                "execution_status": report,
+            },
+            events=events,
+            writer=writer,
+        )
+        remember_agent_report("execution", report)
         return report
 
     close_intent = has_close_intent(task)
@@ -3441,7 +5505,7 @@ def execution_agent(
         "allow_live": bool(st.session_state.allow_live_execution),
     }
     if st.session_state.require_trade_confirmation and not st.session_state.confirm_next_trade:
-        st.session_state.pending_trade = pending
+        set_pending_trade_state(pending, source="execution_agent")
         report = {
             "role": "Execution Trader",
             "ok": False,
@@ -3450,6 +5514,14 @@ def execution_agent(
             "pending_trade": pending,
         }
         append_team_event(events, "执行交易员", "经理", "已拦截写操作：需要老板在侧边栏确认下一笔订单。", writer)
+        attach_agent_ai_brief(
+            report,
+            "execution",
+            task=task,
+            context={"pending_trade": pending, "execution_status": report},
+            events=events,
+            writer=writer,
+        )
         remember_agent_report("execution", report)
         return report
 
@@ -3470,6 +5542,14 @@ def execution_agent(
             "account": account_result.get("data"),
         }
         append_team_event(events, "执行交易员", "经理", "已拦截 live 账户写操作：默认只允许 demo token。", writer)
+        attach_agent_ai_brief(
+            report,
+            "execution",
+            task=task,
+            context={"pending_trade": pending, "account_result": account_result, "execution_status": report},
+            events=events,
+            writer=writer,
+        )
         remember_agent_report("execution", report)
         return report
 
@@ -3491,6 +5571,14 @@ def execution_agent(
                 "open_contract_status": status_result.get("data"),
             }
             append_team_event(events, "执行交易员", "经理", "平仓需要明确 contract_id。我已读取持仓状态供老板选择。", writer)
+            attach_agent_ai_brief(
+                report,
+                "execution",
+                task=task,
+                context={"pending_trade": pending, "account_result": account_result, "open_contract_status": status_result},
+                events=events,
+                writer=writer,
+            )
             remember_agent_report("execution", report)
             return report
         receipt_result = call_deriv_tool(
@@ -3535,7 +5623,7 @@ def execution_agent(
     st.session_state.confirm_next_trade = False
     st.session_state.pending_trade = None
     if receipt_result.get("ok"):
-        st.session_state.last_trade_receipt = receipt_result
+        record_trade_receipt_state(receipt_result, source="execution_agent")
         receipt = ((receipt_result.get("data") or {}).get("receipt") or (receipt_result.get("data") or {}).get("sell") or {})
         report = {
             "role": "Execution Trader",
@@ -3558,6 +5646,14 @@ def execution_agent(
             ),
             writer,
         )
+        attach_agent_ai_brief(
+            report,
+            "execution",
+            task=task,
+            context={"pending_trade": pending, "account_result": account_result, "receipt_result": receipt_result},
+            events=events,
+            writer=writer,
+        )
         remember_agent_report("execution", report)
         return report
 
@@ -3570,6 +5666,14 @@ def execution_agent(
         "error": error_message,
     }
     append_team_event(events, "执行交易员", "经理", f"下单失败：{error_message}", writer)
+    attach_agent_ai_brief(
+        report,
+        "execution",
+        task=task,
+        context={"pending_trade": pending, "account_result": account_result, "receipt_result": receipt_result},
+        events=events,
+        writer=writer,
+    )
     remember_agent_report("execution", report)
     return report
 
@@ -3897,17 +6001,261 @@ def deterministic_manager_summary(
     market_report: dict[str, Any] | None,
     execution_report: dict[str, Any] | None,
 ) -> str:
+    _z = "zh" if current_lang() == "zh" else "en"
     if execution_report and execution_report.get("ok"):
         receipt = execution_report.get("receipt") or {}
-        return (
-            "经理总结：行情员工完成市场检查，执行交易员已通过模拟盘下单。"
-            f"合同 ID：{receipt.get('contract_id')}，成交价：{receipt.get('purchase_price')}。"
-        )
+        if _z == "zh":
+            return (
+                "经理总结：行情员工完成市场检查，执行交易员已通过模拟盘下单。"
+                f"合同 ID：{receipt.get('contract_id')}，成交价：{receipt.get('purchase_price')}。"
+            )
+        else:
+            return (
+                "Manager summary: Market check passed. Execution agent submitted the demo order. "
+                f"Contract ID: {receipt.get('contract_id')}, price: {receipt.get('purchase_price')}."
+            )
     if execution_report and not execution_report.get("ok"):
-        return f"经理总结：交易未完成，原因：{execution_report.get('reason') or execution_report.get('error')}。"
+        if execution_report.get("reason") == "graph_guardrail_blocked":
+            blockers = execution_report.get("blockers") or []
+            blocker_text = ", ".join(str(item) for item in blockers) if blockers else "guardrail_blocked"
+            if _z == "zh":
+                return f"经理总结：图级风控未放行执行，原因：{blocker_text}。没有提交订单。"
+            else:
+                return f"Manager summary: Graph-level guardrail blocked execution. Reason: {blocker_text}. No order was submitted."
+        reason = execution_report.get('reason') or execution_report.get('error')
+        if _z == "zh":
+            return f"经理总结：交易未完成，原因：{reason}。"
+        else:
+            return f"Manager summary: Trade not completed. Reason: {reason}."
     if market_report:
-        return f"经理总结：{market_report.get('summary')}"
-    return "经理总结：当前指令没有形成可执行交易任务。"
+        prefix = "经理总结：" if _z == "zh" else "Manager summary: "
+        return f"{prefix}{market_report.get('summary')}"
+    return "经理总结：当前指令没有形成可执行交易任务。" if _z == "zh" else "Manager summary: No executable trading task was formed."
+
+
+def trading_team_langgraph_available() -> bool:
+    try:
+        import langgraph  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+def initial_team_graph_state(user_text: str) -> TeamGraphState:
+    route_plan = determine_agent_route(user_text)
+    return {
+        "user_text": user_text,
+        "symbol": route_plan["symbol"],
+        "amount": route_plan["amount"],
+        "contract_type": route_plan["contract_type"],
+        "duration": route_plan["duration"],
+        "duration_unit": route_plan["duration_unit"],
+        "route": route_plan["route"],
+        "cursor": 0,
+        "missing_fields": route_plan["missing_fields"],
+        "guardrails": route_plan["guardrails"],
+        "events": [],
+        "market_report": None,
+        "execution_report": None,
+        "agent_reports": {},
+        "final_answer": "",
+        "ok": True,
+    }
+
+
+def team_graph_next_node(state: TeamGraphState) -> str:
+    route = list(state.get("route") or [])
+    cursor = int(state.get("cursor") or 0)
+    if cursor >= len(route):
+        from langgraph.graph import END
+
+        return END
+    return route[cursor]
+
+
+def team_graph_supervisor_node(state: TeamGraphState) -> dict[str, Any]:
+    events = list(state.get("events") or [])
+    if not events:
+        append_team_event(events, "用户", "经理", str(state.get("user_text") or ""), None)
+    route = list(state.get("route") or [])
+    append_team_event(
+        events,
+        "经理",
+        "Graph",
+        f"LangGraph 路由：{team_graph_route_label(route)}",
+        None,
+    )
+    if state.get("guardrails"):
+        append_team_event(events, "经理", "Guardrail", "已启用安全闸门：" + ", ".join(state.get("guardrails") or []), None)
+    return {"events": events, "cursor": int(state.get("cursor") or 0)}
+
+
+def team_graph_agent_args(agent_id: str, state: TeamGraphState) -> dict[str, Any]:
+    user_text = str(state.get("user_text") or "")
+    symbol = str(state.get("symbol") or extract_symbol(user_text))
+    if agent_id == "strategy":
+        return {"task": user_text, "symbol": symbol}
+    if agent_id == "market":
+        return {
+            "task": "按用户目标读取必要行情并判断触发条件。",
+            "symbol": symbol,
+            "tick_count": 10,
+            "granularity": extract_granularity(user_text),
+            "candle_count": extract_count(user_text),
+            "analysis_goal": "consecutive_down" if "跌" in user_text else "consecutive_up" if "涨" in user_text else "tick_trend",
+        }
+    if agent_id == "risk":
+        return {"task": user_text, "symbol": symbol, "amount": float(state.get("amount") or 0)}
+    if agent_id == "compliance":
+        return {
+            "task": user_text,
+            "amount": float(state.get("amount") or 0),
+            "contract_type": str(state.get("contract_type") or ""),
+        }
+    if agent_id == "chart":
+        return {
+            "task": "生成 K 线图表快照。",
+            "symbol": symbol,
+            "granularity": extract_granularity(user_text),
+            "count": extract_count(user_text) if extract_count(user_text) > 0 else 120,
+        }
+    if agent_id == "execution":
+        return {
+            "task": "条件、风控和合规均通过后执行模拟盘订单。",
+            "symbol": symbol,
+            "amount": float(state.get("amount") or 0),
+            "contract_type": str(state.get("contract_type") or "CALL").upper(),
+            "duration": int(state.get("duration") or 5),
+            "duration_unit": str(state.get("duration_unit") or "t"),
+            "risk_note": "LangGraph guardrail approved route; still requires human confirmation if enabled.",
+        }
+    return {"task": "整理 LangGraph 团队协作复盘。"}
+
+
+def team_graph_execution_blockers(state: TeamGraphState) -> list[str]:
+    blockers: list[str] = []
+    missing_fields = list(state.get("missing_fields") or [])
+    if missing_fields:
+        blockers.append("missing_trade_parameters")
+    reports = state.get("agent_reports") or {}
+    risk_report = reports.get("risk") or {}
+    if risk_report and not risk_report.get("ok", True):
+        blockers.append(str(risk_report.get("reason") or risk_report.get("status") or "risk_blocked"))
+    compliance_report = reports.get("compliance") or {}
+    if compliance_report and not compliance_report.get("ok", True):
+        compliance_blockers = compliance_report.get("blockers") or []
+        if compliance_blockers:
+            blockers.extend(str(item) for item in compliance_blockers)
+        else:
+            blockers.append(str(compliance_report.get("status") or "compliance_blocked"))
+    for guardrail in state.get("guardrails") or []:
+        guardrail_text = str(guardrail)
+        if guardrail_text and guardrail_text != "missing_trade_parameters":
+            blockers.append(guardrail_text)
+    return list(dict.fromkeys(blockers))
+
+
+def team_graph_final_answer(state: TeamGraphState) -> str:
+    _z = "zh" if current_lang() == "zh" else "en"
+    missing = list(state.get("missing_fields") or [])
+    if missing:
+        if _z == "zh":
+            return f"经理总结：我识别到交易意图和 {state.get('symbol')}，但缺少交易参数：{', '.join(missing)}。请补充后我再让执行 Agent 进入确认闸门。"
+        else:
+            return f"Manager summary: Trade intent detected for {state.get('symbol')}, but missing parameters: {', '.join(missing)}. Please provide them before the execution agent proceeds."
+    execution_report = state.get("execution_report")
+    market_report = state.get("market_report")
+    if execution_report:
+        return deterministic_manager_summary(market_report, execution_report)
+    if market_report:
+        prefix = "经理总结：" if _z == "zh" else "Manager summary: "
+        return f"{prefix}{market_report.get('summary')}"
+    route = team_graph_route_label(list(state.get("route") or []))
+    if _z == "zh":
+        return f"经理总结：LangGraph 团队已按路线完成协作：{route}。"
+    else:
+        return f"Manager summary: LangGraph team completed the route: {route}."
+
+
+def make_team_graph_agent_node(agent_id: str) -> Callable[[TeamGraphState], dict[str, Any]]:
+    def node(state: TeamGraphState) -> dict[str, Any]:
+        events = list(state.get("events") or [])
+        reports = dict(state.get("agent_reports") or {})
+        args = team_graph_agent_args(agent_id, state)
+        execution_blockers = team_graph_execution_blockers({**state, "agent_reports": reports}) if agent_id == "execution" else []
+        if agent_id == "execution" and execution_blockers:
+            result = {
+                "role": "Execution Trader",
+                "ok": False,
+                "status": "blocked",
+                "reason": "graph_guardrail_blocked",
+                "blockers": execution_blockers,
+            }
+            append_team_event(
+                events,
+                "Guardrail",
+                "执行交易员",
+                ("图级风控未放行执行节点：" if current_lang() == "zh" else "Graph guardrail blocked execution node: ") + ", ".join(execution_blockers),
+                None,
+            )
+        else:
+            result = manager_tool_dispatch(f"assign_task_to_{agent_id}_agent", args, events, None)
+        reports[agent_id] = result
+        updates: dict[str, Any] = {
+            "events": events,
+            "agent_reports": reports,
+            "cursor": int(state.get("cursor") or 0) + 1,
+        }
+        if agent_id == "market":
+            updates["market_report"] = result
+        if agent_id == "execution":
+            updates["execution_report"] = result
+            updates["ok"] = bool(result.get("ok"))
+        if agent_id == "report":
+            final_answer = team_graph_final_answer({**state, **updates})
+            append_team_event(events, "经理", "用户", final_answer, None)
+            publish_team_log(events, build_team_extra_lines(updates.get("market_report") or state.get("market_report"), updates.get("execution_report") or state.get("execution_report")))
+            updates["events"] = events
+            updates["final_answer"] = final_answer
+        return updates
+
+    return node
+
+
+def build_trading_team_langgraph() -> Any:
+    from langgraph.graph import START, StateGraph
+
+    graph = StateGraph(TeamGraphState)
+    graph.add_node("supervisor", team_graph_supervisor_node)
+    for agent_id in ["strategy", "market", "risk", "compliance", "chart", "execution", "report"]:
+        graph.add_node(agent_id, make_team_graph_agent_node(agent_id))
+    graph.add_edge(START, "supervisor")
+    graph.add_conditional_edges("supervisor", team_graph_next_node)
+    for agent_id in ["strategy", "market", "risk", "compliance", "chart", "execution", "report"]:
+        graph.add_conditional_edges(agent_id, team_graph_next_node)
+    return graph.compile()
+
+
+def run_trading_team_langgraph(
+    user_text: str,
+    writer: Callable[[str], None] | None = None,
+) -> TeamRunResult:
+    app = build_trading_team_langgraph()
+    state = app.invoke(initial_team_graph_state(user_text))
+    events = list(state.get("events") or [])
+    if writer:
+        for event in events:
+            writer(localized_event_line(event))
+    final_answer = str(state.get("final_answer") or team_graph_final_answer(state))
+    return TeamRunResult(
+        final_answer=final_answer,
+        events=events,
+        market_report=state.get("market_report"),
+        execution_report=state.get("execution_report"),
+        ok=bool(state.get("ok", True)),
+        agent_reports=state.get("agent_reports") or {},
+    )
 
 
 def deterministic_manager_state_machine(
@@ -4056,16 +6404,41 @@ def run_hierarchical_trading_team(
     writer: Callable[[str], None] | None = None,
 ) -> TeamRunResult:
     events: list[AgentEvent] = []
+    if trading_team_langgraph_available():
+        try:
+            result = run_trading_team_langgraph(user_text, writer)
+            remember_manager_memory(user_text, result)
+            return result
+        except Exception as exc:
+            append_team_event(events, "系统", "经理", f"LangGraph 交易团队失败，切换兜底运行时：{exc}", writer)
     provider: Provider = st.session_state.llm_provider
     if provider in {"OpenAI", "DeepSeek", "OpenAI-Compatible"} and st.session_state.llm_api_key:
         result = manager_with_openai_tool_calling(user_text, events, writer)
         if result:
+            remember_manager_memory(user_text, result)
             return result
     if provider == "Anthropic" and st.session_state.llm_api_key:
         result = manager_with_anthropic_tool_calling(user_text, events, writer)
         if result:
+            remember_manager_memory(user_text, result)
             return result
-    return deterministic_manager_state_machine(user_text, events, writer)
+    result = deterministic_manager_state_machine(user_text, events, writer)
+    remember_manager_memory(user_text, result)
+    return result
+
+
+def remember_manager_memory(user_text: str, result: TeamRunResult) -> None:
+    append_agent_memory_to_state(
+        st.session_state,
+        "manager",
+        {
+            "time": datetime.now(LOCAL_TZ).strftime("%H:%M:%S"),
+            "task": user_text[:240],
+            "summary": result.final_answer[:800],
+            "ok": result.ok,
+        },
+        persist=True,
+    )
 
 
 def reset_agent_log() -> list[str]:
@@ -4154,6 +6527,32 @@ def execute_trade_closed_loop(plan: ToolPlan) -> tuple[dict[str, Any], str]:
         return result, "条件没有满足，智能体没有触发模拟下单。执行链条已写入自动执行日志。"
 
     log.append("4. 自动触发下单: READY")
+    pending = {
+        "action": "execute_simulated_trade",
+        "symbol": params["symbol"],
+        "amount": float(params["amount"]),
+        "contract_type": params["contract_type"],
+        "duration": int(params["duration"]),
+        "duration_unit": params["duration_unit"],
+        "contract_id": None,
+        "allow_live": bool(st.session_state.allow_live_execution),
+        "source": "closed_loop",
+    }
+    if st.session_state.require_trade_confirmation and not st.session_state.confirm_next_trade:
+        set_pending_trade_state(pending, source="closed_loop")
+        result = {
+            "ok": False,
+            "error": {
+                "message": "写操作已进入待确认队列。请先确认下一笔模拟盘订单。",
+                "reason": "pending_human_confirmation",
+                "pending_trade": pending,
+            },
+        }
+        log.append("   order_status=WAITING_CONFIRMATION")
+        log.append("   reason=pending_human_confirmation")
+        publish_agent_log(log)
+        return result, summarize_result(plan, result)
+
     if not st.session_state.deriv_token:
         result = {
             "ok": False,
@@ -4194,7 +6593,7 @@ def execute_trade_closed_loop(plan: ToolPlan) -> tuple[dict[str, Any], str]:
     )
 
     if result.get("ok"):
-        st.session_state.last_trade_receipt = result
+        record_trade_receipt_state(result, source="closed_loop")
         receipt = ((result.get("data") or {}).get("receipt") or {})
         log.append("   order_status=SUCCESS")
         log.append(f"   contract_id={receipt.get('contract_id')}")
@@ -4261,37 +6660,50 @@ def execute_plan(plan: ToolPlan) -> tuple[dict[str, Any], str]:
         return execute_trade_closed_loop(plan)
 
     publish_agent_log(reset_agent_log() + ["1. 普通对话: 未触发工具", "2. 自动触发下单: 无"])
-    return {"ok": True, "data": {}}, "我可以帮你查最新 tick、画 K 线，或执行模拟交易。请给出 symbol、方向、金额和时长。"
+    return {"ok": True, "data": {}}, ("我可以帮你查最新 tick、画 K 线，或执行模拟交易。请给出 symbol、方向、金额和时长。" if current_lang() == "zh" else "I can check the latest tick, draw candles, or execute demo trades. Please provide symbol, direction, amount, and duration.")
 
 
 def summarize_result(plan: ToolPlan, result: dict[str, Any]) -> str:
     if not result.get("ok"):
-        message = (result.get("error") or {}).get("message", "工具调用失败")
-        return f"工具调用没有成功：{message}"
+        message = (result.get("error") or {}).get("message", ("工具调用失败" if current_lang() == "zh" else "Tool call failed"))
+        return f"工具调用没有成功：{message}" if current_lang() == "zh" else f"Tool call did not succeed: {message}"
 
     if plan.action == "get_market_ticks":
         tick = ((result.get("data") or {}).get("tick") or {})
-        return f"{tick.get('symbol')} 最新报价是 {tick.get('quote')}，时间 {tick.get('timestamp')}。"
+        return f"{tick.get('symbol')} 最新报价是 {tick.get('quote')}，时间 {tick.get('timestamp')}。" if current_lang() == "zh" else f"{tick.get('symbol')} latest quote is {tick.get('quote')}, time {tick.get('timestamp')}."
 
     if plan.action == "get_historical_candles":
         data = result.get("data") or {}
-        return f"已获取 {data.get('symbol')} 的 {data.get('returned_count')} 根 K 线，并在下方绘制成蜡烛图。"
+        return f"已获取 {data.get('symbol')} 的 {data.get('returned_count')} 根 K 线，并在下方绘制成蜡烛图。" if current_lang() == "zh" else f"Fetched {data.get('returned_count')} candles for {data.get('symbol')} and rendered the chart below."
 
     if plan.action == "execute_simulated_trade":
         data = result.get("data") or {}
         if data.get("status") == "skipped":
-            return (
-                "条件没有满足，未触发模拟交易。"
-                f"最新价：{data.get('latest_tick')}，条件：{data.get('condition')}。"
-            )
+            if current_lang() == "zh":
+                return (
+                    "条件没有满足，未触发模拟交易。"
+                    f"最新价：{data.get('latest_tick')}，条件：{data.get('condition')}。"
+                )
+            else:
+                return (
+                    "Condition not met. Demo trade was not triggered. "
+                    f"Latest price: {data.get('latest_tick')}, condition: {data.get('condition')}."
+                )
         receipt = ((result.get("data") or {}).get("receipt") or {})
-        return (
-            "模拟交易已提交成功。"
-            f"合约 ID：{receipt.get('contract_id')}，成交价：{receipt.get('purchase_price')} "
-            f"{receipt.get('currency')}。"
-        )
+        if current_lang() == "zh":
+            return (
+                "模拟交易已提交成功。"
+                f"合约 ID：{receipt.get('contract_id')}，成交价：{receipt.get('purchase_price')} "
+                f"{receipt.get('currency')}。"
+            )
+        else:
+            return (
+                "Demo trade submitted successfully. "
+                f"Contract ID: {receipt.get('contract_id')}, purchase price: {receipt.get('purchase_price')} "
+                f"{receipt.get('currency')}."
+            )
 
-    return "已完成。"
+    return ("已完成。" if current_lang() == "zh" else "Completed.")
 
 
 def stream_text(text: str) -> Generator[str, None, None]:
@@ -4318,6 +6730,468 @@ def render_header() -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def global_status_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    advisor = state.get("last_advisor_result") or {}
+    pending_trade = state.get("pending_trade")
+    symbol = (
+        advisor.get("symbol")
+        or (((state.get("last_tick") or {}).get("data") or {}).get("symbol"))
+        or state.get("advisor_symbol")
+        or DEFAULT_SYMBOL
+    )
+    entry_price = advisor.get("entry_price")
+    return {
+        "symbol": symbol,
+        "advisor_stance": advisor.get("stance") or "WAIT",
+        "advisor_confidence": float(advisor.get("confidence") or 0),
+        "entry_price": entry_price,
+        "api_calls": len(state.get("api_trace") or []),
+        "sync_version": int(state.get("sync_version") or 0),
+        "pending_trade": bool(pending_trade),
+    }
+
+
+def timestamp_age_seconds(value: Any, *, now: datetime | None = None) -> float | None:
+    if not value:
+        return None
+    try:
+        parsed = pd.to_datetime(value, utc=True).to_pydatetime()
+    except (TypeError, ValueError):
+        return None
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return round(max(0.0, (current - parsed).total_seconds()), 1)
+
+
+def freshness_item(value: Any, max_age_seconds: int, *, now: datetime | None = None) -> dict[str, Any]:
+    age = timestamp_age_seconds(value, now=now)
+    if age is None:
+        return {"age_seconds": None, "status": "missing", "fresh": False}
+    fresh = age <= max_age_seconds
+    return {
+        "age_seconds": age,
+        "status": "fresh" if fresh else "stale",
+        "fresh": fresh,
+    }
+
+
+def freshness_snapshot(state: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
+    tick = state.get("last_tick") or {}
+    tick_data = tick.get("data") or {}
+    tick_payload = tick_data.get("tick") or {}
+    snapshots = list(state.get("chart_snapshots") or [])
+    latest_chart = snapshots[0] if snapshots else {}
+    chart_timestamp = (
+        latest_chart.get("created_at")
+        or ((state.get("last_candles") or {}).get("timestamp"))
+    )
+    advisor = state.get("last_advisor_result") or {}
+    items = {
+        "tick": freshness_item(
+            tick_payload.get("timestamp") or tick.get("timestamp"),
+            FRESHNESS_LIMITS_SECONDS["tick"],
+            now=now,
+        ),
+        "chart": freshness_item(
+            chart_timestamp,
+            FRESHNESS_LIMITS_SECONDS["chart"],
+            now=now,
+        ),
+        "advisor": freshness_item(
+            advisor.get("created_at"),
+            FRESHNESS_LIMITS_SECONDS["advisor"],
+            now=now,
+        ),
+    }
+    known_count = sum(1 for item in items.values() if item["status"] != "missing")
+    fresh_count = sum(1 for item in items.values() if item["fresh"])
+    stale_count = sum(1 for item in items.values() if item["status"] == "stale")
+    return {
+        "items": items,
+        "known_count": known_count,
+        "fresh_count": fresh_count,
+        "stale_count": stale_count,
+        "missing_count": len(items) - known_count,
+        "ok": known_count > 0 and stale_count == 0,
+    }
+
+
+def render_global_status_bar() -> None:
+    snapshot = global_status_snapshot(dict(st.session_state))
+    freshness = freshness_snapshot(dict(st.session_state))
+    entry = snapshot.get("entry_price")
+    entry_text = f"{float(entry):.5g}" if entry else t("status_none")
+    confidence = float(snapshot.get("advisor_confidence") or 0)
+    pending_text = t("status_yes") if snapshot.get("pending_trade") else t("status_none")
+    freshness_text = (
+        t("status_none")
+        if not freshness["known_count"]
+        else f'{freshness["fresh_count"]}/{freshness["known_count"]}'
+    )
+    st.markdown(
+        f"""
+        <div class="global-status">
+          <div class="status-cell"><span>{html.escape(t("status_symbol"))}</span><strong>{html.escape(str(snapshot["symbol"]))}</strong></div>
+          <div class="status-cell"><span>{html.escape(t("status_advisor"))}</span><strong>{html.escape(str(snapshot["advisor_stance"]))} · {confidence:.0%}</strong></div>
+          <div class="status-cell"><span>{html.escape(t("status_entry"))}</span><strong>{html.escape(entry_text)}</strong></div>
+          <div class="status-cell {'attention' if freshness.get('stale_count') else ''}"><span>{html.escape(t("status_freshness"))}</span><strong>{html.escape(freshness_text)}</strong></div>
+          <div class="status-cell"><span>{html.escape(t("status_api_calls"))}</span><strong>{int(snapshot["api_calls"])}</strong></div>
+          <div class="status-cell"><span>{html.escape(t("status_sync"))}</span><strong>{int(snapshot["sync_version"])}</strong></div>
+          <div class="status-cell {'attention' if snapshot.get('pending_trade') else ''}"><span>{html.escape(t("status_pending"))}</span><strong>{html.escape(pending_text)}</strong></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def safety_gate_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    has_token = bool(str(state.get("deriv_token") or "").strip())
+    requires_confirmation = bool(state.get("require_trade_confirmation"))
+    confirmed_next = bool(state.get("confirm_next_trade"))
+    live_enabled = bool(state.get("allow_live_execution"))
+    pending_trade = bool(state.get("pending_trade"))
+    confirmation_ready = (not requires_confirmation) or confirmed_next
+    freshness = freshness_snapshot(state)
+    return {
+        "has_token": has_token,
+        "requires_confirmation": requires_confirmation,
+        "confirmed_next": confirmed_next,
+        "confirmation_ready": confirmation_ready,
+        "live_enabled": live_enabled,
+        "pending_trade": pending_trade,
+        "data_freshness_ok": bool(freshness["ok"]),
+        "fresh_count": freshness["fresh_count"],
+        "known_freshness_count": freshness["known_count"],
+        "stale_count": freshness["stale_count"],
+        "write_ready": has_token and confirmation_ready and not pending_trade,
+    }
+
+
+def render_safety_gate_panel() -> None:
+    snapshot = safety_gate_snapshot(dict(st.session_state))
+    token_state = t("safety_ready") if snapshot["has_token"] else t("safety_blocked")
+    confirmation_state = (
+        t("safety_ready")
+        if snapshot["confirmation_ready"]
+        else t("safety_required")
+    )
+    live_state = t("safety_enabled") if snapshot["live_enabled"] else t("safety_disabled")
+    pending_state = t("status_yes") if snapshot["pending_trade"] else t("status_none")
+    freshness_state = (
+        t("safety_ready")
+        if snapshot["data_freshness_ok"]
+        else f'{snapshot["fresh_count"]}/{snapshot["known_freshness_count"]}'
+    )
+    cells = [
+        (t("safety_token"), token_state, snapshot["has_token"]),
+        (t("safety_confirmation"), confirmation_state, snapshot["confirmation_ready"]),
+        (t("safety_freshness"), freshness_state, snapshot["data_freshness_ok"]),
+        (t("safety_live"), live_state, not snapshot["live_enabled"]),
+        (t("safety_pending_order"), pending_state, not snapshot["pending_trade"]),
+    ]
+    html_cells = []
+    for label, value, ok in cells:
+        html_cells.append(
+            f"""
+            <div class="safety-cell {'ok' if ok else 'warn'}">
+              <span>{html.escape(label)}</span>
+              <strong>{html.escape(value)}</strong>
+            </div>
+            """.strip()
+        )
+    st.markdown(
+        f"""
+        <div class="safety-panel">
+          <div class="safety-title">{html.escape(t("safety_gate_panel"))}</div>
+          <div class="safety-grid">{''.join(html_cells)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def advisor_trade_alignment(pending: dict[str, Any], advisor: dict[str, Any] | None) -> str:
+    action = str(pending.get("action") or "")
+    if action == "close_open_contract":
+        return "close_action"
+    if not advisor:
+        return "no_advisor"
+    pending_symbol = str(pending.get("symbol") or "")
+    advisor_symbol = str(advisor.get("symbol") or "")
+    if pending_symbol and advisor_symbol and pending_symbol != advisor_symbol:
+        return "symbol_mismatch"
+    advisor_stance = str(advisor.get("stance") or "WAIT").upper()
+    direction = str(pending.get("contract_type") or "").upper()
+    if advisor_stance == "WAIT":
+        return "advisor_wait"
+    if advisor_stance and direction and advisor_stance == direction:
+        return "aligned"
+    if advisor_stance in {"CALL", "PUT"} and direction in {"CALL", "PUT"}:
+        return "direction_conflict"
+    return "unknown"
+
+
+def pending_trade_summary(
+    pending: dict[str, Any] | None,
+    advisor: dict[str, Any] | None = None,
+    freshness: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not pending:
+        return {"has_pending_trade": False, "flags": []}
+    action = str(pending.get("action") or "")
+    direction = str(pending.get("contract_type") or "").upper()
+    amount = pending.get("amount")
+    duration = pending.get("duration")
+    duration_unit = str(pending.get("duration_unit") or "")
+    alignment = advisor_trade_alignment(pending, advisor)
+    flags: list[str] = []
+    if not pending.get("symbol") and action != "close_open_contract":
+        flags.append("missing_symbol")
+    if action != "close_open_contract" and direction not in {"CALL", "PUT"}:
+        flags.append("missing_direction")
+    try:
+        amount_value = float(amount) if amount is not None else 0.0
+    except (TypeError, ValueError):
+        amount_value = 0.0
+    if action != "close_open_contract" and amount_value <= 0:
+        flags.append("missing_amount")
+    try:
+        duration_value = int(duration) if duration is not None else 0
+    except (TypeError, ValueError):
+        duration_value = 0
+    if action != "close_open_contract" and duration_value <= 0:
+        flags.append("missing_duration")
+    if pending.get("allow_live"):
+        flags.append("live_execution")
+    if alignment in {"symbol_mismatch", "advisor_wait", "direction_conflict"}:
+        flags.append(alignment)
+    stale_count = int((freshness or {}).get("stale_count") or 0)
+    if stale_count:
+        flags.append("stale_data")
+    return {
+        "has_pending_trade": True,
+        "action": action or "unknown",
+        "symbol": pending.get("symbol"),
+        "direction": direction or None,
+        "amount": amount_value if amount is not None else None,
+        "duration": f"{duration_value}{duration_unit}" if duration_value and duration_unit else None,
+        "allow_live": bool(pending.get("allow_live")),
+        "advisor_alignment": alignment,
+        "fresh_count": int((freshness or {}).get("fresh_count") or 0),
+        "known_freshness_count": int((freshness or {}).get("known_count") or 0),
+        "stale_count": stale_count,
+        "flags": flags,
+    }
+
+
+def advisor_trade_draft(
+    advisor: dict[str, Any] | None,
+    *,
+    amount: float = 1.0,
+    duration: int = 5,
+    duration_unit: str = "t",
+    allow_live: bool = False,
+) -> dict[str, Any]:
+    if not advisor:
+        return {"ok": False, "reason": "missing_advisor"}
+    stance = str(advisor.get("stance") or "WAIT").upper()
+    if stance not in {"CALL", "PUT"}:
+        return {"ok": False, "reason": "advisor_wait", "stance": stance}
+    symbol = normalize_deriv_symbol(str(advisor.get("symbol") or DEFAULT_SYMBOL))
+    try:
+        amount_value = float(amount)
+    except (TypeError, ValueError):
+        amount_value = 0.0
+    try:
+        duration_value = int(duration)
+    except (TypeError, ValueError):
+        duration_value = 0
+    if amount_value <= 0:
+        return {"ok": False, "reason": "invalid_amount", "stance": stance}
+    if duration_value <= 0:
+        return {"ok": False, "reason": "invalid_duration", "stance": stance}
+    return {
+        "ok": True,
+        "pending_trade": {
+            "action": "execute_simulated_trade",
+            "symbol": symbol,
+            "amount": amount_value,
+            "contract_type": stance,
+            "duration": duration_value,
+            "duration_unit": duration_unit if duration_unit in {"t", "m", "h"} else "t",
+            "contract_id": None,
+            "allow_live": bool(allow_live),
+            "source": "advisor_council",
+            "advisor_created_at": advisor.get("created_at"),
+            "advisor_confidence": float(advisor.get("confidence") or 0),
+            "advisor_entry_price": advisor.get("entry_price"),
+        },
+    }
+
+
+def advisor_audit_summary(advisor: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not advisor:
+        return None
+    return {
+        "ok": bool(advisor.get("ok", True)),
+        "created_at": advisor.get("created_at"),
+        "symbol": advisor.get("symbol"),
+        "stance": advisor.get("stance"),
+        "confidence": advisor.get("confidence"),
+        "entry_price": advisor.get("entry_price"),
+        "runtime": advisor.get("runtime"),
+        "source_count": advisor.get("source_count"),
+        "vote_counts": advisor.get("vote_counts") or {},
+        "consensus": advisor.get("consensus"),
+    }
+
+
+def execution_audit_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    advisor = state.get("last_advisor_result") or None
+    freshness = freshness_snapshot(state)
+    pending = state.get("pending_trade") or None
+    return {
+        "schema_version": 1,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "global_status": global_status_snapshot(state),
+        "data_freshness": freshness,
+        "safety_gate": safety_gate_snapshot(state),
+        "pending_trade_summary": pending_trade_summary(pending, advisor, freshness),
+        "pending_trade": pending,
+        "advisor": advisor_audit_summary(advisor),
+        "api_trace": list(state.get("api_trace") or [])[-20:],
+        "runtime_events": list(state.get("runtime_events") or [])[-30:],
+        "chart_snapshot_count": len(state.get("chart_snapshots") or []),
+        "team_event_count": len(state.get("team_events") or []),
+    }
+
+
+def render_audit_export_panel() -> None:
+    st.markdown(f"#### {t('audit_export')}")
+    st.caption(t("audit_export_caption"))
+    snapshot = execution_audit_snapshot(dict(st.session_state))
+    st.download_button(
+        t("download_audit"),
+        data=json.dumps(snapshot, ensure_ascii=False, indent=2, default=str).encode("utf-8"),
+        file_name=f"deriv-audit-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json",
+        mime="application/json",
+        key="download_audit",
+        width="stretch",
+    )
+
+
+def system_health_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    checks: dict[str, dict[str, Any]] = {}
+    try:
+        init_local_db()
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("SELECT 1").fetchone()
+        checks["db"] = {"ok": True, "detail": "sqlite ready"}
+    except Exception as exc:
+        checks["db"] = {"ok": False, "detail": str(exc)}
+
+    try:
+        build_trading_team_langgraph()
+        build_advisor_langgraph()
+        checks["langgraph"] = {"ok": True, "detail": "trading+advisor compiled"}
+    except Exception as exc:
+        checks["langgraph"] = {"ok": False, "detail": str(exc)}
+
+    checks["token"] = {
+        "ok": bool(str(state.get("deriv_token") or "").strip()),
+        "detail": "configured" if state.get("deriv_token") else "missing",
+    }
+    checks["pending"] = {
+        "ok": not bool(state.get("pending_trade")),
+        "detail": "none" if not state.get("pending_trade") else "pending_trade",
+    }
+    freshness = freshness_snapshot(state)
+    checks["freshness"] = {
+        "ok": bool(freshness.get("ok")),
+        "detail": f'{freshness.get("fresh_count", 0)}/{freshness.get("known_count", 0)} fresh',
+    }
+    required_ok = bool(checks["db"]["ok"] and checks["langgraph"]["ok"])
+    attention = [
+        key
+        for key, item in checks.items()
+        if key not in {"token", "freshness"} and not item["ok"]
+    ]
+    return {
+        "ok": required_ok and not attention,
+        "checks": checks,
+        "attention": attention,
+        "api_trace_count": len(state.get("api_trace") or []),
+        "runtime_event_count": len(state.get("runtime_events") or []),
+    }
+
+
+def render_system_health_panel() -> None:
+    health = system_health_snapshot(dict(st.session_state))
+    st.markdown(f"#### {t('system_health')}")
+    st.caption(t("system_health_caption"))
+    cols = st.columns(5)
+    checks = health["checks"]
+    health_labels = {
+        "db": t("health_db"),
+        "langgraph": t("health_langgraph"),
+        "token": t("health_token"),
+        "pending": t("health_pending"),
+        "freshness": t("status_freshness"),
+    }
+    for col, key in zip(cols, ["db", "langgraph", "token", "pending", "freshness"], strict=True):
+        item = checks[key]
+        col.metric(
+            health_labels[key],
+            t("health_ready") if item["ok"] else t("health_attention"),
+            str(item["detail"]),
+        )
+
+
+def render_pending_trade_panel(*, show_raw: bool = True) -> None:
+    pending = st.session_state.get("pending_trade")
+    if not pending:
+        return
+    summary = pending_trade_summary(
+        pending,
+        st.session_state.get("last_advisor_result"),
+        freshness_snapshot(dict(st.session_state)),
+    )
+    flags = summary.get("flags") or []
+    flag_text = ", ".join(flags) if flags else t("safety_ready")
+    freshness_text = (
+        t("status_none")
+        if not summary.get("known_freshness_count")
+        else f'{summary.get("fresh_count")}/{summary.get("known_freshness_count")}'
+    )
+    st.markdown(
+        f"""
+        <div class="pending-panel">
+          <div class="safety-title">{html.escape(t("pending_trade"))}</div>
+          <div class="pending-grid">
+            <div><span>{html.escape(t("pending_action"))}</span><strong>{html.escape(str(summary.get("action")))}</strong></div>
+            <div><span>{html.escape(t("status_symbol"))}</span><strong>{html.escape(str(summary.get("symbol") or t("status_none")))}</strong></div>
+            <div><span>{html.escape(t("pending_direction"))}</span><strong>{html.escape(str(summary.get("direction") or t("status_none")))}</strong></div>
+            <div><span>{html.escape(t("pending_amount"))}</span><strong>{html.escape(str(summary.get("amount") or t("status_none")))}</strong></div>
+            <div><span>{html.escape(t("pending_duration"))}</span><strong>{html.escape(str(summary.get("duration") or t("status_none")))}</strong></div>
+            <div><span>{html.escape(t("pending_advisor_alignment"))}</span><strong>{html.escape(str(summary.get("advisor_alignment")))}</strong></div>
+            <div><span>{html.escape(t("pending_freshness"))}</span><strong>{html.escape(freshness_text)}</strong></div>
+            <div class="{'warn' if flags else 'ok'}"><span>{html.escape(t("pending_flags"))}</span><strong>{html.escape(flag_text)}</strong></div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if show_raw:
+        st.caption(
+            (
+                "待确认订单只展示关键字段；原始参数不在界面展开。"
+                if current_lang() == "zh"
+                else "Pending orders show only key fields; raw payloads are not shown in the UI."
+            )
+        )
 
 
 def readable_agent_bubble(agent_id: str) -> str:
@@ -4458,16 +7332,17 @@ def render_swarm_graph() -> None:
         position: relative;
         height: 520px;
         overflow: hidden;
-        border: 1px solid rgba(38, 59, 52, .55);
+        border: 1px solid rgba(38, 59, 52, .42);
+        border-radius: 8px;
         background:
-          radial-gradient(circle at 50% 44%, rgba(0,184,148,.09), transparent 38%),
-          radial-gradient(circle at 82% 18%, rgba(122,167,255,.12), transparent 26%),
-          radial-gradient(circle, rgba(8,17,15,.08) 1px, transparent 1px),
-          linear-gradient(180deg, rgba(248,252,250,.96), rgba(236,245,241,.91));
-        background-size: auto, auto, 18px 18px, auto;
+          linear-gradient(90deg, rgba(8,17,15,.07) 1px, transparent 1px),
+          linear-gradient(0deg, rgba(8,17,15,.05) 1px, transparent 1px),
+          linear-gradient(180deg, rgba(248,252,250,.97), rgba(236,245,241,.92));
+        background-size: 22px 22px, 22px 22px, auto;
         color: #10221d;
         font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        box-shadow: 0 22px 70px rgba(0,0,0,.22);
+        box-shadow: 0 16px 44px rgba(0,0,0,.2);
+        transform: translateZ(0);
       }}
       html, body {{
         margin: 0;
@@ -4506,7 +7381,8 @@ def render_swarm_graph() -> None:
         border: 1px solid rgba(255,255,255,.72);
         background: rgba(255,255,255,.68);
         backdrop-filter: blur(12px);
-        box-shadow: 0 12px 34px rgba(16,34,29,.12);
+        border-radius: 8px;
+        box-shadow: 0 10px 24px rgba(16,34,29,.1);
       }}
       .kg-actions {{
         pointer-events: auto;
@@ -4524,8 +7400,9 @@ def render_swarm_graph() -> None:
         font-weight: 800;
         font-size: 12px;
         border-radius: 999px;
-        box-shadow: 0 12px 34px rgba(16,34,29,.12);
+        box-shadow: 0 10px 24px rgba(16,34,29,.1);
         backdrop-filter: blur(12px);
+        transition: transform .12s ease, background .12s ease;
       }}
       .kg-actions button:hover {{ transform: translateY(-1px); background: rgba(255,255,255,.92); }}
       .kg-switch {{ display: inline-flex; align-items: center; gap: 6px; }}
@@ -4541,7 +7418,8 @@ def render_swarm_graph() -> None:
         border: 1px solid rgba(255,255,255,.72);
         background: rgba(255,255,255,.66);
         backdrop-filter: blur(12px);
-        box-shadow: 0 12px 34px rgba(16,34,29,.12);
+        border-radius: 8px;
+        box-shadow: 0 10px 24px rgba(16,34,29,.1);
         min-width: 150px;
       }}
       .kg-legend-row {{ display: flex; align-items: center; justify-content: space-between; gap: 14px; font-size: 12px; color: #29443d; }}
@@ -4558,7 +7436,8 @@ def render_swarm_graph() -> None:
         border: 1px solid rgba(255,255,255,.76);
         background: rgba(255,255,255,.76);
         backdrop-filter: blur(16px);
-        box-shadow: 0 18px 54px rgba(16,34,29,.18);
+        border-radius: 8px;
+        box-shadow: 0 14px 38px rgba(16,34,29,.16);
         transform: translateX(115%);
         opacity: 0;
         transition: .22s ease;
@@ -4595,6 +7474,7 @@ def render_swarm_graph() -> None:
         border: 1px solid rgba(255,255,255,.7);
         background: rgba(255,255,255,.62);
         backdrop-filter: blur(12px);
+        border-radius: 8px;
       }}
       @media (max-width: 760px) {{
         #kg-root {{ height: 640px; }}
@@ -4639,6 +7519,7 @@ def render_swarm_graph() -> None:
       let hovered = null, selected = null, dragging = null;
       let pan = {{ x: 0, y: 0 }}, zoom = 1, isPanning = false, last = {{x:0,y:0}};
       let alpha = 1;
+      let lastStatusAt = 0;
       const colors = {{ system:'#8b5cf6', task:'#14b8a6', risk:'#f43f5e', concept:'#06b6d4', api:'#ef4444' }};
       const nodes = graph.nodes.map((n, i) => ({{
         ...n,
@@ -4670,6 +7551,19 @@ def render_swarm_graph() -> None:
         const rect = canvas.getBoundingClientRect();
         return {{ x: rect.width / 2 + pan.x + node.x * zoom, y: rect.height / 2 + pan.y + node.y * zoom }};
       }}
+      function roundedRect(x, y, w, h, r) {{
+        const radius = Math.min(r, w / 2, h / 2);
+        ctx.beginPath();
+        ctx.moveTo(x + radius, y);
+        ctx.arcTo(x + w, y, x + w, y + h, radius);
+        ctx.arcTo(x + w, y + h, x, y + h, radius);
+        ctx.arcTo(x, y + h, x, y, radius);
+        ctx.arcTo(x, y, x + w, y, radius);
+        ctx.closePath();
+      }}
+      function compactLabel(text, maxChars = 14) {{
+        return text.length > maxChars ? text.slice(0, maxChars - 1) + '…' : text;
+      }}
       function related(node) {{
         if (!node) return new Set();
         const set = new Set([node.id]);
@@ -4680,6 +7574,7 @@ def render_swarm_graph() -> None:
         return set;
       }}
       function tick() {{
+        if (alpha <= .052 && !dragging) return;
         const center = byId.get('manager');
         if (center) {{
           center.x *= .94; center.y *= .94; center.vx *= .45; center.vy *= .45;
@@ -4709,7 +7604,7 @@ def render_swarm_graph() -> None:
           n.vx *= .86; n.vy *= .86;
           n.x += n.vx; n.y += n.vy;
         }});
-        alpha = Math.max(.045, alpha * .992);
+        alpha = Math.max(.045, alpha * .985);
       }}
       function draw() {{
         tick();
@@ -4739,24 +7634,27 @@ def render_swarm_graph() -> None:
             ctx.fillStyle = '#00b894';
             ctx.beginPath(); ctx.arc(px, py, 3.2 / zoom, 0, Math.PI * 2); ctx.fill();
           }}
-          if (showLabels && active) {{
+          if (showLabels && active && zoom > .48) {{
             const mx = (l.source.x + l.target.x) / 2;
             const my = (l.source.y + l.target.y) / 2;
             ctx.font = `${{11 / zoom}}px "PingFang SC", "Microsoft YaHei", system-ui`;
-            const w = ctx.measureText(l.label).width + 12 / zoom;
-            ctx.globalAlpha = .9;
-            ctx.fillStyle = 'rgba(255,255,255,.82)';
-            ctx.fillRect(mx - w / 2, my - 9 / zoom, w, 18 / zoom);
+            const edgeLabel = compactLabel(l.label, 18);
+            const w = ctx.measureText(edgeLabel).width + 12 / zoom;
+            ctx.globalAlpha = .58;
+            ctx.fillStyle = 'rgba(255,255,255,.68)';
+            roundedRect(mx - w / 2, my - 9 / zoom, w, 18 / zoom, 7 / zoom);
+            ctx.fill();
             ctx.fillStyle = '#35544c';
             ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-            ctx.fillText(l.label, mx, my);
+            ctx.globalAlpha = .72;
+            ctx.fillText(edgeLabel, mx, my);
           }}
         }});
 
         nodes.forEach(n => {{
           const isFocus = focus && neighborhood.has(n.id);
           const isDim = focus && !isFocus;
-          const pulse = Math.sin(time * 2.2 + n.x * .01) * 2.2;
+          const pulse = (n === hovered || n === selected || n.id === 'manager') ? Math.sin(time * 2.8 + n.x * .01) * 1.6 : 0;
           const r = n.radius + pulse + (n === hovered ? 5 : 0);
           ctx.globalAlpha = isDim ? .22 : (n.confidence || .85);
           if (n === selected || n.id === 'manager') {{
@@ -4775,10 +7673,24 @@ def render_swarm_graph() -> None:
           ctx.font = `900 ${{13 / zoom}}px "PingFang SC", "Microsoft YaHei", system-ui`;
           ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
           ctx.fillText(n.code || n.label.slice(0, 2), n.x, n.y);
-          ctx.fillStyle = '#17312b';
-          ctx.font = `800 ${{12 / zoom}}px "PingFang SC", "Microsoft YaHei", system-ui`;
-          ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-          ctx.fillText(n.label, n.x + r + 8 / zoom, n.y);
+          if (zoom > .42) {{
+            const label = compactLabel(n.label, n.id === 'manager' ? 18 : 12);
+            ctx.font = `800 ${{12 / zoom}}px "PingFang SC", "Microsoft YaHei", system-ui`;
+            const w = ctx.measureText(label).width + 16 / zoom;
+            const h = 22 / zoom;
+            const labelY = n.y + r + 15 / zoom;
+            ctx.globalAlpha = isDim ? .18 : .74;
+            ctx.fillStyle = 'rgba(255,255,255,.7)';
+            roundedRect(n.x - w / 2, labelY - h / 2, w, h, 8 / zoom);
+            ctx.fill();
+            ctx.strokeStyle = 'rgba(255,255,255,.42)';
+            ctx.lineWidth = 1 / zoom;
+            ctx.stroke();
+            ctx.fillStyle = '#17312b';
+            ctx.globalAlpha = isDim ? .28 : .86;
+            ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+            ctx.fillText(label, n.x, labelY);
+          }}
         }});
         ctx.restore();
         renderStatus();
@@ -4817,15 +7729,23 @@ def render_swarm_graph() -> None:
         ).join('');
       }}
       function renderStatus() {{
+        const now = performance.now();
+        if (now - lastStatusAt < 220) return;
+        lastStatusAt = now;
         status.innerHTML = `<span>{status_nodes}: ${{nodes.length}}</span><span>{status_links}: ${{links.length}}</span><span>${{ui.selected}}: ${{selected ? selected.label : ui.none}}</span><span>${{ui.hovered}}: ${{hovered ? hovered.label : ui.none}}</span><span>{status_layout}</span><span>${{ui.memorySync}}</span><span>${{graph.status.updated}}</span>`;
       }}
       canvas.addEventListener('mousemove', e => {{
         if (dragging) {{ const p = world(e.clientX, e.clientY); dragging.x = p.x; dragging.y = p.y; dragging.vx = 0; dragging.vy = 0; alpha = .55; return; }}
         if (isPanning) {{ pan.x += e.clientX - last.x; pan.y += e.clientY - last.y; last = {{x:e.clientX,y:e.clientY}}; return; }}
-        hovered = hit(e.clientX, e.clientY);
+        const nextHover = hit(e.clientX, e.clientY);
+        if (nextHover !== hovered) {{
+          hovered = nextHover;
+          alpha = Math.max(alpha, .18);
+        }}
       }});
       canvas.addEventListener('mousedown', e => {{
         const n = hit(e.clientX, e.clientY);
+        alpha = Math.max(alpha, .45);
         if (n) {{ dragging = n; canvas.classList.add('dragging'); }}
         else {{ isPanning = true; last = {{x:e.clientX,y:e.clientY}}; }}
       }});
@@ -4835,6 +7755,7 @@ def render_swarm_graph() -> None:
         e.preventDefault();
         const delta = e.deltaY > 0 ? .92 : 1.08;
         zoom = Math.max(.35, Math.min(2.8, zoom * delta));
+        alpha = Math.max(alpha, .22);
       }}, {{ passive: false }});
       document.getElementById('kg-close').onclick = () => openPanel(null);
       document.getElementById('kg-labels').onchange = e => showLabels = e.target.checked;
@@ -4905,6 +7826,7 @@ def candles_frame_from_result(result: dict[str, Any] | None) -> pd.DataFrame:
     frame = pd.DataFrame(candles)
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
     frame["utc_time"] = frame["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    frame["local_timestamp"] = frame["timestamp"].dt.tz_convert(LOCAL_TZ).dt.tz_localize(None)
     frame["local_time"] = frame["timestamp"].dt.tz_convert(LOCAL_TZ).dt.strftime("%Y-%m-%d %H:%M:%S MYT")
     for column in ("open", "high", "low", "close", "volume"):
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
@@ -4914,11 +7836,143 @@ def candles_frame_from_result(result: dict[str, Any] | None) -> pd.DataFrame:
     return frame.reset_index(drop=True)
 
 
+def chart_data_status(
+    frame: pd.DataFrame,
+    granularity: int,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    if frame.empty or "timestamp" not in frame.columns:
+        return {
+            "ok": False,
+            "fresh": False,
+            "latest_utc": None,
+            "latest_local": None,
+            "age_seconds": None,
+            "allowed_lag_seconds": max(int(granularity) * 3, 180),
+        }
+    latest_ts = pd.to_datetime(frame.iloc[-1]["timestamp"], utc=True)
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    age_seconds = max(0.0, (current - latest_ts.to_pydatetime()).total_seconds())
+    allowed_lag = max(int(granularity) * 3, 180)
+    return {
+        "ok": True,
+        "fresh": age_seconds <= allowed_lag,
+        "latest_utc": latest_ts.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "latest_local": latest_ts.tz_convert(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S MYT"),
+        "age_seconds": round(age_seconds, 1),
+        "allowed_lag_seconds": allowed_lag,
+    }
+
+
+def chart_integrity_report(
+    frame: pd.DataFrame,
+    granularity: int,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    if frame.empty or "timestamp" not in frame.columns:
+        return {
+            "ok": False,
+            "fresh": False,
+            "duplicate_timestamps": 0,
+            "out_of_order_bars": 0,
+            "invalid_ohlc": 0,
+            "gap_count": 0,
+            "issues": ["empty_data"],
+        }
+
+    timestamps = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+    valid_timestamps = timestamps.dropna()
+    duplicate_timestamps = int(valid_timestamps.duplicated().sum())
+    intervals = valid_timestamps.diff().dt.total_seconds().dropna()
+    out_of_order_bars = int((intervals < 0).sum())
+    gap_threshold = max(float(granularity) * 1.5, float(granularity) + 1.0)
+    gap_count = int((intervals > gap_threshold).sum())
+
+    required_prices = ["open", "high", "low", "close"]
+    if all(column in frame.columns for column in required_prices):
+        prices = frame[required_prices].apply(pd.to_numeric, errors="coerce")
+        finite_mask = prices.map(lambda value: bool(pd.notna(value) and math.isfinite(float(value))))
+        finite_prices = prices.where(finite_mask)
+        invalid_prices = (~finite_mask).any(axis=1) | (prices <= 0).any(axis=1)
+        invalid_ranges = (
+            finite_prices["high"] < finite_prices[["open", "low", "close"]].max(axis=1)
+        ) | (
+            finite_prices["low"] > finite_prices[["open", "high", "close"]].min(axis=1)
+        )
+        invalid_ohlc = int((invalid_prices | invalid_ranges).sum())
+    else:
+        invalid_ohlc = len(frame)
+
+    freshness = chart_data_status(frame, granularity, now=now)
+    issues: list[str] = []
+    if timestamps.isna().any():
+        issues.append("invalid_timestamp")
+    if duplicate_timestamps:
+        issues.append("duplicate_timestamps")
+    if out_of_order_bars:
+        issues.append("out_of_order_bars")
+    if invalid_ohlc:
+        issues.append("invalid_ohlc")
+    if gap_count:
+        issues.append("possible_gaps")
+    if not freshness.get("fresh"):
+        issues.append("stale_data")
+
+    return {
+        "ok": not issues,
+        "fresh": bool(freshness.get("fresh")),
+        "duplicate_timestamps": duplicate_timestamps,
+        "out_of_order_bars": out_of_order_bars,
+        "invalid_ohlc": invalid_ohlc,
+        "gap_count": gap_count,
+        "issues": issues,
+    }
+
+
+def local_time_label(value: Any, fmt: str = "%Y-%m-%d %H:%M:%S MYT") -> str:
+    if not value:
+        return ""
+    try:
+        timestamp = pd.to_datetime(value, utc=True)
+    except (TypeError, ValueError):
+        return str(value)
+    return timestamp.tz_convert(LOCAL_TZ).strftime(fmt)
+
+
 def normalize_close(frame: pd.DataFrame) -> pd.Series:
     first = frame["close"].dropna().iloc[0]
     if first == 0:
         return frame["close"]
     return frame["close"] / first * 100
+
+
+def advisor_chart_overlay(symbol: str, advisor_result: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not advisor_result:
+        return None
+    if str(advisor_result.get("symbol") or "") != str(symbol):
+        return None
+    entry_price = advisor_result.get("entry_price")
+    try:
+        price = float(entry_price)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(price) or price <= 0:
+        return None
+    stance = str(advisor_result.get("stance") or "WAIT").upper()
+    colors = {"CALL": "#00b894", "PUT": "#f05f5f", "WAIT": "#f5b84b"}
+    confidence = float(advisor_result.get("confidence") or 0)
+    return {
+        "symbol": symbol,
+        "price": price,
+        "stance": stance if stance in colors else "WAIT",
+        "confidence": confidence,
+        "color": colors.get(stance, colors["WAIT"]),
+        "label": f"{stance if stance in colors else 'WAIT'} · {confidence:.0%}",
+    }
 
 
 def chart_config() -> dict[str, Any]:
@@ -4969,15 +8023,28 @@ def render_chart_stats(frame: pd.DataFrame) -> None:
         )
 
 
-def render_measurement(frame: pd.DataFrame) -> None:
+def render_measurement(frame: pd.DataFrame, *, key_prefix: str = "") -> None:
     if len(frame) < 2:
         return
 
     st.markdown(f"#### {t('measure')}")
-    labels = [f"{idx} · {row.timestamp.strftime('%m-%d %H:%M')} · close {row.close:.5g}" for idx, row in frame.iterrows()]
+    labels = [
+        f"{idx} · {row.local_timestamp.strftime('%m-%d %H:%M')} MYT · close {row.close:.5g}"
+        for idx, row in frame.iterrows()
+    ]
     col_a, col_b = st.columns(2)
-    start_label = col_a.selectbox(t("start_candle"), labels, index=max(len(labels) - 12, 0))
-    end_label = col_b.selectbox(t("end_candle"), labels, index=len(labels) - 1)
+    start_label = col_a.selectbox(
+        t("start_candle"),
+        labels,
+        index=max(len(labels) - 12, 0),
+        key=f"measure_start_{key_prefix}",
+    )
+    end_label = col_b.selectbox(
+        t("end_candle"),
+        labels,
+        index=len(labels) - 1,
+        key=f"measure_end_{key_prefix}",
+    )
     start_idx = int(start_label.split(" · ", 1)[0])
     end_idx = int(end_label.split(" · ", 1)[0])
     if start_idx == end_idx:
@@ -5010,13 +8077,23 @@ def fetch_compare_candles(symbol: str, granularity: int, count: int) -> dict[str
     )
 
 
+def candle_result_count(result: dict[str, Any] | None) -> int:
+    data = (result or {}).get("data") or {}
+    try:
+        returned_count = int(data.get("returned_count") or 0)
+    except (TypeError, ValueError):
+        returned_count = 0
+    return max(returned_count, len(data.get("ohlcv") or []))
+
+
 def fetch_and_store_candles(symbol: str, granularity: int, count: int, source: str) -> dict[str, Any]:
     result = fetch_compare_candles(symbol, granularity, count)
-    add_chart_snapshot(result, source=source)
+    if result.get("ok") and candle_result_count(result) > 0:
+        add_chart_snapshot(result, source=source)
     return result
 
 
-def render_trading_chart_workbench(result: dict[str, Any]) -> None:
+def render_trading_chart_workbench(result: dict[str, Any], *, key_prefix: str = "") -> None:
     frame = candles_frame_from_result(result)
     if frame.empty:
         st.info(t("chart_empty_info"))
@@ -5026,6 +8103,8 @@ def render_trading_chart_workbench(result: dict[str, Any]) -> None:
     symbol = data.get("symbol", DEFAULT_SYMBOL)
     granularity = int(data.get("granularity") or DEFAULT_GRANULARITY)
     count = int(data.get("returned_count") or len(frame))
+    status = chart_data_status(frame, granularity)
+    integrity = chart_integrity_report(frame, granularity)
 
     st.markdown(
         f"""
@@ -5039,26 +8118,47 @@ def render_trading_chart_workbench(result: dict[str, Any]) -> None:
         unsafe_allow_html=True,
     )
 
+    status_cols = st.columns([0.25, 0.25, 0.25, 0.25])
+    status_cols[0].metric(t("chart_last_candle"), status.get("latest_local") or "N/A")
+    status_cols[1].metric(t("chart_data_age"), "N/A" if status.get("age_seconds") is None else f"{float(status['age_seconds']):.0f}s")
+    status_cols[2].metric(t("chart_data_status"), t("chart_fresh") if status.get("fresh") else t("chart_stale"))
+    status_cols[3].metric(t("chart_time_zone"), "MYT / UTC")
+    st.caption(f"{t('chart_local_time_note')} {t('chart_refresh_hint')}")
+
+    with st.expander(t("chart_integrity"), expanded=not integrity["ok"]):
+        integrity_cols = st.columns(5)
+        integrity_cols[0].metric(
+            t("chart_integrity"),
+            t("chart_integrity_ok") if integrity["ok"] else t("chart_integrity_attention"),
+        )
+        integrity_cols[1].metric(t("chart_duplicate_bars"), integrity["duplicate_timestamps"])
+        integrity_cols[2].metric(t("chart_gap_count"), integrity["gap_count"])
+        integrity_cols[3].metric(t("chart_invalid_ohlc"), integrity["invalid_ohlc"])
+        integrity_cols[4].metric(t("chart_order_errors"), integrity["out_of_order_bars"])
+        st.caption(t("chart_integrity_hint"))
+
     control_a, control_b, control_c = st.columns([0.32, 0.34, 0.34])
     st.session_state.chart_height = control_a.slider(
         t("chart_height"),
         min_value=420,
+        key=f"chart_height_{key_prefix}",
         max_value=950,
         value=int(st.session_state.chart_height),
         step=40,
     )
-    compare_enabled = control_b.toggle(t("compare_trend"), value=bool(st.session_state.compare_result))
+    compare_enabled = control_b.toggle(t("compare_trend"), value=bool(st.session_state.compare_result), key=f"compare_trend_{key_prefix}")
     st.session_state.compare_symbol = control_c.text_input(
         t("compare_symbol"),
         value=st.session_state.compare_symbol,
         placeholder=t("compare_placeholder"),
+        key=f"compare_symbol_{key_prefix}",
     )
 
     refresh_cols = st.columns([0.25, 0.25, 0.5])
-    if refresh_cols[0].button(t("refresh_current"), width="stretch"):
+    if refresh_cols[0].button(t("refresh_current"), key=f"refresh_current_{key_prefix}"):
         fetch_and_store_candles(symbol, granularity, count, source="manual_refresh")
         st.rerun()
-    if refresh_cols[1].button(t("refresh_compare"), width="stretch"):
+    if refresh_cols[1].button(t("refresh_compare"), key=f"refresh_compare_{key_prefix}"):
         st.session_state.compare_result = fetch_compare_candles(
             st.session_state.compare_symbol.strip() or "R_75",
             granularity,
@@ -5071,11 +8171,20 @@ def render_trading_chart_workbench(result: dict[str, Any]) -> None:
     fig = go.Figure()
     fig.add_trace(
         go.Candlestick(
-            x=frame["timestamp"],
+            x=frame["local_timestamp"],
             open=frame["open"],
             high=frame["high"],
             low=frame["low"],
             close=frame["close"],
+            customdata=frame[["local_time", "utc_time"]],
+            hovertemplate=(
+                "%{customdata[0]}<br>"
+                "%{customdata[1]}<br>"
+                f"{symbol}: open=%{{open:.5f}}<br>"
+                "high=%{high:.5f}<br>"
+                "low=%{low:.5f}<br>"
+                "close=%{close:.5f}<extra></extra>"
+            ),
             increasing_line_color="#007f73",
             decreasing_line_color="#be3434",
             increasing_fillcolor="#007f73",
@@ -5085,7 +8194,7 @@ def render_trading_chart_workbench(result: dict[str, Any]) -> None:
     )
     fig.add_trace(
         go.Scatter(
-            x=frame["timestamp"],
+            x=frame["local_timestamp"],
             y=frame["ma5"],
             mode="lines",
             line=dict(color="#d89b24", width=1.5),
@@ -5094,7 +8203,7 @@ def render_trading_chart_workbench(result: dict[str, Any]) -> None:
     )
     fig.add_trace(
         go.Scatter(
-            x=frame["timestamp"],
+            x=frame["local_timestamp"],
             y=frame["ma20"],
             mode="lines",
             line=dict(color="#2457c5", width=1.5),
@@ -5107,7 +8216,7 @@ def render_trading_chart_workbench(result: dict[str, Any]) -> None:
         compare_symbol = ((st.session_state.compare_result.get("data") or {}).get("symbol") or "Compare")
         fig.add_trace(
             go.Scatter(
-                x=compare_frame["timestamp"],
+                x=compare_frame["local_timestamp"],
                 y=normalize_close(compare_frame),
                 yaxis="y2",
                 mode="lines",
@@ -5125,6 +8234,32 @@ def render_trading_chart_workbench(result: dict[str, Any]) -> None:
         annotation_text=f"Last {latest_close:.5g}",
         annotation_position="right",
     )
+    overlay = advisor_chart_overlay(symbol, st.session_state.get("last_advisor_result"))
+    if overlay:
+        fig.add_hline(
+            y=overlay["price"],
+            line_width=2,
+            line_dash="dash",
+            line_color=overlay["color"],
+            annotation_text=f"{t('chart_advisor_overlay')} {overlay['label']} · {overlay['price']:.5g}",
+            annotation_position="left",
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=[frame.iloc[-1]["local_timestamp"]],
+                y=[overlay["price"]],
+                mode="markers+text",
+                marker=dict(size=12, color=overlay["color"], line=dict(color="#ffffff", width=1)),
+                text=[overlay["stance"]],
+                textposition="top center",
+                name=t("chart_advisor_overlay"),
+                hovertemplate=(
+                    f"{t('chart_advisor_overlay')}<br>"
+                    "stance=%{text}<br>"
+                    "entry=%{y:.5f}<extra></extra>"
+                ),
+            )
+        )
     fig.update_layout(
         title=f"{symbol} · {t('chart_title_suffix')} · granularity={granularity}s · candles={len(frame)}",
         height=int(st.session_state.chart_height),
@@ -5167,12 +8302,12 @@ def render_trading_chart_workbench(result: dict[str, Any]) -> None:
             visible=compare_enabled and not compare_frame.empty,
         ),
     )
-    st.plotly_chart(fig, width="stretch", config=chart_config())
+    st.plotly_chart(fig, width="stretch", config=chart_config(), key=f"trading_chart_{key_prefix}")
 
     render_chart_stats(frame)
 
-    with st.expander(t("measure_data"), expanded=True):
-        render_measurement(frame)
+    with st.expander(t("measure_data"), expanded=False):
+        render_measurement(frame, key_prefix=key_prefix)
         st.markdown(f"#### {t('full_ohlcv')}")
         st.dataframe(
             frame[
@@ -5186,8 +8321,76 @@ def render_trading_chart_workbench(result: dict[str, Any]) -> None:
             data=frame.to_csv(index=False).encode("utf-8"),
             file_name=f"{symbol}-ohlcv.csv",
             mime="text/csv",
+            key=f"download_ohlcv_{key_prefix}",
             width="stretch",
         )
+
+
+def render_chart_loader_controls() -> None:
+    current_symbol = selected_chart_symbol(
+        str(st.session_state.get("chart_loader_symbol", DEFAULT_SYMBOL)),
+        "",
+    )
+    if current_symbol not in COMMON_DERIV_SYMBOLS:
+        current_symbol = DEFAULT_SYMBOL
+    current_granularity = int(st.session_state.get("chart_loader_granularity", DEFAULT_GRANULARITY) or DEFAULT_GRANULARITY)
+    if current_granularity not in CHART_GRANULARITY_OPTIONS:
+        current_granularity = DEFAULT_GRANULARITY
+    current_count = int(st.session_state.get("chart_loader_count", 120) or 120)
+    current_count = min(1000, max(20, current_count))
+
+    st.session_state.chart_loader_symbol = current_symbol
+    st.session_state.chart_loader_granularity = current_granularity
+    st.session_state.chart_loader_count = current_count
+
+    with st.container(border=True):
+        st.subheader(t("chart_loader_title"))
+        st.caption(t("chart_loader_caption"))
+        cols = st.columns([0.25, 0.25, 0.25, 0.25])
+        cols[0].selectbox(
+            t("chart_symbol_select"),
+            COMMON_DERIV_SYMBOLS,
+            index=COMMON_DERIV_SYMBOLS.index(current_symbol),
+            key="chart_loader_symbol",
+        )
+        cols[1].text_input(
+            t("chart_custom_symbol"),
+            key="chart_custom_symbol",
+            placeholder=t("chart_custom_placeholder"),
+        )
+        cols[2].selectbox(
+            t("chart_granularity"),
+            CHART_GRANULARITY_OPTIONS,
+            index=CHART_GRANULARITY_OPTIONS.index(current_granularity),
+            key="chart_loader_granularity",
+            format_func=chart_granularity_label,
+        )
+        cols[3].number_input(
+            t("chart_candle_count"),
+            min_value=20,
+            max_value=1000,
+            step=20,
+            key="chart_loader_count",
+        )
+
+        if st.button(t("chart_load_selected"), type="primary", width="stretch"):
+            symbol = selected_chart_symbol(
+                str(st.session_state.chart_loader_symbol),
+                str(st.session_state.chart_custom_symbol),
+            )
+            result = fetch_and_store_candles(
+                symbol,
+                int(st.session_state.chart_loader_granularity),
+                int(st.session_state.chart_loader_count),
+                source="chart_loader",
+            )
+            if result.get("ok") and candle_result_count(result) > 0:
+                st.success(f"{t('chart_loaded')}: {symbol}")
+            elif result.get("ok"):
+                st.warning(t("chart_empty_info"))
+            else:
+                st.error(f"{t('chart_load_failed')}: {symbol}")
+                st.caption((result.get("error") or {}).get("message", "unknown error"))
 
 
 def render_last_artifacts() -> None:
@@ -5198,30 +8401,34 @@ def render_last_artifacts() -> None:
             f'<div class="success-badge">{html.escape(t("success_badge"))}</div>',
             unsafe_allow_html=True,
         )
-        st.json(receipt)
+        receipt_cols = st.columns(3)
+        receipt_cols[0].metric("Contract ID", receipt.get("contract_id", "-"))
+        receipt_cols[1].metric("Price", receipt.get("purchase_price", "-"))
+        receipt_cols[2].metric("Currency", receipt.get("currency", "-"))
 
     snapshots = st.session_state.chart_snapshots
     if snapshots:
         st.markdown(f"#### {t('chart_snapshots')}")
         tabs = st.tabs(
             [
-                f"{item.get('symbol')} · {item.get('granularity')}s · {item.get('created_at', '')[11:19]}"
+                f"{item.get('symbol')} · {item.get('granularity')}s · {local_time_label(item.get('created_at'), '%H:%M:%S MYT')}"
                 for item in snapshots
             ]
         )
-        for tab, item in zip(tabs, snapshots, strict=False):
+        for i, (tab, item) in enumerate(zip(tabs, snapshots, strict=False)):
             with tab:
-                st.caption(f"{t('snapshot_time')}: {item.get('created_at')} · source={item.get('source')}")
-                render_trading_chart_workbench(item["result"])
+                st.caption(
+                    f"{t('snapshot_time')}: {local_time_label(item.get('created_at'))} · "
+                    f"UTC={item.get('created_at')} · source={item.get('source')}"
+                )
+                idx = f"{item.get('id', 'snapshot')}_{i}"
+                render_trading_chart_workbench(item["result"], key_prefix=idx)
     elif st.session_state.last_candles and st.session_state.last_candles.get("ok"):
-        render_trading_chart_workbench(st.session_state.last_candles)
+        render_trading_chart_workbench(st.session_state.last_candles, key_prefix="latest")
     else:
         with st.container(border=True):
             st.subheader(t("chart_workbench"))
             st.caption(t("no_chart_snapshots"))
-            if st.button(t("load_default"), type="primary", width="stretch"):
-                fetch_and_store_candles("R_100", 60, 120, source="default_loader")
-                st.rerun()
 
     if st.session_state.last_tick and st.session_state.last_tick.get("ok"):
         tick = ((st.session_state.last_tick.get("data") or {}).get("tick") or {})
@@ -5332,6 +8539,61 @@ def render_direct_dispatch() -> None:
     st.session_state.direct_prompt_nonce += 1
 
 
+def render_advisor_trade_draft_controls(result: dict[str, Any]) -> None:
+    stance = str(result.get("stance") or "WAIT").upper()
+    key_suffix = re.sub(r"[^A-Za-z0-9_]+", "_", str(result.get("created_at") or "latest"))
+    with st.container(border=True):
+        st.markdown(f"#### {t('advisor_trade_draft')}")
+        st.caption(t("advisor_trade_draft_caption"))
+        controls = st.columns([0.28, 0.28, 0.24, 0.2])
+        amount = controls[0].number_input(
+            t("advisor_trade_amount"),
+            min_value=0.35,
+            max_value=1000.0,
+            value=1.0,
+            step=0.5,
+            key=f"advisor_trade_amount_{key_suffix}",
+        )
+        duration = controls[1].number_input(
+            t("advisor_trade_duration"),
+            min_value=1,
+            max_value=60,
+            value=5,
+            step=1,
+            key=f"advisor_trade_duration_{key_suffix}",
+        )
+        duration_unit = controls[2].selectbox(
+            "Unit",
+            ["t", "m", "h"],
+            index=0,
+            key=f"advisor_trade_unit_{key_suffix}",
+        )
+        disabled = stance not in {"CALL", "PUT"}
+        if controls[3].button(
+            t("advisor_trade_draft"),
+            type="primary",
+            width="stretch",
+            disabled=disabled,
+            key=f"advisor_trade_button_{key_suffix}",
+        ):
+            draft = advisor_trade_draft(
+                result,
+                amount=float(amount),
+                duration=int(duration),
+                duration_unit=str(duration_unit),
+                allow_live=bool(st.session_state.allow_live_execution),
+            )
+            if draft.get("ok"):
+                set_pending_trade_state(draft["pending_trade"], source="advisor_council")
+                st.session_state.active_page = "trading"
+                st.success(t("advisor_trade_created"))
+                st.rerun()
+            else:
+                st.warning(t("advisor_trade_wait_blocked"))
+        if disabled:
+            st.info(t("advisor_trade_wait_blocked"))
+
+
 def render_advisor_result(result: dict[str, Any]) -> None:
     st.markdown(
         f"""
@@ -5343,12 +8605,16 @@ def render_advisor_result(result: dict[str, Any]) -> None:
         """,
         unsafe_allow_html=True,
     )
-    cols = st.columns(4)
+    cols = st.columns(5)
     cols[0].metric(t("advisor_confidence"), f"{float(result.get('confidence') or 0):.0%}")
     cols[1].metric(t("advisor_elapsed"), f"{float(result.get('elapsed_ms') or 0) / 1000:.1f}s")
     cols[2].metric(t("advisor_sources"), int(result.get("source_count") or 0))
-    cols[3].metric("Runtime", str(result.get("runtime") or "local"))
-    st.caption(f"Votes: `{json.dumps(result.get('vote_counts') or {}, ensure_ascii=False)}`")
+    entry_price = result.get("entry_price")
+    cols[3].metric(t("advisor_entry_price"), f"{float(entry_price):.5g}" if entry_price else "N/A")
+    cols[4].metric("Runtime", str(result.get("runtime") or "local"))
+    vote_display = translate_advisor_votes(result.get("vote_counts") or {})
+    st.caption(f"Votes: `{json.dumps(vote_display, ensure_ascii=False)}`")
+    render_advisor_trade_draft_controls(result)
 
     opinions = result.get("opinions") or []
     cards = []
@@ -5361,8 +8627,8 @@ def render_advisor_result(result: dict[str, Any]) -> None:
   <div class="advisor-card-top">
     <div class="advisor-code" style="border-color:{html.escape(spec['color'])};">{html.escape(spec['code'])}</div>
     <div>
-      <div class="advisor-name">{html.escape(str(opinion.get("name") or ""))}</div>
-      <div class="advisor-role">{html.escape(str(opinion.get("role") or ""))}</div>
+      <div class="advisor-name">{html.escape(translate_advisor_name(str(opinion.get("name") or "")))}</div>
+      <div class="advisor-role">{html.escape(translate_advisor_role(str(opinion.get("role") or "")))}</div>
     </div>
   </div>
   <span class="advisor-stance">{html.escape(str(opinion.get("stance") or "WAIT"))}</span>
@@ -5395,23 +8661,208 @@ def render_advisor_result(result: dict[str, Any]) -> None:
             st.caption(t("advisor_no_sources"))
 
     with st.expander(t("advisor_transcript"), expanded=False):
-        st.json(
-            {
-                "question": result.get("question"),
-                "symbol": result.get("symbol"),
-                "market": result.get("market"),
-                "news_signal": result.get("news_signal"),
-                "opinions": result.get("opinions"),
-                "vote_counts": result.get("vote_counts"),
-            }
-        )
+        st.markdown(f"**问题**：{result.get('question')}")
+        st.markdown(f"**Symbol**：{result.get('symbol')}")
+        vote_display2 = translate_advisor_votes(result.get("vote_counts") or {})
+        st.markdown(f"**投票**：{vote_display2}")
+        opinions = result.get("opinions") or []
+        if opinions:
+            st.dataframe(
+                [
+                    {
+                        "advisor": translate_advisor_name(str(item.get("name") or "")),
+                        "stance": item.get("stance"),
+                        "confidence": item.get("confidence"),
+                        "rationale": item.get("rationale"),
+                        "invalidation": item.get("invalidation"),
+                    }
+                    for item in opinions
+                ],
+                width="stretch",
+                height=min(320, 80 + len(opinions) * 42),
+            )
     st.download_button(
         t("advisor_download"),
         data=json.dumps(result, ensure_ascii=False, indent=2, default=str).encode("utf-8"),
         file_name=f"advisor-council-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json",
         mime="application/json",
+        key=f"advisor_download_{str(result.get('created_at') or 'latest')}",
         width="stretch",
     )
+
+
+def fetch_latest_price_for_evaluation(symbol: str) -> float | None:
+    result = call_deriv_tool(
+        "get_market_ticks",
+        get_market_ticks(symbol, False),
+        {"symbol": symbol, "subscribe": False, "advisor_evaluation": True},
+    )
+    if not result.get("ok"):
+        return None
+    value = (((result.get("data") or {}).get("tick") or {}).get("quote"))
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    return price if math.isfinite(price) and price > 0 else None
+
+
+def fetch_candles_for_evaluation(symbol: str, granularity: int = 60, count: int = 120) -> pd.DataFrame:
+    result = call_deriv_tool(
+        "get_historical_candles",
+        get_historical_candles(symbol, granularity, count),
+        {
+            "symbol": symbol,
+            "granularity": granularity,
+            "count": count,
+            "advisor_evaluation": True,
+        },
+    )
+    return candles_frame_from_result(result)
+
+
+def evaluate_recent_advisors(limit: int = 12) -> list[dict[str, Any]]:
+    records = load_advisor_run_records(limit)
+    price_cache: dict[str, float | None] = {}
+    candle_cache: dict[str, pd.DataFrame] = {}
+    rows: list[dict[str, Any]] = []
+    for record in records:
+        result = record.get("result") or {}
+        symbol = str(result.get("symbol") or record.get("symbol") or DEFAULT_SYMBOL)
+        if symbol not in price_cache:
+            price_cache[symbol] = fetch_latest_price_for_evaluation(symbol)
+        if symbol not in candle_cache:
+            candle_cache[symbol] = fetch_candles_for_evaluation(symbol)
+        entry = result.get("entry_price")
+        if entry is None:
+            entry = advisor_entry_price(dict(result.get("market") or {}))
+        evaluation = evaluate_advisor_outcome(
+            str(result.get("stance") or "WAIT"),
+            entry,
+            price_cache[symbol],
+            float(result.get("confidence") or record.get("confidence") or 0),
+        )
+        future_closes = future_closes_after_created_at(
+            candle_cache[symbol],
+            str(result.get("created_at") or record.get("created_at") or ""),
+            10,
+        )
+        created_at = str(result.get("created_at") or record.get("created_at") or "")
+        readiness = advisor_horizon_readiness(created_at)
+        horizon_evaluation = evaluate_advisor_horizons(
+            str(result.get("stance") or "WAIT"),
+            entry,
+            future_closes,
+            float(result.get("confidence") or record.get("confidence") or 0),
+        )
+        horizons = horizon_evaluation.get("horizons") or {}
+        rows.append(
+            {
+                "id": record.get("id"),
+                "created_at": record.get("created_at"),
+                "symbol": symbol,
+                "stance": evaluation["stance"],
+                "confidence": evaluation["confidence"],
+                "entry_price": evaluation["entry_price"],
+                "exit_price": evaluation["exit_price"],
+                "return_pct": evaluation["return_pct"],
+                "paper_return_pct": evaluation["paper_return_pct"],
+                "status": evaluation["status"],
+                "outcome": evaluation["outcome"],
+                "score": evaluation["score"],
+                "horizon_status": horizon_evaluation["status"],
+                "horizon_average_score": horizon_evaluation["average_score"],
+                "horizon_1m": (horizons.get("1m") or {}).get("paper_return_pct"),
+                "horizon_5m": (horizons.get("5m") or {}).get("paper_return_pct"),
+                "horizon_10m": (horizons.get("10m") or {}).get("paper_return_pct"),
+                "horizon_outcome_1m": (horizons.get("1m") or {}).get("outcome"),
+                "horizon_outcome_5m": (horizons.get("5m") or {}).get("outcome"),
+                "horizon_outcome_10m": (horizons.get("10m") or {}).get("outcome"),
+                "ready_horizons": ",".join(readiness.get("ready") or []),
+                "pending_horizons": ",".join(readiness.get("pending") or []),
+                "age_seconds": readiness.get("age_seconds"),
+                "evaluation_ready": advisor_evaluation_ready(created_at, entry),
+                "question": record.get("question"),
+            }
+        )
+    return rows
+
+
+def render_advisor_evaluation_panel() -> None:
+    with st.expander(t("advisor_evaluation"), expanded=False):
+        st.caption(t("advisor_evaluation_caption"))
+        if st.button(t("advisor_mark_recent"), width="stretch"):
+            st.session_state.advisor_evaluations = evaluate_recent_advisors(12)
+
+        evaluations = list(st.session_state.get("advisor_evaluations") or [])
+        if not evaluations:
+            st.caption(t("advisor_no_evaluations"))
+            return
+
+        summary = summarize_advisor_evaluations(evaluations)
+        horizon_scores = [
+            float(item["horizon_average_score"])
+            for item in evaluations
+            if item.get("horizon_average_score") is not None
+        ]
+        average_horizon_score = round(sum(horizon_scores) / len(horizon_scores), 3) if horizon_scores else None
+        cols = st.columns(5)
+        accuracy = summary.get("direction_accuracy")
+        avg_return = summary.get("average_paper_return_pct")
+        avg_score = summary.get("average_score")
+        cols[0].metric(t("advisor_outcome"), int(summary.get("evaluated_count") or 0))
+        cols[1].metric(
+            t("advisor_direction_accuracy"),
+            "N/A" if accuracy is None else f"{float(accuracy):.0%}",
+        )
+        cols[2].metric(
+            t("advisor_paper_return"),
+            "N/A" if avg_return is None else f"{float(avg_return):+.3f}%",
+        )
+        cols[3].metric("Score", "N/A" if avg_score is None else f"{float(avg_score):.2f}")
+        cols[4].metric(
+            t("advisor_horizon_scores"),
+            "N/A" if average_horizon_score is None else f"{average_horizon_score:.2f}",
+        )
+
+        st.dataframe(
+            [
+                {
+                    "id": item.get("id"),
+                    "time": str(item.get("created_at") or "")[:19],
+                    "symbol": item.get("symbol"),
+                    "stance": item.get("stance"),
+                    "confidence": item.get("confidence"),
+                    "entry": item.get("entry_price"),
+                    "mark": item.get("exit_price"),
+                    "return_pct": item.get("return_pct"),
+                    "paper_return_pct": item.get("paper_return_pct"),
+                    "status": item.get("status"),
+                    "outcome": item.get("outcome"),
+                    "1m_paper": item.get("horizon_1m"),
+                    "1m_outcome": item.get("horizon_outcome_1m"),
+                    "5m_paper": item.get("horizon_5m"),
+                    "5m_outcome": item.get("horizon_outcome_5m"),
+                    "10m_paper": item.get("horizon_10m"),
+                    "10m_outcome": item.get("horizon_outcome_10m"),
+                    "eval_ready": item.get("evaluation_ready"),
+                    "ready": item.get("ready_horizons"),
+                    "pending": item.get("pending_horizons"),
+                    "question": item.get("question"),
+                }
+                for item in evaluations
+            ],
+            width="stretch",
+            height=260,
+        )
+        performance = summarize_advisor_performance(evaluations)
+        if performance:
+            st.markdown(f"#### {t('advisor_performance')}")
+            st.dataframe(
+                performance,
+                width="stretch",
+                height=min(260, 56 + len(performance) * 36),
+            )
 
 
 def render_advisor_council() -> None:
@@ -5495,11 +8946,13 @@ def render_advisor_council() -> None:
             status.update(label=t("advisor_done"), state="complete", expanded=True)
         st.session_state.advisor_prompt_nonce += 1
         render_advisor_result(result)
+        render_advisor_evaluation_panel()
         return
 
     if st.session_state.get("last_advisor_result"):
         st.markdown(f"#### {t('advisor_result')}")
         render_advisor_result(st.session_state.last_advisor_result)
+    render_advisor_evaluation_panel()
 
 
 def render_sync_bus() -> None:
@@ -5510,7 +8963,7 @@ def render_sync_bus() -> None:
     cols[1].metric("Agent Events", len(st.session_state.get("team_events", [])))
     cols[2].metric("API Calls", len(st.session_state.get("api_trace", [])))
     cols[3].metric("Chart Snapshots", len(st.session_state.get("chart_snapshots", [])))
-    st.code(format_runtime_events(18), language="text")
+    render_agent_timeline(18)
     with st.expander(t("api_trace"), expanded=False):
         api_rows = st.session_state.get("api_trace", [])[-20:]
         if api_rows:
@@ -5561,16 +9014,7 @@ def render_chat() -> None:
             unsafe_allow_html=True,
         )
 
-        st.markdown(f"#### {t('agent_log')}")
-        st.code(st.session_state.agent_execution_log, language="text")
-        render_sync_bus()
-        st.download_button(
-            t("download_log"),
-            data=st.session_state.agent_execution_log,
-            file_name=f"deriv-agent-log-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt",
-            mime="text/plain",
-            width="stretch",
-        )
+        # Agent timeline removed; access via Monitor page
 
         if clear_clicked:
             st.session_state.prompt_nonce += 1
@@ -5593,7 +9037,7 @@ def render_chat() -> None:
 
             def live_writer(line: str) -> None:
                 st.write(line)
-                live_slot.code(format_runtime_events(22), language="text")
+                live_slot.markdown(agent_timeline_html(22), unsafe_allow_html=True)
 
             with st.status(t("team_processing"), expanded=True) as status:
                 team_result = run_hierarchical_trading_team(prompt, writer=live_writer)
@@ -5603,13 +9047,19 @@ def render_chat() -> None:
                     status.update(label=t("team_blocked"), state="error", expanded=True)
 
             with st.expander(t("structured_result"), expanded=False):
-                st.json(
-                    {
-                        "market_report": team_result.market_report,
-                        "execution_report": team_result.execution_report,
-                        "events": [event.line() for event in team_result.events],
-                    }
-                )
+                st.markdown("**团队思路**")
+                for event in team_result.events:
+                    st.markdown(f"- {localized_event_line(event)}")
+                if team_result.market_report:
+                    label = "行情结论" if current_lang() == "zh" else "Market summary"
+                    st.markdown(f"**{label}**：{team_result.market_report.get('summary') or team_result.market_report.get('ai_brief') or '-'}")
+                if team_result.execution_report:
+                    if current_lang() == "zh":
+                        status = team_result.execution_report.get("status") or ("完成" if team_result.execution_report.get("ok") else "阻断")
+                    else:
+                        status = team_result.execution_report.get("status") or ("Completed" if team_result.execution_report.get("ok") else "Blocked")
+                    label = "执行状态" if current_lang() == "zh" else "Execution status"
+                    st.markdown(f"**{label}**：{status}")
 
             answer = team_result.final_answer
             rendered = st.write_stream(stream_text(answer))
@@ -5619,22 +9069,1354 @@ def render_chat() -> None:
         st.session_state.prompt_nonce += 1
 
 
+PAGE_KEYS = ["cases", "advisor", "micro", "trading", "charts", "monitor"]
+PAGE_NAV_CODES = {
+    "cases": "TC",
+    "advisor": "AD",
+    "micro": "MI",
+    "trading": "EX",
+    "charts": "CH",
+    "monitor": "MO",
+}
+
+CASE_STAGE_LABELS = {
+    "zh": {
+        "draft": "目标草稿",
+        "advisor_review": "谋士讨论",
+        "market_validation": "行情验证",
+        "micro_backtest": "小笔回测",
+        "risk_review": "风控复核",
+        "awaiting_confirmation": "等待人工确认",
+        "execution": "交易执行",
+        "review": "成交复盘",
+    },
+    "en": {
+        "draft": "Objective Draft",
+        "advisor_review": "Advisor Review",
+        "market_validation": "Market Validation",
+        "micro_backtest": "Micro Backtest",
+        "risk_review": "Risk Review",
+        "awaiting_confirmation": "Human Confirmation",
+        "execution": "Execution",
+        "review": "Post-trade Review",
+    },
+}
+
+CASE_STATUS_LABELS = {
+    "zh": {"active": "进行中", "paused": "已暂停", "completed": "已完成", "cancelled": "已取消", "failed": "失败"},
+    "en": {"active": "Active", "paused": "Paused", "completed": "Completed", "cancelled": "Cancelled", "failed": "Failed"},
+}
+
+
+def case_stage_label(stage: str) -> str:
+    return CASE_STAGE_LABELS[current_lang()].get(stage, stage)
+
+
+def case_status_label(status: str) -> str:
+    return CASE_STATUS_LABELS[current_lang()].get(status, status)
+
+
+def case_next_page(stage: str) -> str:
+    return {
+        "draft": "advisor",
+        "advisor_review": "charts",
+        "market_validation": "micro",
+        "micro_backtest": "trading",
+        "risk_review": "trading",
+        "awaiting_confirmation": "trading",
+        "execution": "monitor",
+        "review": "monitor",
+    }.get(stage, "advisor")
+
+
+def case_artifact_payload(case: dict[str, Any], artifact_type: str) -> dict[str, Any] | None:
+    artifact = (((case.get("context") or {}).get("artifacts") or {}).get(artifact_type) or {})
+    payload = artifact.get("payload")
+    return payload if isinstance(payload, dict) else None
+
+
+def save_workflow_checkpoint(
+    case_id: str,
+    *,
+    completed_steps: list[str],
+    current_step: str,
+    status: str,
+    failed_step: str | None = None,
+    detail: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    case = get_trade_case(DB_PATH, case_id)
+    if case is None:
+        raise KeyError(f"unknown trade case: {case_id}")
+    payload = {
+        "status": status,
+        "current_step": current_step,
+        "completed_steps": list(dict.fromkeys(completed_steps)),
+        "failed_step": failed_step,
+        "detail": detail or {},
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    return record_trade_case_artifact(
+        DB_PATH,
+        case_id,
+        artifact_type="workflow_run",
+        actor="workflow_orchestrator",
+        message=f"Workflow {status}: {current_step}",
+        payload=payload,
+        expected_version=int(case["version"]),
+    )
+
+
+def earliest_retry_step(blockers: list[str]) -> str:
+    if any(code in blockers for code in {"missing_advisor", "advisor_not_actionable", "direction_conflict", "symbol_mismatch"}):
+        return "advisor"
+    if any(code in blockers for code in {"missing_market", "market_data_unhealthy"}):
+        return "market"
+    if any(code in blockers for code in {"missing_micro_strategy", "micro_not_actionable", "budget_blocked", "backtest_halted", "no_paper_trades"}):
+        return "micro_strategy"
+    return "consistency_gate"
+
+
+def run_trade_case_simulation(
+    case_id: str,
+    *,
+    amount: float = 1.0,
+    candle_count: int = 120,
+    time_budget_seconds: int = 8,
+    use_web: bool = False,
+    retry_failed: bool = False,
+    writer: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    case = get_trade_case(DB_PATH, case_id)
+    if case is None:
+        return {"ok": False, "reason": "missing_case"}
+    if case.get("status") == "failed" and retry_failed:
+        case = control_trade_case(
+            DB_PATH,
+            case_id,
+            "retry",
+            actor="workflow_orchestrator",
+            expected_version=int(case["version"]),
+        )
+    if case.get("status") != "active":
+        return {"ok": False, "reason": f"case_{case.get('status')}"}
+    if st.session_state.get("pending_trade"):
+        return {
+            "ok": False,
+            "reason": "pending_trade_exists",
+            "case_id": case_id,
+            "error": "Resolve or clear the existing pending trade before starting another simulation.",
+        }
+
+    st.session_state.active_trade_case_id = case_id
+    resume_step = workflow_resume_step(case)
+    start_index = WORKFLOW_STEPS.index(resume_step)
+    previous_workflow = case_artifact_payload(case, "workflow_run") or {}
+    completed_steps = [
+        step for step in previous_workflow.get("completed_steps", []) if step in WORKFLOW_STEPS[:start_index]
+    ]
+    current_step = resume_step
+
+    def announce(message: str) -> None:
+        if writer:
+            writer(message)
+        push_runtime_event("case_workflow", "Orchestrator", case_id, message)
+
+    try:
+        advisor = case_artifact_payload(case, "advisor")
+        if start_index <= WORKFLOW_STEPS.index("advisor") or not advisor:
+            current_step = "advisor"
+            announce(f"{case_id}: advisor council started")
+            advisor = run_advisor_council(
+                str(case["objective"]),
+                str(case["symbol"]),
+                int(time_budget_seconds),
+                bool(use_web),
+                writer,
+            )
+            refreshed = get_trade_case(DB_PATH, case_id) or case
+            if not case_artifact_payload(refreshed, "advisor"):
+                sync_active_trade_case_artifact(
+                    "advisor",
+                    actor="workflow_orchestrator",
+                    message="Automated advisor result saved",
+                    payload=advisor,
+                )
+            completed_steps.append("advisor")
+            save_workflow_checkpoint(
+                case_id,
+                completed_steps=completed_steps,
+                current_step="advisor",
+                status="running",
+                detail={"stance": advisor.get("stance"), "confidence": advisor.get("confidence")},
+            )
+        else:
+            announce(f"{case_id}: reusing advisor evidence")
+
+        case = get_trade_case(DB_PATH, case_id) or case
+        market = case_artifact_payload(case, "market")
+        if start_index <= WORKFLOW_STEPS.index("market") or not market:
+            current_step = "market"
+            announce(f"{case_id}: market validation started")
+            candle_result = fetch_compare_candles(str(case["symbol"]), DEFAULT_GRANULARITY, int(candle_count))
+            if not candle_result.get("ok"):
+                raise RuntimeError((candle_result.get("error") or {}).get("message", "market fetch failed"))
+            frame = candles_frame_from_result(candle_result)
+            if frame.empty:
+                raise RuntimeError("market returned no drawable candles")
+            integrity = chart_integrity_report(frame, DEFAULT_GRANULARITY)
+            market = {
+                "symbol": str(case["symbol"]),
+                "granularity": DEFAULT_GRANULARITY,
+                "candle_count": len(frame),
+                "latest_timestamp": frame.iloc[-1]["timestamp"].isoformat(),
+                "latest_close": float(frame.iloc[-1]["close"]),
+                "integrity": integrity,
+                "candle_result": candle_result,
+            }
+            add_chart_snapshot(candle_result, source="workflow_orchestrator")
+            sync_active_trade_case_artifact(
+                "market",
+                actor="workflow_orchestrator",
+                message="Automated market evidence saved",
+                payload=market,
+            )
+            completed_steps.append("market")
+            save_workflow_checkpoint(
+                case_id,
+                completed_steps=completed_steps,
+                current_step="market",
+                status="running",
+                detail={"integrity": integrity, "candle_count": len(frame)},
+            )
+        else:
+            announce(f"{case_id}: reusing market evidence")
+
+        case = get_trade_case(DB_PATH, case_id) or case
+        micro = case_artifact_payload(case, "micro_strategy")
+        if start_index <= WORKFLOW_STEPS.index("micro_strategy") or not micro:
+            current_step = "micro_strategy"
+            announce(f"{case_id}: micro strategy backtest started")
+            candle_result = (market or {}).get("candle_result") or {}
+            frame = candles_frame_from_result(candle_result)
+            if frame.empty:
+                raise RuntimeError("persisted market evidence has no candles")
+            price_frame = normalize_price_frame(frame[["timestamp", "close"]])
+            config = MicroTradeConfig(symbol=str(case["symbol"]), max_trade_amount=float(amount))
+            budget_check = budget_guard_check(
+                action="execute_simulated_trade",
+                amount=float(amount),
+                limits=BudgetLimits(
+                    max_single_trade_amount=float(amount),
+                    max_daily_trade_budget=max(5.0, float(amount)),
+                    max_total_trade_budget=max(5.0, float(amount)),
+                ),
+                daily_spent=0,
+                total_spent=0,
+            )
+            decision = analyze_micro_trade(price_frame, config)
+            backtest = backtest_micro_strategy(
+                price_frame,
+                config,
+                CircuitBreakerConfig(),
+                lookback_bars=8,
+            )
+            operator_brief = micro_operator_brief(
+                decision,
+                budget_check,
+                backtest,
+                price_frame,
+                data_source="live",
+                symbol=config.symbol,
+            )
+            save_micro_strategy_run(
+                goal=str(case["objective"]),
+                config=config,
+                decision=decision,
+                budget_check=budget_check,
+                backtest=backtest,
+                operator_brief=operator_brief,
+                data_source="live",
+            )
+            case = get_trade_case(DB_PATH, case_id) or case
+            micro = case_artifact_payload(case, "micro_strategy") or {
+                "config": {"symbol": config.symbol, "max_trade_amount": config.max_trade_amount},
+                "decision": decision,
+                "budget_guard": budget_check,
+                "backtest": backtest,
+                "operator_brief": operator_brief,
+            }
+            completed_steps.append("micro_strategy")
+            save_workflow_checkpoint(
+                case_id,
+                completed_steps=completed_steps,
+                current_step="micro_strategy",
+                status="running",
+                detail={"action": decision.get("action"), "trade_count": (backtest.get("summary") or {}).get("trade_count")},
+            )
+        else:
+            announce(f"{case_id}: reusing micro strategy evidence")
+
+        current_step = "consistency_gate"
+        draft = advisor_trade_draft(
+            advisor,
+            amount=float(amount),
+            duration=5,
+            duration_unit="t",
+            allow_live=False,
+        )
+        pending = draft.get("pending_trade") if draft.get("ok") else None
+        gate = trade_case_consistency_gate(
+            case,
+            advisor=advisor,
+            market=market,
+            micro=micro,
+            pending_trade=pending,
+        )
+        sync_active_trade_case_artifact(
+            "risk",
+            actor="consistency_gate",
+            message="Automated consistency gate completed",
+            payload=gate,
+        )
+        completed_steps.append("consistency_gate")
+        if not gate["ok"]:
+            retry_step = earliest_retry_step(gate["blockers"])
+            save_workflow_checkpoint(
+                case_id,
+                completed_steps=completed_steps,
+                current_step="consistency_gate",
+                status="blocked",
+                failed_step=retry_step,
+                detail=gate,
+            )
+            announce(f"{case_id}: consistency gate blocked the order")
+            result = {
+                "ok": True,
+                "ready_for_confirmation": False,
+                "case_id": case_id,
+                "gate": gate,
+                "resume_step": retry_step,
+            }
+            st.session_state.last_case_workflow_result = result
+            return result
+
+        current_step = "human_confirmation"
+        set_pending_trade_state(pending, source="workflow_orchestrator")
+        completed_steps.append("human_confirmation")
+        save_workflow_checkpoint(
+            case_id,
+            completed_steps=completed_steps,
+            current_step="human_confirmation",
+            status="awaiting_confirmation",
+            detail=gate,
+        )
+        result = {
+            "ok": True,
+            "ready_for_confirmation": True,
+            "case_id": case_id,
+            "gate": gate,
+            "pending_trade": pending,
+        }
+        st.session_state.last_case_workflow_result = result
+        announce(f"{case_id}: waiting for human confirmation")
+        return result
+    except Exception as exc:
+        failure = {
+            "status": "failed",
+            "current_step": current_step,
+            "completed_steps": list(dict.fromkeys(completed_steps)),
+            "failed_step": current_step,
+            "detail": {"error": str(exc)},
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        latest = get_trade_case(DB_PATH, case_id)
+        if latest and latest.get("status") == "active":
+            update_trade_case(
+                DB_PATH,
+                case_id,
+                actor="workflow_orchestrator",
+                message=f"Workflow failed at {current_step}",
+                event_type="workflow_failure",
+                status="failed",
+                artifact_type="workflow_run",
+                payload=failure,
+                expected_version=int(latest["version"]),
+                last_error=str(exc),
+            )
+        result = {
+            "ok": False,
+            "reason": "workflow_failed",
+            "case_id": case_id,
+            "failed_step": current_step,
+            "error": str(exc),
+        }
+        st.session_state.last_case_workflow_result = result
+        announce(f"{case_id}: failed at {current_step}: {exc}")
+        return result
+
+
+def render_trade_case_banner() -> None:
+    case = active_trade_case()
+    if not case:
+        return
+    cols = st.columns([0.68, 0.16, 0.16])
+    cols[0].caption(
+        f"{t('case_active')}: `{case['id']}` · {case['title']} · "
+        f"{case_stage_label(str(case['stage']))} · v{case['version']}"
+    )
+    cols[1].metric(t("case_status"), case_status_label(str(case["status"])))
+    if cols[2].button(t("page_cases"), key="open_active_trade_case", width="stretch"):
+        st.session_state.active_page = "cases"
+        st.rerun()
+
+
+def render_trade_cases_page() -> None:
+    st.markdown(f"### {t('page_cases')}")
+    st.markdown(f'<p class="small-muted">{html.escape(t("page_cases_caption"))}</p>', unsafe_allow_html=True)
+
+    with st.expander(t("case_new"), expanded=not bool(list_trade_cases(DB_PATH, limit=1))):
+        with st.form("create_trade_case_form", clear_on_submit=False):
+            create_cols = st.columns([0.28, 0.5, 0.22])
+            title = create_cols[0].text_input(t("case_title"), placeholder="R_75 short-window validation")
+            objective = create_cols[1].text_input(
+                t("case_objective"),
+                placeholder=(
+                    "先问谋士、验证行情、跑小笔回测，通过风控后再决定是否提交模拟订单"
+                    if current_lang() == "zh"
+                    else "Ask advisors, validate data, run a micro backtest, then review a demo order"
+                ),
+            )
+            symbol = create_cols[2].text_input(t("case_symbol"), value=DEFAULT_SYMBOL)
+            submitted = st.form_submit_button(t("case_create"), type="primary", width="stretch")
+        if submitted:
+            if not objective.strip():
+                st.warning(t("case_objective"))
+            else:
+                case = create_active_trade_case(objective, symbol, title)
+                st.success(f"{t('case_created')}: {case['id']}")
+                st.rerun()
+
+    cases = list_trade_cases(DB_PATH, limit=30)
+    if not cases:
+        st.info(t("case_none"))
+        return
+
+    labels = {
+        item["id"]: f"{item['id']} · {item['title']} · {case_status_label(str(item['status']))}"
+        for item in cases
+    }
+    case_ids = list(labels)
+    current_id = str(st.session_state.get("active_trade_case_id") or case_ids[0])
+    if current_id not in case_ids:
+        current_id = case_ids[0]
+    selected_id = st.selectbox(
+        t("case_active"),
+        case_ids,
+        index=case_ids.index(current_id),
+        format_func=lambda value: labels[value],
+        key="trade_case_selector",
+    )
+    if selected_id != st.session_state.get("active_trade_case_id"):
+        st.session_state.active_trade_case_id = selected_id
+    case = get_trade_case(DB_PATH, selected_id)
+    if case is None:
+        st.error(t("case_none"))
+        return
+
+    metrics = st.columns(5)
+    metrics[0].metric("Case ID", case["id"])
+    metrics[1].metric(t("case_status"), case_status_label(str(case["status"])))
+    metrics[2].metric(t("case_stage"), case_stage_label(str(case["stage"])))
+    metrics[3].metric(t("case_version"), int(case["version"]))
+    metrics[4].metric(t("case_updated"), local_time_label(case["updated_at"], "%m-%d %H:%M MYT"))
+    st.caption(f"{case['objective']} · Symbol `{case['symbol']}`")
+
+    with st.container(border=True):
+        st.markdown(f"#### {t('case_auto_run')}")
+        st.caption(t("case_auto_run_caption"))
+        run_cols = st.columns([0.2, 0.2, 0.2, 0.2, 0.2])
+        workflow_amount = run_cols[0].number_input(
+            t("case_trade_amount"),
+            min_value=0.35,
+            max_value=10.0,
+            value=1.0,
+            step=0.25,
+            key=f"case_amount_{case['id']}",
+        )
+        workflow_candles = run_cols[1].number_input(
+            t("case_candle_count"),
+            min_value=40,
+            max_value=500,
+            value=120,
+            step=20,
+            key=f"case_candles_{case['id']}",
+        )
+        workflow_budget = run_cols[2].number_input(
+            t("case_time_budget"),
+            min_value=4,
+            max_value=25,
+            value=8,
+            step=1,
+            key=f"case_time_budget_{case['id']}",
+        )
+        workflow_web = run_cols[3].toggle(
+            t("case_use_web"),
+            value=False,
+            key=f"case_web_{case['id']}",
+        )
+        run_label = t("case_retry_from_failure") if case["status"] == "failed" else t("case_run_now")
+        run_clicked = run_cols[4].button(
+            run_label,
+            key=f"case_run_{case['id']}",
+            type="primary",
+            width="stretch",
+            disabled=case["status"] not in {"active", "failed"},
+        )
+        if run_clicked:
+            with st.status(t("case_auto_run"), expanded=True) as workflow_status:
+                result = run_trade_case_simulation(
+                    str(case["id"]),
+                    amount=float(workflow_amount),
+                    candle_count=int(workflow_candles),
+                    time_budget_seconds=int(workflow_budget),
+                    use_web=bool(workflow_web),
+                    retry_failed=case["status"] == "failed",
+                    writer=st.write,
+                )
+                if not result.get("ok"):
+                    workflow_status.update(
+                        label=f"{t('case_failed_step')}: {workflow_step_label(result.get('failed_step'))}",
+                        state="error",
+                    )
+                elif result.get("ready_for_confirmation"):
+                    workflow_status.update(label=t("case_ready_confirmation"), state="complete")
+                else:
+                    workflow_status.update(label=t("case_no_confirmation"), state="complete")
+            st.rerun()
+
+        workflow_artifact = case_artifact_payload(case, "workflow_run") or {}
+        render_trade_case_operator_brief(case)
+        if workflow_artifact:
+            with st.expander(
+                t("case_run_details"),
+                expanded=workflow_artifact.get("status") == "failed",
+            ):
+                workflow_metrics = st.columns(3)
+                workflow_metrics[0].metric(
+                    t("case_failed_step"),
+                    workflow_step_label(workflow_artifact.get("failed_step"))
+                    if workflow_artifact.get("status") in {"failed", "blocked"}
+                    else "-",
+                )
+                workflow_metrics[1].metric(
+                    t("case_gate_result"),
+                    workflow_status_label(workflow_artifact.get("status")),
+                )
+                workflow_metrics[2].metric(
+                    t("case_stage"),
+                    workflow_phase_label(workflow_artifact.get("current_step")),
+                )
+                detail = workflow_artifact.get("detail") or {}
+                blockers = display_case_blockers(detail.get("blockers") or [], detail)
+                if blockers:
+                    st.warning(
+                        f"{t('case_blockers')}: "
+                        + "；".join(case_blocker_message(str(code)) for code in blockers)
+                    )
+                if workflow_artifact.get("status") == "failed" and detail.get("error"):
+                    st.error(str(detail["error"]))
+
+    controls = st.columns([0.18, 0.18, 0.18, 0.46])
+    control_action: str | None = None
+    if case["status"] == "active" and controls[0].button(t("case_pause"), key=f"pause_{case['id']}", width="stretch"):
+        control_action = "pause"
+    if case["status"] == "paused" and controls[1].button(t("case_resume"), key=f"resume_{case['id']}", width="stretch"):
+        control_action = "resume"
+    if case["status"] in {"active", "paused", "failed"} and controls[2].button(t("case_cancel"), key=f"cancel_{case['id']}", width="stretch"):
+        control_action = "cancel"
+    if controls[3].button(t("case_open_module"), key=f"next_{case['id']}", type="primary", width="stretch"):
+        st.session_state.active_page = case_next_page(str(case["stage"]))
+        st.rerun()
+    if control_action:
+        try:
+            control_trade_case(
+                DB_PATH,
+                str(case["id"]),
+                control_action,
+                expected_version=int(case["version"]),
+            )
+            st.rerun()
+        except TradeCaseConflict:
+            st.warning(t("case_conflict"))
+        except TradeCaseTransitionError as exc:
+            st.warning(str(exc))
+
+    stage_index = CASE_STAGES.index(str(case["stage"])) if case["stage"] in CASE_STAGES else 0
+    st.markdown(f"#### {t('case_progress')}")
+    st.progress((stage_index + 1) / len(CASE_STAGES))
+    progress_cols = st.columns(4)
+    for index, stage in enumerate(CASE_STAGES):
+        state = "✓" if index < stage_index else "●" if index == stage_index else "○"
+        progress_cols[index % 4].caption(f"{state} {case_stage_label(stage)}")
+
+    artifacts = dict((case.get("context") or {}).get("artifacts") or {})
+    st.markdown(f"#### {t('case_artifacts')}")
+    if artifacts:
+        artifact_rows = []
+        for artifact_type, artifact in artifacts.items():
+            payload = artifact.get("payload") or {}
+            artifact_rows.append(
+                {
+                    ("产物" if current_lang() == "zh" else "Artifact"): artifact_type,
+                    ("来源" if current_lang() == "zh" else "Actor"): artifact.get("actor"),
+                    ("更新时间" if current_lang() == "zh" else "Updated"): local_time_label(artifact.get("updated_at"), "%m-%d %H:%M:%S MYT"),
+                    ("摘要" if current_lang() == "zh" else "Summary"): str(
+                        payload.get("consensus")
+                        or payload.get("headline")
+                        or payload.get("recommendation")
+                        or payload.get("snapshot_id")
+                        or payload.get("status")
+                        or payload.get("contract_id")
+                        or "saved"
+                    )[:180],
+                }
+            )
+        st.dataframe(artifact_rows, width="stretch", hide_index=True)
+    else:
+        st.info(t("case_none"))
+
+    events = list_trade_case_events(DB_PATH, str(case["id"]), limit=200)
+    st.markdown(f"#### {t('case_events')}")
+    event_rows = [
+        {
+            ("时间" if current_lang() == "zh" else "Time"): local_time_label(item["created_at"], "%m-%d %H:%M:%S MYT"),
+            ("版本" if current_lang() == "zh" else "Version"): item["version"],
+            ("角色" if current_lang() == "zh" else "Actor"): item["actor"],
+            ("阶段" if current_lang() == "zh" else "Stage"): case_stage_label(str(item["stage"])),
+            ("事件" if current_lang() == "zh" else "Event"): item["message"],
+        }
+        for item in events
+    ]
+    st.dataframe(event_rows, width="stretch", hide_index=True, height=min(420, 72 + len(event_rows) * 34))
+
+
+def render_page_nav() -> str:
+    current = st.session_state.get("active_page", "advisor")
+    if current not in PAGE_KEYS:
+        current = "advisor"
+    current_label = t(f"page_{current}")
+    st.markdown(
+        f"""
+        <div class="workspace-head">
+          <div class="workspace-title">{html.escape(t('workspace'))}</div>
+          <div class="workspace-route">Gateway / {html.escape(current_label)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    nav_cards = []
+    for page_key in PAGE_KEYS:
+        active = page_key == current
+        state = "ACTIVE" if active else "READY"
+        nav_cards.append(
+            f"""
+            <div class="nav-card {'active' if active else ''}">
+              <div class="nav-top">
+                <div class="nav-code">{html.escape(PAGE_NAV_CODES[page_key])}</div>
+                <div class="nav-state">{state}</div>
+              </div>
+              <div class="nav-label">{html.escape(t(f'page_{page_key}'))}</div>
+              <div class="nav-caption">{html.escape(t(f'page_{page_key}_caption'))}</div>
+            </div>
+            """.strip()
+        )
+    st.markdown(f'<div class="nav-grid">{"".join(nav_cards)}</div>', unsafe_allow_html=True)
+    nav_cols = st.columns(len(PAGE_KEYS))
+    for col, page_key in zip(nav_cols, PAGE_KEYS, strict=True):
+        if col.button(
+            t(f"page_{page_key}"),
+            key=f"nav_{page_key}",
+            type="primary" if page_key == current else "secondary",
+            width="stretch",
+        ):
+            st.session_state.active_page = page_key
+            st.rerun()
+    selected = st.session_state.get("active_page", current)
+    st.markdown(
+        f"""
+        <div class="page-context">
+          <strong>{html.escape(t(f"page_{selected}"))}</strong>
+          <span>{html.escape(t(f"page_{selected}_caption"))}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    return selected
+
+
+def render_advisor_page() -> None:
+    render_advisor_council()
+
+
+def default_micro_prices() -> str:
+    return "100,100.03,100.06,100.10,100.15,100.22,100.30,100.39,100.49,100.61,100.74,100.88,101.03,101.19,101.36,101.54"
+
+
+def micro_price_frame_from_text(raw: str) -> pd.DataFrame:
+    values: list[dict[str, float]] = []
+    for chunk in re.split(r"[\n,，\s]+", raw.strip()):
+        if not chunk:
+            continue
+        try:
+            values.append({"close": float(chunk)})
+        except ValueError:
+            continue
+    return normalize_price_frame(values)
+
+
+def micro_budget_reason_label(reason: Any, *, lang: str | None = None) -> str:
+    language = lang or current_lang()
+    text = str(reason or "unknown")
+    zh = {
+        "within_budget": "未超预算",
+        "single_trade_limit_exceeded": "单笔金额超过限制",
+        "daily_budget_exceeded": "今日预算不足",
+        "total_budget_exceeded": "总预算不足",
+        "missing_amount": "缺少金额",
+        "invalid_amount": "金额无效",
+        "unknown": "未知",
+    }
+    en = {
+        "within_budget": "Within budget",
+        "single_trade_limit_exceeded": "Single-trade limit exceeded",
+        "daily_budget_exceeded": "Daily budget exceeded",
+        "total_budget_exceeded": "Total budget exceeded",
+        "missing_amount": "Missing amount",
+        "invalid_amount": "Invalid amount",
+        "unknown": "Unknown",
+    }
+    labels = zh if language == "zh" else en
+    return labels.get(text, text.replace("_", " "))
+
+
+def micro_halt_reason_label(reason: Any, *, lang: str | None = None) -> str:
+    language = lang or current_lang()
+    text = str(reason or "none")
+    zh = {
+        "none": "无熔断",
+        "max_consecutive_losses": "连续亏损熔断",
+        "max_total_loss_amount": "累计亏损熔断",
+        "max_drawdown_pct": "回撤熔断",
+        "max_trade_count": "交易次数上限",
+    }
+    en = {
+        "none": "No halt",
+        "max_consecutive_losses": "Consecutive-loss halt",
+        "max_total_loss_amount": "Total-loss halt",
+        "max_drawdown_pct": "Drawdown halt",
+        "max_trade_count": "Trade-count limit",
+    }
+    labels = zh if language == "zh" else en
+    return labels.get(text, text.replace("_", " "))
+
+
+def micro_action_label(action: Any, *, lang: str | None = None) -> str:
+    language = lang or current_lang()
+    text = str(action or "WAIT").upper()
+    zh = {
+        "CALL": "看涨",
+        "PUT": "看跌",
+        "WAIT": "等待",
+        "BUY": "买入",
+        "SELL": "卖出",
+        "HOLD": "持有/等待",
+    }
+    en = {
+        "CALL": "CALL",
+        "PUT": "PUT",
+        "WAIT": "Wait",
+        "BUY": "Buy",
+        "SELL": "Sell",
+        "HOLD": "Hold",
+    }
+    labels = zh if language == "zh" else en
+    label = labels.get(text, text)
+    return f"{label} ({text})" if language == "zh" and text in {"CALL", "PUT"} else label
+
+
+def micro_blocker_label(blocker: Any, *, lang: str | None = None) -> str:
+    language = lang or current_lang()
+    text = str(blocker or "")
+    zh = {
+        "weak_momentum": "动量太弱",
+        "excess_volatility": "波动过高",
+        "low_confidence": "置信度不足",
+        "cost_edge_too_small": "扣除成本后优势太小",
+        "single_trade_limit_exceeded": "单笔金额超过限制",
+        "daily_budget_exceeded": "今日预算不足",
+        "total_budget_exceeded": "总预算不足",
+    }
+    en = {
+        "weak_momentum": "Weak momentum",
+        "excess_volatility": "Excess volatility",
+        "low_confidence": "Low confidence",
+        "cost_edge_too_small": "Cost-adjusted edge too small",
+        "single_trade_limit_exceeded": "Single-trade limit exceeded",
+        "daily_budget_exceeded": "Daily budget exceeded",
+        "total_budget_exceeded": "Total budget exceeded",
+    }
+    labels = zh if language == "zh" else en
+    return labels.get(text, text.replace("_", " "))
+
+
+def micro_operator_brief(
+    decision: dict[str, Any],
+    budget_check: dict[str, Any],
+    backtest: dict[str, Any],
+    frame: pd.DataFrame,
+    *,
+    lang: str | None = None,
+    data_source: str = "manual",
+    symbol: str = "",
+) -> dict[str, Any]:
+    language = lang or current_lang()
+    action = str(decision.get("action") or "WAIT")
+    confidence = float(decision.get("confidence") or 0.0)
+    blockers = [str(item) for item in decision.get("blockers") or []]
+    summary = backtest.get("summary") or {}
+    trade_count = int(summary.get("trade_count") or 0)
+    total_pnl = float(summary.get("total_pnl") or 0.0)
+    win_rate = summary.get("win_rate")
+    budget_ok = bool(budget_check.get("ok"))
+    halt_reason = summary.get("halt_reason") or "none"
+    is_live = data_source == "live"
+    display_symbol = symbol or str(decision.get("symbol") or "")
+    weak_backtest = bool(
+        trade_count
+        and (
+            halt_reason != "none"
+            or total_pnl <= 0
+            or (win_rate is not None and float(win_rate) < 0.52)
+        )
+    )
+
+    if not budget_ok:
+        recommendation = "禁止交易" if language == "zh" else "Do Not Trade"
+        headline = (
+            "预算闸门已经阻止本轮交易，员工建议：不要开仓，不要继续加码。"
+            if language == "zh"
+            else "Budget guard blocks this run. Keep capital untouched."
+        )
+    elif action in {"WAIT", "HOLD"}:
+        recommendation = "等待" if language == "zh" else "Wait"
+        headline = (
+            "当前信号不够干净，员工建议：继续观察，暂不下单。"
+            if language == "zh"
+            else "No clean small-trade edge yet. Wait for a stronger signal."
+        )
+    elif not is_live:
+        recommendation = "仅测算法" if language == "zh" else "Algorithm Check Only"
+        headline = (
+            "你现在用的是手动/样例收盘价，这只能检查算法逻辑，不能代表当前市场。"
+            if language == "zh"
+            else "Manual/sample closes only check the algorithm; they do not represent the live market."
+        )
+    elif weak_backtest:
+        recommendation = "暂不执行" if language == "zh" else "Do Not Execute Yet"
+        headline = (
+            f"实时方向偏 {micro_action_label(action, lang=language)}，但纸面回测不支持执行："
+            f"胜率 {float(win_rate or 0):.0%}，盈亏 {total_pnl:+.5f}，{micro_halt_reason_label(halt_reason, lang=language)}。"
+            if language == "zh"
+            else (
+                f"Live direction leans {action}, but the paper backtest does not support execution: "
+                f"win rate {float(win_rate or 0):.0%}, P/L {total_pnl:+.5f}, {micro_halt_reason_label(halt_reason, lang=language)}."
+            )
+        )
+    else:
+        recommendation = "观察跟踪" if language == "zh" else "Watch"
+        headline = (
+            f"基于 {display_symbol} 最新K线，短线方向偏 {micro_action_label(action, lang=language)}；回测没有触发熔断，可加入观察清单。"
+            if language == "zh"
+            else f"Latest candles lean {action}; no circuit halt was triggered, so keep it on the watch list."
+        )
+
+    risk_items = (
+        [
+            f"单次金额：{decision.get('risk', {}).get('max_trade_amount', 'N/A')}",
+            f"预算状态：{micro_budget_reason_label(budget_check.get('reason'), lang=language)}",
+            f"熔断状态：{micro_halt_reason_label(halt_reason, lang=language)}",
+        ]
+        if language == "zh"
+        else [
+            f"Trade amount: {decision.get('risk', {}).get('max_trade_amount', 'N/A')}",
+            f"Budget: {micro_budget_reason_label(budget_check.get('reason'), lang=language)}",
+            f"Circuit breaker: {micro_halt_reason_label(halt_reason, lang=language)}",
+        ]
+    )
+    if blockers:
+        risk_items.append(
+            ("阻断项：" if language == "zh" else "Blockers: ")
+            + ", ".join(micro_blocker_label(item, lang=language) for item in blockers)
+        )
+    risk_items.append(
+        ("数据来源：Deriv 最新K线" if is_live else "数据来源：手动/样例，不能代表实时市场")
+        if language == "zh"
+        else ("Data source: latest Deriv candles" if is_live else "Data source: manual/sample closes, not live market")
+    )
+
+    next_steps = []
+    if not budget_ok:
+        next_steps.append(
+            "先降低单次金额，或确认已用预算后再尝试。"
+            if language == "zh"
+            else "Reduce amount or reset spent budget before any new attempt."
+        )
+    elif action in {"WAIT", "HOLD"}:
+        next_steps.append(
+            "先刷新/补充最新收盘价，再重新运行判断。"
+            if language == "zh"
+            else "Collect fresher closes and rerun before considering a trade."
+        )
+    elif not is_live:
+        next_steps.append(
+            "切换到 Deriv 最新K线，再跑一次；不要用样例数据做交易判断。"
+            if language == "zh"
+            else "Switch to latest Deriv candles and rerun before making any trading decision."
+        )
+    elif weak_backtest:
+        next_steps.append(
+            "不要下单；等下一根或下一组K线出来后重跑，必须看到胜率、盈亏、熔断同时改善。"
+            if language == "zh"
+            else "Do not trade; rerun after the next candles and require win rate, PnL, and circuit status to improve together."
+        )
+    else:
+        next_steps.append(
+            "把这次方向放入观察清单；连续多轮一致时，再去主交易台生成待确认订单。"
+            if language == "zh"
+            else "Track this direction; only draft a confirmed trade after repeated consistent runs."
+        )
+    next_steps.append(
+        "不要绕过主交易台的人工确认闸门。"
+        if language == "zh"
+        else "Do not bypass the main trading desk confirmation gate."
+    )
+
+    return {
+        "headline": headline,
+        "recommendation": recommendation,
+        "data_quality": "实时K线" if is_live and language == "zh" else "Live candles" if is_live else "样例/手动" if language == "zh" else "Manual/sample",
+        "action": action,
+        "action_label": micro_action_label(action, lang=language),
+        "confidence": confidence,
+        "latest_price": decision.get("latest_price"),
+        "bars": len(frame),
+        "trade_count": trade_count,
+        "win_rate": win_rate,
+        "total_pnl": total_pnl,
+        "ending_equity": summary.get("ending_equity"),
+        "risk_items": risk_items,
+        "evidence": {
+            "momentum_3_pct": decision.get("momentum_3_pct"),
+            "momentum_7_pct": decision.get("momentum_7_pct"),
+            "volatility_pct": decision.get("volatility_pct"),
+            "gross_edge_pct": decision.get("gross_edge_pct"),
+            "short_ema": decision.get("short_ema"),
+            "long_ema": decision.get("long_ema"),
+        },
+        "next_steps": next_steps,
+    }
+
+
+def micro_trades_table(trades: list[dict[str, Any]], *, lang: str | None = None) -> pd.DataFrame:
+    if not trades:
+        return pd.DataFrame()
+    language = lang or current_lang()
+    frame = pd.DataFrame(trades)
+    if "action" in frame.columns:
+        frame["action"] = frame["action"].apply(lambda value: micro_action_label(value, lang=language))
+    frame["verdict"] = frame.apply(
+        lambda row: (
+            "通过"
+            if language == "zh" and not row.get("blockers")
+            else "Pass"
+            if not row.get("blockers")
+            else "阻断: " + ", ".join(micro_blocker_label(item, lang=language) for item in (row.get("blockers") or []))
+            if language == "zh"
+            else "Blocked: " + ", ".join(micro_blocker_label(item, lang=language) for item in (row.get("blockers") or []))
+        ),
+        axis=1,
+    )
+    columns = [
+        "index",
+        "action",
+        "entry_price",
+        "exit_price",
+        "return_pct",
+        "pnl",
+        "equity",
+        "confidence",
+        "verdict",
+    ]
+    frame = frame[[column for column in columns if column in frame.columns]].copy()
+    for column in ("entry_price", "exit_price", "return_pct", "pnl", "equity", "confidence"):
+        if column in frame.columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce").round(5)
+    labels = (
+        {
+            "index": "K线序号",
+            "action": "方向",
+            "entry_price": "入场价",
+            "exit_price": "出场价",
+            "return_pct": "收益率%",
+            "pnl": "盈亏",
+            "equity": "权益",
+            "confidence": "置信度",
+            "verdict": "结果",
+        }
+        if language == "zh"
+        else {
+            "index": "Bar",
+            "action": "Direction",
+            "entry_price": "Entry",
+            "exit_price": "Exit",
+            "return_pct": "Return %",
+            "pnl": "P/L",
+            "equity": "Equity",
+            "confidence": "Confidence",
+            "verdict": "Result",
+        }
+    )
+    return frame.rename(columns=labels)
+
+
+def micro_run_record_view(record: dict[str, Any], *, lang: str | None = None) -> dict[str, Any]:
+    language = lang or current_lang()
+    payload = record.get("payload") or {}
+    brief = payload.get("operator_brief") or {}
+    backtest = payload.get("backtest") or {}
+    summary = backtest.get("summary") or {}
+    data_source = payload.get("data_source") or "unknown"
+    win_rate = summary.get("win_rate")
+    headline = brief.get("headline") or (
+        "旧记录缺少员工结论，请重新运行。"
+        if language == "zh"
+        else "Legacy run without operator brief; rerun it."
+    )
+    return {
+        ("时间" if language == "zh" else "Time"): local_time_label(record.get("created_at"), "%m-%d %H:%M MYT"),
+        ("资产" if language == "zh" else "Symbol"): record.get("symbol"),
+        ("数据" if language == "zh" else "Data"): (
+            "实时K线"
+            if data_source == "live" and language == "zh"
+            else "Live candles"
+            if data_source == "live"
+            else "手动/样例"
+            if language == "zh"
+            else "Manual/sample"
+        ),
+        ("建议" if language == "zh" else "Recommendation"): brief.get("recommendation")
+        or ("旧记录" if language == "zh" else "Legacy"),
+        ("方向" if language == "zh" else "Direction"): brief.get("action_label")
+        or micro_action_label(brief.get("action") or record.get("action"), lang=language),
+        ("胜率" if language == "zh" else "Win Rate"): "N/A" if win_rate is None else f"{float(win_rate):.0%}",
+        ("盈亏" if language == "zh" else "P/L"): f"{float(summary.get('total_pnl') if summary else record.get('total_pnl') or 0):+.5f}",
+        ("熔断" if language == "zh" else "Halt"): micro_halt_reason_label(summary.get("halt_reason"), lang=language),
+        ("结论" if language == "zh" else "Brief"): headline,
+    }
+
+
+def micro_recent_runs_table(rows: list[dict[str, Any]], *, lang: str | None = None) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame([micro_run_record_view(row, lang=lang) for row in rows])
+
+
+def render_micro_strategy_page() -> None:
+    st.markdown(f"### {t('micro_strategy')}")
+    st.markdown(f'<p class="small-muted">{html.escape(t("micro_strategy_caption"))}</p>', unsafe_allow_html=True)
+    with st.container(border=True):
+        top = st.columns([0.34, 0.22, 0.2, 0.24])
+        goal = top[0].text_input(t("micro_goal"), value="高频小额交易，先做纸面策略")
+        symbol = top[1].text_input(t("micro_symbol"), value="R_75")
+        asset_kind = top[2].selectbox(t("micro_asset_kind"), ["deriv", "fund", "equity", "crypto", "forex"])
+        trade_amount = top[3].number_input(t("micro_amount"), min_value=0.35, max_value=100.0, value=1.0, step=0.25)
+
+        source_cols = st.columns([0.34, 0.22, 0.44])
+        source_label = source_cols[0].selectbox(
+            t("micro_data_source"),
+            [t("micro_source_live"), t("micro_source_manual")],
+        )
+        live_count = source_cols[1].number_input(t("micro_live_count"), min_value=20, max_value=1000, value=120, step=20)
+        live_granularity = source_cols[2].selectbox(
+            t("micro_live_granularity"),
+            [60, 120, 300, 900, 3600],
+            format_func=lambda value: f"{int(value)}s",
+        )
+        data_source = "live" if source_label == t("micro_source_live") else "manual"
+        if data_source == "manual":
+            prices_text = st.text_area(t("micro_prices"), value=default_micro_prices(), height=104)
+        else:
+            prices_text = default_micro_prices()
+            st.caption(
+                "运行时会抓取 Deriv 最新K线；下面的手动价格不会参与本轮判断。"
+                if current_lang() == "zh"
+                else "The run will use latest Deriv candles; manual closes are ignored for this run."
+            )
+        budget_cols = st.columns(4)
+        daily_budget = budget_cols[0].number_input(t("micro_daily_budget"), min_value=0.35, max_value=500.0, value=5.0, step=0.5)
+        total_budget = budget_cols[1].number_input(t("micro_total_budget"), min_value=0.35, max_value=500.0, value=5.0, step=0.5)
+        spent_today = budget_cols[2].number_input(t("micro_spent_today"), min_value=0.0, max_value=500.0, value=0.0, step=0.5)
+        spent_total = budget_cols[3].number_input(t("micro_spent_total"), min_value=0.0, max_value=500.0, value=0.0, step=0.5)
+
+        circuit_cols = st.columns(4)
+        max_losses = circuit_cols[0].number_input(t("micro_max_losses"), min_value=1, max_value=10, value=3, step=1)
+        max_loss_amount = circuit_cols[1].number_input(t("micro_max_loss_amount"), min_value=0.1, max_value=100.0, value=2.0, step=0.25)
+        max_drawdown = circuit_cols[2].number_input(t("micro_max_drawdown"), min_value=0.1, max_value=50.0, value=3.0, step=0.25)
+        max_trades = circuit_cols[3].number_input(t("micro_max_trades"), min_value=1, max_value=200, value=30, step=1)
+        run_clicked = st.button(t("micro_run"), type="primary", width="stretch")
+
+    if not run_clicked:
+        recent_runs = load_recent_micro_strategy_runs()
+        if recent_runs:
+            st.markdown(f"#### {t('micro_recent_runs')}")
+            recent_table = micro_recent_runs_table(recent_runs)
+            st.dataframe(recent_table, width="stretch", height=min(340, 72 + len(recent_table) * 32))
+        return
+
+    config = MicroTradeConfig(
+        symbol=normalize_deriv_symbol(symbol) if asset_kind == "deriv" else symbol.strip(),
+        asset_kind=asset_kind,  # type: ignore[arg-type]
+        max_trade_amount=float(trade_amount),
+        min_confidence=0.58,
+        max_volatility_pct=2.8 if asset_kind != "fund" else 2.2,
+    )
+    actual_data_source = data_source
+    if data_source == "live" and asset_kind == "deriv":
+        live_result = fetch_compare_candles(config.symbol, int(live_granularity), int(live_count))
+        if not live_result.get("ok"):
+            st.error(
+                "实时K线抓取失败，本轮不会生成交易建议。"
+                if current_lang() == "zh"
+                else "Live candle fetch failed; no trading suggestion is produced."
+            )
+            st.caption((live_result.get("error") or {}).get("message", "unknown error"))
+            return
+        live_frame = candles_frame_from_result(live_result)
+        frame = normalize_price_frame(live_frame[["timestamp", "close"]])
+        push_runtime_event(
+            "micro_strategy",
+            "Deriv Candles",
+            "Micro Strategy",
+            f"{config.symbol} live candles loaded",
+            {"symbol": config.symbol, "granularity": int(live_granularity), "count": len(frame)},
+        )
+    else:
+        frame = micro_price_frame_from_text(prices_text)
+        actual_data_source = "manual"
+        if data_source == "live" and asset_kind != "deriv":
+            st.warning(
+                "非 Deriv 资产暂时没有实时行情接入，本轮按手动输入模式处理。"
+                if current_lang() == "zh"
+                else "Live data is not wired for non-Deriv assets yet; this run uses manual input."
+            )
+    budget_check = budget_guard_check(
+        action="execute_simulated_trade" if asset_kind == "deriv" else "spot_paper_trade",
+        amount=trade_amount,
+        limits=BudgetLimits(
+            max_single_trade_amount=float(trade_amount),
+            max_daily_trade_budget=float(daily_budget),
+            max_total_trade_budget=float(total_budget),
+        ),
+        daily_spent=float(spent_today),
+        total_spent=float(spent_total),
+    )
+    decision = analyze_micro_trade(frame, config)
+    if not budget_check.get("ok"):
+        decision["action"] = "WAIT" if asset_kind == "deriv" else "HOLD"
+        decision["blockers"] = list(decision.get("blockers") or []) + [str(budget_check.get("reason"))]
+
+    backtest = backtest_micro_strategy(
+        frame,
+        config,
+        CircuitBreakerConfig(
+            max_consecutive_losses=int(max_losses),
+            max_total_loss_amount=float(max_loss_amount),
+            max_drawdown_pct=float(max_drawdown),
+            max_trade_count=int(max_trades),
+        ),
+        lookback_bars=8,
+    )
+    operator_brief = micro_operator_brief(
+        decision,
+        budget_check,
+        backtest,
+        frame,
+        data_source=actual_data_source,
+        symbol=config.symbol,
+    )
+    save_micro_strategy_run(
+        goal=goal,
+        config=config,
+        decision=decision,
+        budget_check=budget_check,
+        backtest=backtest,
+        operator_brief=operator_brief,
+        data_source=actual_data_source,
+    )
+    push_runtime_event(
+        "micro_strategy",
+        "Micro Strategy",
+        "Sync Bus",
+        f"{config.symbol} {operator_brief.get('recommendation')} run saved",
+        {
+            "symbol": config.symbol,
+            "recommendation": operator_brief.get("recommendation"),
+            "action": decision.get("action"),
+            "budget_ok": budget_check.get("ok"),
+            "trade_count": (backtest.get("summary") or {}).get("trade_count"),
+        },
+    )
+    st.success(t("micro_saved"))
+
+    st.markdown(f"#### {t('micro_operator_brief')}")
+    st.info(operator_brief["headline"])
+    brief_cols = st.columns(6)
+    brief_cols[0].metric(t("micro_operator_recommendation"), operator_brief["recommendation"])
+    brief_cols[1].metric(t("micro_trade_direction"), operator_brief["action_label"])
+    brief_cols[2].metric("置信度" if current_lang() == "zh" else "Confidence", f"{operator_brief['confidence']:.0%}")
+    brief_cols[3].metric(t("micro_paper_return"), f"{operator_brief['total_pnl']:+.5f}")
+    brief_cols[4].metric("回测次数" if current_lang() == "zh" else "Trades", int(operator_brief["trade_count"]))
+    brief_cols[5].metric(t("micro_data_quality"), operator_brief["data_quality"])
+
+    info_cols = st.columns([0.34, 0.33, 0.33])
+    with info_cols[0]:
+        st.markdown(f"##### {t('micro_risk_brief')}")
+        for item in operator_brief["risk_items"]:
+            st.markdown(f"- `{item}`")
+    with info_cols[1]:
+        st.markdown(f"##### {t('micro_evidence')}")
+        evidence_names = (
+            {
+                "momentum_3_pct": "最近3根动量%",
+                "momentum_7_pct": "最近7根动量%",
+                "volatility_pct": "波动率%",
+                "gross_edge_pct": "扣成本后优势%",
+                "short_ema": "短均线",
+                "long_ema": "长均线",
+            }
+            if current_lang() == "zh"
+            else {
+                "momentum_3_pct": "3-bar Momentum %",
+                "momentum_7_pct": "7-bar Momentum %",
+                "volatility_pct": "Volatility %",
+                "gross_edge_pct": "Cost-adjusted Edge %",
+                "short_ema": "Short EMA",
+                "long_ema": "Long EMA",
+            }
+        )
+        evidence_rows = [
+            {
+                ("指标" if current_lang() == "zh" else "Signal"): evidence_names.get(key, key),
+                ("数值" if current_lang() == "zh" else "Value"): value,
+            }
+            for key, value in operator_brief["evidence"].items()
+        ]
+        st.dataframe(evidence_rows, width="stretch", hide_index=True, height=248)
+    with info_cols[2]:
+        st.markdown(f"##### {t('micro_next_steps')}")
+        for item in operator_brief["next_steps"]:
+            st.markdown(f"- {html.escape(item)}")
+
+    st.markdown(f"#### {t('micro_decision')}")
+    cols = st.columns(5)
+    cols[0].metric("方向" if current_lang() == "zh" else "Direction", micro_action_label(decision.get("action")))
+    cols[1].metric("置信度" if current_lang() == "zh" else "Confidence", f"{float(decision.get('confidence') or 0):.0%}")
+    cols[2].metric("波动率" if current_lang() == "zh" else "Volatility", f"{float(decision.get('volatility_pct') or 0):.3f}%")
+    cols[3].metric("预算" if current_lang() == "zh" else "Budget", micro_budget_reason_label(budget_check.get("reason")))
+    cols[4].metric("数据条数" if current_lang() == "zh" else "Bars", len(frame))
+    with st.expander("策略检查明细" if current_lang() == "zh" else "Strategy Check Details", expanded=False):
+        st.write(
+            "预算：" + micro_budget_reason_label(budget_check.get("reason"))
+            if current_lang() == "zh"
+            else "Budget: " + micro_budget_reason_label(budget_check.get("reason"))
+        )
+        st.write(
+            "信号：" + micro_action_label(decision.get("action"))
+            if current_lang() == "zh"
+            else "Signal: " + micro_action_label(decision.get("action"))
+        )
+        st.write(
+            f"置信度：{float(decision.get('confidence') or 0):.0%}"
+            if current_lang() == "zh"
+            else f"Confidence: {float(decision.get('confidence') or 0):.0%}"
+        )
+
+    st.markdown(f"#### {t('micro_backtest')}")
+    summary = backtest.get("summary") or {}
+    backtest_cols = st.columns(5)
+    backtest_cols[0].metric("回测次数" if current_lang() == "zh" else "Trades", int(summary.get("trade_count") or 0))
+    backtest_cols[1].metric("胜率" if current_lang() == "zh" else "Win Rate", "N/A" if summary.get("win_rate") is None else f"{float(summary['win_rate']):.0%}")
+    backtest_cols[2].metric("盈亏" if current_lang() == "zh" else "P/L", f"{float(summary.get('total_pnl') or 0):+.5f}")
+    backtest_cols[3].metric("权益" if current_lang() == "zh" else "Equity", f"{float(summary.get('ending_equity') or 100):.5f}")
+    backtest_cols[4].metric("熔断" if current_lang() == "zh" else "Halt", micro_halt_reason_label(summary.get("halt_reason")))
+    trades = backtest.get("trades") or []
+    trade_table = micro_trades_table(trades)
+    if not trade_table.empty:
+        st.markdown(f"##### {t('micro_trade_log')}")
+        st.dataframe(trade_table, width="stretch", height=min(360, 72 + len(trade_table) * 32))
+    else:
+        st.info(t("micro_no_trade"))
+
+    recent_runs = load_recent_micro_strategy_runs()
+    if recent_runs:
+        st.markdown(f"#### {t('micro_recent_runs')}")
+        recent_table = micro_recent_runs_table(recent_runs)
+        st.dataframe(recent_table, width="stretch", height=min(340, 72 + len(recent_table) * 32))
+
+
+def render_trading_page() -> None:
+    render_safety_gate_panel()
+    render_pending_trade_panel(show_raw=False)
+    render_chat()
+
+
+def render_charts_page() -> None:
+    st.markdown(f"### {t('live_results')}")
+    st.markdown(f'<p class="small-muted">{html.escape(t("results_hint"))}</p>', unsafe_allow_html=True)
+    render_chart_loader_controls()
+    render_last_artifacts()
+
+
+def render_monitor_page() -> None:
+    render_system_health_panel()
+    render_swarm_graph()
+    render_agent_roster()
+    render_sync_bus()
+    render_audit_export_panel()
+
+
 def main() -> None:
     init_state()
+    hydrate_persisted_session_state()
     configure_page()
     render_sidebar()
     render_header()
-    render_advisor_council()
-
-    left, right = st.columns([0.36, 0.64], gap="large")
-    with left:
-        render_chat()
-    with right:
-        render_swarm_graph()
-        render_agent_roster()
-        st.markdown(f"### {t('live_results')}")
-        st.markdown(f'<p class="small-muted">{html.escape(t("results_hint"))}</p>', unsafe_allow_html=True)
-        render_last_artifacts()
+    render_global_status_bar()
+    active_page = render_page_nav()
+    if active_page != "cases":
+        render_trade_case_banner()
+    if active_page == "cases":
+        render_trade_cases_page()
+    elif active_page == "advisor":
+        render_advisor_page()
+    elif active_page == "micro":
+        render_micro_strategy_page()
+    elif active_page == "trading":
+        render_trading_page()
+    elif active_page == "charts":
+        render_charts_page()
+    else:
+        render_monitor_page()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,53 @@
+name: Fast CI
+
+on:
+  push:
+    branches-ignore: [main]
+  pull_request:
+
+jobs:
+  quick-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Python deps
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -r requirements.txt
+
+      - name: Compile all Python files
+        run: |
+          files=$(git ls-files --cached --others --exclude-standard -- '*.py')
+          if [ -n "$files" ]; then
+            .venv/bin/python -m py_compile $files
+          fi
+
+      - name: Run core tests (no network)
+        run: |
+          .venv/bin/python -m pytest \
+            tests/test_agent_streaming.py \
+            tests/test_micro_trading.py \
+            tests/test_paper_trading.py \
+            tests/test_risk_policy.py \
+            tests/test_trade_cases.py \
+            tests/test_broker_hub.py \
+            tests/test_case_workflow.py \
+            tests/test_budget_guard.py \
+            -q --tb=short
+
+      - name: Install frontend deps
+        run: cd frontend && npm ci --no-audit --prefer-offline
+
+      - name: TypeScript type check
+        run: cd frontend && npx tsc --noEmit
