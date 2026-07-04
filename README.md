@@ -1,8 +1,10 @@
 # Deriv Smart Trading Gateway
 
-An AI-native trading gateway for Deriv that combines a FastMCP tool server, a Streamlit command center, and a LangGraph-powered advisor council for fast market decisions.
+![Deriv Smart Trading Gateway hero](docs/assets/readme-hero.png)
 
-![Deriv Smart Trading Gateway advisor council](docs/assets/advisor-council-screenshot.png)
+AI trading control room for Deriv. It turns natural-language trading intent into market snapshots, multi-agent advice, risk checks, and human-confirmed execution.
+
+**Built for:** Deriv market data, LangGraph advisor teams, FastMCP tools, Streamlit operations, safer trade review.
 
 ## What It Is
 
