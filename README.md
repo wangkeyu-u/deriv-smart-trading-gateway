@@ -1,3 +1,22 @@
+# Deriv Smart Trading Gateway — Deriv 智能交易网关 / AI Trading Control Room
+
+> 把自然语言交易意图变成市场快照、多智能体建议、风险检查和人工确认执行的 AI 交易控制室。
+>
+> Turns natural-language trading intent into market snapshots, multi-agent advice, risk checks, and human-confirmed execution.
+
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
+[![Streamlit](https://img.shields.io/badge/UI-Streamlit-FF4B4B)](https://streamlit.io/)
+[![LangGraph](https://img.shields.io/badge/Agents-LangGraph-008080)](https://langchain-ai.github.io/langgraph/)
+[![FastMCP](https://img.shields.io/badge/Tools-FastMCP-6B4FBB)](https://gofastmcp.com/)
+
+---
+
+## 项目简介（中文）
+
+Deriv 智能交易网关把自然语言交易意图转化为协调的多智能体工作流：读取实时 Deriv 市场数据、构建 K 线快照、模拟交易、审查风险，并通过人工确认安全门准备执行。核心是 **Boss Advisor Room**——一个 LangGraph 多顾问委员会，宏观顾问、量化顾问、资金流顾问、风险顾问和反向顾问各自独立分析后由首席顾问综合出 CALL / PUT / WAIT 建议。Streamlit 是操作 UI，LangGraph 是智能体编排引擎，FastMCP 暴露 Deriv 工具层。所有写操作需人工确认，实盘交易被默认锁定。
+
+---
+
 # Deriv Smart Trading Gateway
 
 ![Deriv Smart Trading Gateway hero](docs/assets/readme-hero.png)
