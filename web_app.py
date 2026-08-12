@@ -530,6 +530,72 @@ class AdvisorGraphState(TypedDict, total=False):
     graph_runtime: str
 
 
+def merge_graph_reports(
+    left: dict[str, Any], right: dict[str, Any]
+) -> dict[str, Any]:
+    """Merge independent node reports without dropping sibling updates."""
+    return {**left, **right}
+
+
+class ExecutionGraphState(TypedDict, total=False):
+    """State owned by the eight-role execution subgraph.
+
+    ``events`` and ``graph_trace`` use reducers so nodes can emit isolated
+    updates. The safety gate is intentionally a deterministic node, not an
+    agent role and not an LLM call.
+    """
+
+    user_text: str
+    writer: Callable[[str], None] | None
+    plan: dict[str, Any]
+    events: Annotated[list[AgentEvent], operator.add]
+    graph_trace: Annotated[list[str], operator.add]
+    agent_reports: Annotated[dict[str, Any], merge_graph_reports]
+    market_report: dict[str, Any] | None
+    execution_report: dict[str, Any] | None
+    safety_decision: dict[str, Any]
+    final_answer: str
+    ok: bool
+    graph_runtime: str
+
+
+class GatewayParentState(TypedDict, total=False):
+    """Shared envelope for the mutually exclusive execution/advisor subgraphs."""
+
+    workflow: Literal["execution", "advisor"]
+    boundary_trace: Annotated[list[str], operator.add]
+    # Execution-subgraph fields.
+    user_text: str
+    writer: Callable[[str], None] | None
+    plan: dict[str, Any]
+    events: Annotated[list[AgentEvent], operator.add]
+    graph_trace: Annotated[list[str], operator.add]
+    agent_reports: Annotated[dict[str, Any], merge_graph_reports]
+    market_report: dict[str, Any] | None
+    execution_report: dict[str, Any] | None
+    safety_decision: dict[str, Any]
+    final_answer: str
+    ok: bool
+    # Advisor-subgraph fields.
+    question: str
+    symbol: str
+    budget: int
+    use_web: bool
+    language: str
+    started_at: float
+    sources: list[dict[str, str]]
+    market: dict[str, Any]
+    news_signal: dict[str, Any]
+    opinions: Annotated[list[dict[str, Any]], operator.add]
+    logs: Annotated[list[str], operator.add]
+    local_consensus: dict[str, Any]
+    consensus: str
+    stance: str
+    confidence: float
+    vote_counts: dict[str, int]
+    graph_runtime: str
+
+
 def default_agent_prompts() -> dict[str, dict[str, str]]:
     return {
         "manager": {
@@ -2735,10 +2801,11 @@ def run_advisor_langgraph(
     writer: Callable[[str], None] | None = None,
 ) -> dict[str, Any] | None:
     try:
-        app = build_advisor_langgraph()
+        app = build_gateway_parent_graph()
         return dict(
             app.invoke(
                 {
+                    "workflow": "advisor",
                     "question": question,
                     "symbol": symbol,
                     "budget": budget,
@@ -2747,6 +2814,7 @@ def run_advisor_langgraph(
                     "started_at": time.perf_counter(),
                     "opinions": [],
                     "logs": [],
+                    "boundary_trace": ["parent:advisor"],
                 }
             )
         )
@@ -3910,6 +3978,323 @@ def deterministic_manager_summary(
     return "经理总结：当前指令没有形成可执行交易任务。"
 
 
+def build_execution_plan(user_text: str) -> dict[str, Any]:
+    """Parse one command into the deterministic plan shared by graph nodes."""
+    symbol = extract_symbol(user_text)
+    trade_intent = has_trade_intent(user_text)
+    amount = extract_amount(user_text)
+    contract_type = extract_contract_type(user_text)
+    duration = extract_duration(user_text)
+    duration_unit = extract_duration_unit(user_text)
+    if trade_intent and duration <= 0:
+        duration, duration_unit = 5, "t"
+    needs_market = trade_intent or any(
+        keyword in user_text
+        for keyword in ["走势", "Tick", "tick", "行情", "价格", "K线", "k线", "连续", "图", "chart"]
+    )
+    return {
+        "symbol": symbol,
+        "trade_intent": trade_intent,
+        "amount": amount,
+        "contract_type": contract_type or "",
+        "duration": duration,
+        "duration_unit": duration_unit,
+        "needs_market": needs_market,
+        "needs_chart": any(
+            keyword in user_text for keyword in ["图", "K线", "k线", "chart", "表格", "走势"]
+        ),
+        "granularity": extract_granularity(user_text),
+        "count": extract_count(user_text),
+        "numeric_condition": extract_condition(user_text),
+        "condition_requires_down": "连续" in user_text and "跌" in user_text,
+        "condition_requires_up": "连续" in user_text and "涨" in user_text,
+    }
+
+
+def execution_safety_decision(state: ExecutionGraphState) -> dict[str, Any]:
+    """Evaluate deterministic preconditions before the sole write-capable role."""
+    plan = dict(state.get("plan") or {})
+    if not plan.get("trade_intent"):
+        return {"allow_execution": False, "reason": "no_trade_intent"}
+
+    missing = []
+    if float(plan.get("amount") or 0) <= 0:
+        missing.append("amount")
+    if plan.get("contract_type") not in {"CALL", "PUT"}:
+        missing.append("contract_type")
+    if missing:
+        return {
+            "allow_execution": False,
+            "reason": "missing_trade_parameters",
+            "missing": missing,
+        }
+
+    reports = dict(state.get("agent_reports") or {})
+    compliance = dict(reports.get("compliance") or {})
+    if not compliance.get("ok", True):
+        return {
+            "allow_execution": False,
+            "reason": "compliance_blocked",
+            "blockers": list(compliance.get("blockers") or []),
+        }
+    risk = dict(reports.get("risk") or {})
+    if risk.get("reason") not in {None, "missing_deriv_api_token"}:
+        return {"allow_execution": False, "reason": "risk_blocked"}
+
+    market_report = dict(state.get("market_report") or {})
+    tick_analysis = dict(market_report.get("tick_analysis") or {})
+    condition_passed = True
+    condition_note = "用户未设置市场条件，允许进入执行角色的安全门。"
+    if plan.get("condition_requires_down"):
+        condition_passed = bool(tick_analysis.get("consecutive_three_down"))
+        condition_note = f"连续三个 Tick 下跌条件 -> {condition_passed}"
+    elif plan.get("condition_requires_up"):
+        condition_passed = bool(tick_analysis.get("consecutive_three_up"))
+        condition_note = f"连续三个 Tick 上涨条件 -> {condition_passed}"
+    numeric_condition = plan.get("numeric_condition")
+    if numeric_condition:
+        latest_quote = tick_analysis.get("latest_quote")
+        if latest_quote is None:
+            condition_passed = False
+            condition_note = "数值条件需要最新行情，但行情不可用"
+        else:
+            condition_passed, condition_note = evaluate_condition(
+                numeric_condition, float(latest_quote)
+            )
+    return {
+        "allow_execution": condition_passed,
+        "reason": "cleared" if condition_passed else "condition_not_met",
+        "condition_note": condition_note,
+    }
+
+
+def build_execution_langgraph() -> Any:
+    """Compile Manager + seven workers into the execution StateGraph."""
+    from langgraph.graph import END, START, StateGraph
+
+    graph = StateGraph(ExecutionGraphState)
+
+    def manager_node(state: ExecutionGraphState) -> dict[str, Any]:
+        text = str(state.get("user_text") or "")
+        event = AgentEvent("用户", "经理", text)
+        writer = state.get("writer")
+        if writer:
+            writer(localized_event_line(event))
+        return {
+            "plan": build_execution_plan(text),
+            "events": [event],
+            "graph_trace": ["manager"],
+            "graph_runtime": "langgraph",
+        }
+
+    def run_role(
+        state: ExecutionGraphState,
+        role_id: str,
+        call: Callable[[dict[str, Any], list[AgentEvent], Callable[[str], None] | None], dict[str, Any]],
+    ) -> dict[str, Any]:
+        local_events: list[AgentEvent] = []
+        report = call(dict(state.get("plan") or {}), local_events, state.get("writer"))
+        updates: dict[str, Any] = {
+            "events": local_events,
+            "agent_reports": {role_id: report},
+            "graph_trace": [role_id],
+        }
+        if role_id == "market":
+            updates["market_report"] = report
+        if role_id == "execution":
+            updates["execution_report"] = report
+        return updates
+
+    def strategy_node(state: ExecutionGraphState) -> dict[str, Any]:
+        return run_role(
+            state,
+            "strategy",
+            lambda plan, events, writer: assign_task_to_strategy_agent(
+                {"task": state.get("user_text", ""), "symbol": plan.get("symbol")}, events, writer
+            ),
+        )
+
+    def market_node(state: ExecutionGraphState) -> dict[str, Any]:
+        plan = dict(state.get("plan") or {})
+        if not plan.get("needs_market"):
+            return {"agent_reports": {"market": {"role": "Market Analyst Agent", "status": "not_required"}}, "graph_trace": ["market"]}
+        return run_role(
+            state,
+            "market",
+            lambda plan, events, writer: assign_task_to_market_agent(
+                {
+                    "task": "读取最新行情并验证用户条件。",
+                    "symbol": plan.get("symbol"),
+                    "tick_count": 10,
+                    "granularity": plan.get("granularity"),
+                    "candle_count": plan.get("count") or 60,
+                    "analysis_goal": "consecutive_down" if plan.get("condition_requires_down") else "tick_trend",
+                },
+                events,
+                writer,
+            ),
+        )
+
+    def risk_node(state: ExecutionGraphState) -> dict[str, Any]:
+        plan = dict(state.get("plan") or {})
+        if not plan.get("trade_intent"):
+            return {"agent_reports": {"risk": {"role": "Risk Sentinel", "status": "not_required", "ok": True}}, "graph_trace": ["risk"]}
+        return run_role(
+            state,
+            "risk",
+            lambda plan, events, writer: assign_task_to_risk_agent(
+                {"task": state.get("user_text", ""), "symbol": plan.get("symbol"), "amount": plan.get("amount")}, events, writer
+            ),
+        )
+
+    def compliance_node(state: ExecutionGraphState) -> dict[str, Any]:
+        return run_role(
+            state,
+            "compliance",
+            lambda plan, events, writer: assign_task_to_compliance_agent(
+                {"task": state.get("user_text", ""), "amount": plan.get("amount"), "contract_type": plan.get("contract_type")}, events, writer
+            ),
+        )
+
+    def chart_node(state: ExecutionGraphState) -> dict[str, Any]:
+        plan = dict(state.get("plan") or {})
+        if not plan.get("needs_chart"):
+            return {"agent_reports": {"chart": {"role": "Chart Engineer", "status": "not_required", "ok": True}}, "graph_trace": ["chart"]}
+        return run_role(
+            state,
+            "chart",
+            lambda plan, events, writer: assign_task_to_chart_agent(
+                {"task": "生成 K 线图表快照。", "symbol": plan.get("symbol"), "granularity": plan.get("granularity"), "count": plan.get("count") or 120}, events, writer
+            ),
+        )
+
+    def safety_gate_node(state: ExecutionGraphState) -> dict[str, Any]:
+        decision = execution_safety_decision(state)
+        event = AgentEvent("经理", "经理", f"确定性安全门：{decision.get('reason')}")
+        return {"safety_decision": decision, "events": [event], "graph_trace": ["safety_gate"]}
+
+    def execution_node(state: ExecutionGraphState) -> dict[str, Any]:
+        decision = dict(state.get("safety_decision") or {})
+        return run_role(
+            state,
+            "execution",
+            lambda plan, events, writer: assign_task_to_execution_agent(
+                {
+                    "task": "确定性条件已通过，执行用户授权的订单。",
+                    "symbol": plan.get("symbol"),
+                    "amount": plan.get("amount"),
+                    "contract_type": plan.get("contract_type"),
+                    "duration": plan.get("duration"),
+                    "duration_unit": plan.get("duration_unit"),
+                    "risk_note": decision.get("condition_note") or decision.get("reason"),
+                },
+                events,
+                writer,
+            ),
+        )
+
+    def report_node(state: ExecutionGraphState) -> dict[str, Any]:
+        updates = run_role(
+            state,
+            "report",
+            lambda plan, events, writer: assign_task_to_report_agent(
+                {"task": "整理本轮 StateGraph 多角色协作复盘。"}, events, writer
+            ),
+        )
+        decision = dict(state.get("safety_decision") or {})
+        execution_report = state.get("execution_report")
+        if not execution_report and decision.get("reason") not in {None, "no_trade_intent"}:
+            execution_report = {
+                "role": "Execution Trader",
+                "ok": False,
+                "status": "not_invoked",
+                "reason": decision.get("reason"),
+                "details": decision,
+            }
+            updates["execution_report"] = execution_report
+        final = deterministic_manager_summary(state.get("market_report"), execution_report)
+        final_event = AgentEvent("经理", "用户", final)
+        updates["events"] = list(updates.get("events") or []) + [final_event]
+        updates["final_answer"] = final
+        updates["ok"] = not bool(execution_report and execution_report.get("ok") is False)
+        return updates
+
+    graph.add_node("manager", manager_node)
+    graph.add_node("strategy", strategy_node)
+    graph.add_node("market", market_node)
+    graph.add_node("risk", risk_node)
+    graph.add_node("compliance", compliance_node)
+    graph.add_node("chart", chart_node)
+    graph.add_node("safety_gate", safety_gate_node)
+    graph.add_node("execution", execution_node)
+    graph.add_node("report", report_node)
+    graph.add_edge(START, "manager")
+    graph.add_edge("manager", "strategy")
+    graph.add_edge("strategy", "market")
+    graph.add_edge("market", "risk")
+    graph.add_edge("risk", "compliance")
+    graph.add_edge("compliance", "chart")
+    graph.add_edge("chart", "safety_gate")
+    graph.add_conditional_edges(
+        "safety_gate",
+        lambda state: "execute" if (state.get("safety_decision") or {}).get("allow_execution") else "skip",
+        {"execute": "execution", "skip": "report"},
+    )
+    graph.add_edge("execution", "report")
+    graph.add_edge("report", END)
+    return graph.compile()
+
+
+def build_gateway_parent_graph() -> Any:
+    """Compile the parent boundary around execution and advisor subgraphs."""
+    from langgraph.graph import END, START, StateGraph
+
+    graph = StateGraph(GatewayParentState)
+    graph.add_node("execution_subgraph", build_execution_langgraph())
+    graph.add_node("advisor_subgraph", build_advisor_langgraph())
+    graph.add_conditional_edges(
+        START,
+        lambda state: str(state.get("workflow") or "execution"),
+        {"execution": "execution_subgraph", "advisor": "advisor_subgraph"},
+    )
+    graph.add_edge("execution_subgraph", END)
+    graph.add_edge("advisor_subgraph", END)
+    return graph.compile()
+
+
+def run_execution_langgraph(
+    user_text: str,
+    writer: Callable[[str], None] | None = None,
+) -> TeamRunResult:
+    """Run the parent graph's execution branch and adapt its state for the UI."""
+    app = build_gateway_parent_graph()
+    state = dict(
+        app.invoke(
+            {
+                "workflow": "execution",
+                "user_text": user_text,
+                "writer": writer,
+                "events": [],
+                "graph_trace": [],
+                "agent_reports": {},
+                "boundary_trace": ["parent:execution"],
+            }
+        )
+    )
+    events = list(state.get("events") or [])
+    market_report = state.get("market_report")
+    execution_report = state.get("execution_report")
+    publish_team_log(events, build_team_extra_lines(market_report, execution_report))
+    return TeamRunResult(
+        final_answer=str(state.get("final_answer") or deterministic_manager_summary(market_report, execution_report)),
+        events=events,
+        market_report=market_report,
+        execution_report=execution_report,
+        ok=bool(state.get("ok", True)),
+        agent_reports=dict(state.get("agent_reports") or {}),
+    )
+
+
 def deterministic_manager_state_machine(
     user_text: str,
     events: list[AgentEvent],
@@ -4056,16 +4441,18 @@ def run_hierarchical_trading_team(
     writer: Callable[[str], None] | None = None,
 ) -> TeamRunResult:
     events: list[AgentEvent] = []
-    provider: Provider = st.session_state.llm_provider
-    if provider in {"OpenAI", "DeepSeek", "OpenAI-Compatible"} and st.session_state.llm_api_key:
-        result = manager_with_openai_tool_calling(user_text, events, writer)
-        if result:
-            return result
-    if provider == "Anthropic" and st.session_state.llm_api_key:
-        result = manager_with_anthropic_tool_calling(user_text, events, writer)
-        if result:
-            return result
-    return deterministic_manager_state_machine(user_text, events, writer)
+    try:
+        return run_execution_langgraph(user_text, writer)
+    except Exception as exc:
+        append_team_event(
+            events,
+            "系统",
+            "经理",
+            f"执行 StateGraph 失败，切换确定性 Python fallback：{exc}",
+            writer,
+        )
+        push_runtime_event("langgraph", "Execution Graph", "Fallback", str(exc))
+        return deterministic_manager_state_machine(user_text, events, writer)
 
 
 def reset_agent_log() -> list[str]:
