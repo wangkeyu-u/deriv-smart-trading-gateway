@@ -1,6 +1,7 @@
 # Deriv Resume Evidence
 
-Source resume: `/Users/wangkeyu/Downloads/123简历.pdf`  
+Source resume: `/Users/wangkeyu/Downloads/123简历.pdf`
+
 SHA-256: `dc82b04dd8ca3d628c9b5c1b2cc17ed079c1b8356ea2079b7c44870be29ca4cb`
 
 The machine-readable source of truth is `docs/resume-evidence.json`. Runtime
