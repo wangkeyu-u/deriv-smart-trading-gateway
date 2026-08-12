@@ -198,7 +198,7 @@ def build_evidence(resume_pdf: Path) -> dict[str, Any]:
         "generator": "scripts/generate_runtime_evidence.py",
         "git": {
             "branch": git("branch", "--show-current"),
-            "head": git("rev-parse", "HEAD"),
+            "evidence_source_head": git("rev-parse", "HEAD"),
             "round1_tag_target": git("rev-parse", "codex/round1-complete^{}"),
             "original_main": git("rev-parse", "main"),
             "origin_main": git("rev-parse", "origin/main"),

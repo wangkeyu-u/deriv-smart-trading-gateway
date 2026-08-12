@@ -22,55 +22,55 @@
         ],
         "node_timings": {
           "chart": {
-            "elapsed_ms": 0.001,
-            "remaining_after_ms": 3978.979,
-            "remaining_before_ms": 3978.98,
+            "elapsed_ms": 0.002,
+            "remaining_after_ms": 3966.328,
+            "remaining_before_ms": 3966.33,
             "status": "completed"
           },
           "compliance": {
-            "elapsed_ms": 0.129,
-            "remaining_after_ms": 3979.202,
-            "remaining_before_ms": 3979.331,
+            "elapsed_ms": 0.274,
+            "remaining_after_ms": 3966.732,
+            "remaining_before_ms": 3967.006,
             "status": "completed"
           },
           "manager": {
-            "elapsed_ms": 0.705,
-            "remaining_after_ms": 3979.746,
-            "remaining_before_ms": 3980.451,
+            "elapsed_ms": 0.924,
+            "remaining_after_ms": 3968.375,
+            "remaining_before_ms": 3969.299,
             "status": "completed"
           },
           "market": {
-            "elapsed_ms": 0.001,
-            "remaining_after_ms": 3979.439,
-            "remaining_before_ms": 3979.441,
+            "elapsed_ms": 0.003,
+            "remaining_after_ms": 3967.21,
+            "remaining_before_ms": 3967.212,
             "status": "completed"
           },
           "report": {
-            "elapsed_ms": 0.006,
-            "remaining_after_ms": 3978.735,
-            "remaining_before_ms": 3978.741,
+            "elapsed_ms": 0.007,
+            "remaining_after_ms": 3965.893,
+            "remaining_before_ms": 3965.9,
             "status": "completed"
           },
           "risk": {
-            "elapsed_ms": 0.002,
-            "remaining_after_ms": 3979.083,
-            "remaining_before_ms": 3979.085,
+            "elapsed_ms": 0.003,
+            "remaining_after_ms": 3966.511,
+            "remaining_before_ms": 3966.514,
             "status": "completed"
           },
           "safety_gate": {
-            "elapsed_ms": 0.004,
-            "remaining_after_ms": 3978.88,
-            "remaining_before_ms": 3978.884,
+            "elapsed_ms": 0.007,
+            "remaining_after_ms": 3966.16,
+            "remaining_before_ms": 3966.166,
             "status": "completed"
           },
           "strategy": {
-            "elapsed_ms": 0.004,
-            "remaining_after_ms": 3979.556,
-            "remaining_before_ms": 3979.561,
+            "elapsed_ms": 0.009,
+            "remaining_after_ms": 3967.478,
+            "remaining_before_ms": 3967.487,
             "status": "completed"
           }
         },
-        "observed_elapsed_ms": 21.499,
+        "observed_elapsed_ms": 34.543,
         "requested_budget_seconds": 4,
         "timed_out": false
       },
@@ -88,66 +88,66 @@
         ],
         "node_timings": {
           "chart": {
-            "elapsed_ms": 0.001,
-            "remaining_after_ms": 24981.566,
-            "remaining_before_ms": 24981.567,
+            "elapsed_ms": 0.002,
+            "remaining_after_ms": 24970.51,
+            "remaining_before_ms": 24970.512,
             "status": "completed"
           },
           "compliance": {
-            "elapsed_ms": 0.14,
-            "remaining_after_ms": 24981.787,
-            "remaining_before_ms": 24981.927,
+            "elapsed_ms": 0.224,
+            "remaining_after_ms": 24970.89,
+            "remaining_before_ms": 24971.115,
             "status": "completed"
           },
           "manager": {
-            "elapsed_ms": 0.043,
-            "remaining_after_ms": 24982.263,
-            "remaining_before_ms": 24982.305,
+            "elapsed_ms": 0.054,
+            "remaining_after_ms": 24971.674,
+            "remaining_before_ms": 24971.727,
             "status": "completed"
           },
           "market": {
-            "elapsed_ms": 0.001,
-            "remaining_after_ms": 24982.03,
-            "remaining_before_ms": 24982.032,
+            "elapsed_ms": 0.002,
+            "remaining_after_ms": 24971.291,
+            "remaining_before_ms": 24971.294,
             "status": "completed"
           },
           "report": {
-            "elapsed_ms": 0.006,
-            "remaining_after_ms": 24980.895,
-            "remaining_before_ms": 24980.901,
+            "elapsed_ms": 0.014,
+            "remaining_after_ms": 24969.532,
+            "remaining_before_ms": 24969.545,
             "status": "completed"
           },
           "risk": {
-            "elapsed_ms": 0.002,
-            "remaining_after_ms": 24981.67,
-            "remaining_before_ms": 24981.672,
+            "elapsed_ms": 0.003,
+            "remaining_after_ms": 24970.687,
+            "remaining_before_ms": 24970.689,
             "status": "completed"
           },
           "safety_gate": {
             "elapsed_ms": 0.005,
-            "remaining_after_ms": 24981.468,
-            "remaining_before_ms": 24981.473,
+            "remaining_after_ms": 24970.347,
+            "remaining_before_ms": 24970.353,
             "status": "completed"
           },
           "strategy": {
-            "elapsed_ms": 0.003,
-            "remaining_after_ms": 24982.143,
-            "remaining_before_ms": 24982.147,
+            "elapsed_ms": 0.004,
+            "remaining_after_ms": 24971.476,
+            "remaining_before_ms": 24971.48,
             "status": "completed"
           }
         },
-        "observed_elapsed_ms": 19.349,
+        "observed_elapsed_ms": 31.137,
         "requested_budget_seconds": 25,
         "timed_out": false
       }
     ],
     "supports_real_network_latency_claim": false
   },
-  "generated_at": "2026-08-12T17:39:13.186892+00:00",
+  "generated_at": "2026-08-12T17:41:44.335989+00:00",
   "generator": "scripts/generate_runtime_evidence.py",
   "git": {
     "branch": "codex/interview-alignment",
-    "head": "52f854f3c8960554b36c156f32502fd6e46948d0",
+    "evidence_source_head": "c31a2220c5dc7f3a861c31e91a2f9089bbc26327",
     "origin_main": "d7659d9a57d6c7ca4a51e874335fc9e58b1f79f2",
     "original_main": "d7659d9a57d6c7ca4a51e874335fc9e58b1f79f2",
     "round1_tag_target": "101ca58ec53db457b01db57ba6a125c66f6f7f51"
