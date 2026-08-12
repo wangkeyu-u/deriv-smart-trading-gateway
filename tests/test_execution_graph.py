@@ -33,6 +33,10 @@ def test_execution_graph_contains_exactly_eight_role_nodes_plus_safety_gate() ->
     assert EXECUTION_ROLES <= nodes
     assert "safety_gate" in nodes
     assert EXECUTION_ROLES.isdisjoint({"safety_gate", "__start__", "__end__"})
+    assert ("market", "compliance") in graph_edges(graph)
+    assert ("compliance", "risk") in graph_edges(graph)
+    assert ("risk", "chart") in graph_edges(graph)
+    assert ("risk", "compliance") not in graph_edges(graph)
     assert ("chart", "safety_gate") in graph_edges(graph)
     assert ("safety_gate", "execution") in graph_edges(graph)
     assert ("safety_gate", "report") in graph_edges(graph)
@@ -134,7 +138,7 @@ def test_execution_graph_routes_only_cleared_trade_to_execution(monkeypatch: Any
     )
 
     result = web_app.run_execution_langgraph("用 10 美金买 R_75 看涨，持续 5 ticks")
-    assert called == ["strategy", "market", "risk", "compliance", "execution", "report"]
+    assert called == ["strategy", "market", "compliance", "risk", "execution", "report"]
     assert result.execution_report is not None
     assert result.execution_report["reason"] == "pending_human_confirmation"
 
