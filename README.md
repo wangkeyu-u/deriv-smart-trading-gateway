@@ -58,7 +58,7 @@ Streamlit Command Center -> LangGraph Parent Router
   |      web_research -> market_snapshot -> news_signal -> 5 advisors -> Chief
   |
   +--> Execution Subgraph
-         manager -> strategy -> market -> risk -> compliance -> chart
+         manager -> strategy -> market -> compliance -> risk -> chart
                                                                |
                                                          safety_gate
                                                            /      \
@@ -136,6 +136,7 @@ The app uses two complementary subgraphs behind one parent router.
 - Risk Sentinel and Compliance Reviewer block unsafe or incomplete trade requests.
 - Execution Trader is the only worker allowed to submit Deriv write operations.
 - A deterministic safety-gate node routes to Execution only after parameters, conditions, Risk, and Compliance have passed.
+- Both subgraphs enforce a configurable 4–25 second deadline and record per-node elapsed/remaining budget; deadline exhaustion fails closed before execution.
 
 **Advisor Council**
 
@@ -148,6 +149,11 @@ The app uses two complementary subgraphs behind one parent router.
 All eight execution roles and all five Advisor roles run as LangGraph nodes. The Chief is a sixth Advisor-side role. A role node is not automatically an LLM call: local rules use zero LLM calls, and Chief model synthesis is optional. See [Architecture and terminology](docs/ARCHITECTURE.md).
 
 If execution-graph invocation fails, the app falls back to the existing deterministic Python manager state machine. If the Advisor graph fails, it falls back to the local council runner. Neither fallback bypasses HITL or live-account protection.
+
+OpenAI, Anthropic, and DeepSeek share the same Manager tool-call schemas. Their
+tool calls are planning input only: business execution always enters the same
+deterministic StateGraph. Provider failure therefore degrades to that graph
+without granting a direct Deriv write path.
 
 ## Extend Agents
 
@@ -231,14 +237,16 @@ Run the checks:
 ```bash
 .venv/bin/python -m py_compile web_app.py server.py smoke_test.py
 .venv/bin/python -m pytest -q
+.venv/bin/python scripts/generate_runtime_evidence.py
+.venv/bin/python scripts/validate_resume_evidence.py
 .venv/bin/python smoke_test.py
 ```
 
-Current deterministic validation (Deriv network smoke checks are separate and require endpoint availability):
-
-```text
-21 passed
-```
+The current evidence status, exact resume wording, package versions, hashes,
+runtime-enumerated MCP schemas, offline fixture benchmark, and separate
+read-only network smoke are documented in
+[`docs/RESUME_EVIDENCE.md`](docs/RESUME_EVIDENCE.md). Recompute counts rather
+than copying a prior test total; it changes as coverage grows.
 
 ## Deriv Endpoint
 

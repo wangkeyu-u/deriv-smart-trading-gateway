@@ -1,0 +1,29 @@
+{
+  "all_passed": false,
+  "authenticated": false,
+  "cases": [
+    {
+      "error": {
+        "details": null,
+        "message": "InvalidSymbol: Symbol R_100 is invalid.",
+        "type": "DerivAPIError"
+      },
+      "observed_elapsed_ms": 1974.535,
+      "ok": false,
+      "tool": "get_market_ticks"
+    },
+    {
+      "error": null,
+      "observed_elapsed_ms": 1994.992,
+      "ok": true,
+      "tool": "get_historical_candles"
+    }
+  ],
+  "fixture": false,
+  "generated_at": "2026-08-12T17:35:51.367343+00:00",
+  "network": "Deriv public WebSocket",
+  "schema_version": 1,
+  "supports_decision_budget_claim": false,
+  "symbol": "R_100",
+  "write_tools_executed": false
+}

@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "source_resume": {
+    "path": "/Users/wangkeyu/Downloads/123简历.pdf",
+    "sha256": "dc82b04dd8ca3d628c9b5c1b2cc17ed079c1b8356ea2079b7c44870be29ca4cb"
+  },
+  "allowed_statuses": [
+    "verified",
+    "implemented_unverified",
+    "unsupported"
+  ],
+  "claims": [
+    {
+      "id": "stategraph-budget",
+      "resume_text": "采用LangGraph架构设计多智能体AI交易网关，通过StateGraph模式协调8个执行代理和5个并行顾问，在4–25秒延迟预算内完成交易决策。",
+      "status": "verified",
+      "qualification": "Verified as an enforced configurable decision budget, not as a claim that every observed run lasts 4–25 seconds. Offline timings are fixture-only and real network smoke is separate.",
+      "code_locations": [
+        "web_app.py: normalize_decision_budget, timed_graph_node, build_execution_langgraph, build_advisor_langgraph",
+        "tests/test_decision_budget.py",
+        "tests/test_execution_graph.py"
+      ],
+      "verification_commands": [
+        ".venv/bin/python scripts/generate_runtime_evidence.py",
+        ".venv/bin/python -m pytest tests/test_decision_budget.py tests/test_execution_graph.py -q"
+      ],
+      "versions_and_hashes": [
+        "langgraph=1.2.11",
+        "agent_prompts_sha256=96d116311d08c614089cd23b45a55076738034e15ac6bd1f134709b6d290f95c"
+      ],
+      "artifacts": [
+        "docs/evidence/runtime-evidence.json#graph",
+        "docs/evidence/runtime-evidence.json#decision_budget",
+        "docs/evidence/network-smoke.json"
+      ]
+    },
+    {
+      "id": "async-websocket",
+      "resume_text": "为Deriv API构建弹性异步WebSocket客户端，实现请求多路复用、基于asyncio的路由、订阅队列调度及指数退避重连机制。",
+      "status": "verified",
+      "qualification": "Concurrency, req_id correlation, bounded subscription queues with drop-oldest backpressure, and capped jittered exponential backoff are covered by deterministic async tests. Network smoke is read-only and partially successful in this environment.",
+      "code_locations": [
+        "server.py: DerivWebSocketClient",
+        "tests/test_websocket_resilience.py"
+      ],
+      "verification_commands": [
+        ".venv/bin/python -m pytest tests/test_websocket_resilience.py -q",
+        ".venv/bin/python scripts/run_network_smoke.py"
+      ],
+      "versions_and_hashes": [
+        "websockets=15.0.1",
+        "python=3.14.5",
+        "requirements_sha256=2e5711b74f8b40e9c3e083ecb483481574fa93dba99b4fcd82a22fbaecee3ac1"
+      ],
+      "artifacts": [
+        "docs/evidence/runtime-evidence.json#websocket",
+        "docs/evidence/network-smoke.json"
+      ]
+    },
+    {
+      "id": "three-layer-safety",
+      "resume_text": "实施三层安全防护流水线（合规→风控→执行），集成人工复核验证、默认禁用实盘账户及令牌掩码机制，防止误操作交易。",
+      "status": "verified",
+      "qualification": "Verified through topology checks, behavioral gates, backend live-account enforcement, recursive trace redaction, exception masking, and capability-deletion guards. No order was executed.",
+      "code_locations": [
+        "web_app.py: build_execution_langgraph, execution_safety_decision, execution_agent, redact_sensitive_values",
+        "server.py: enforce_demo_or_explicit_live, mask_secret, redact_secrets",
+        "tests/test_security_evidence.py",
+        "tests/test_safety_gates.py"
+      ],
+      "verification_commands": [
+        ".venv/bin/python -m pytest tests/test_security_evidence.py tests/test_safety_gates.py -q"
+      ],
+      "versions_and_hashes": [
+        "mcp=1.29.0",
+        "requirements_sha256=2e5711b74f8b40e9c3e083ecb483481574fa93dba99b4fcd82a22fbaecee3ac1"
+      ],
+      "artifacts": [
+        "docs/evidence/runtime-evidence.json#safety"
+      ]
+    },
+    {
+      "id": "provider-fallback",
+      "resume_text": "设计双运行时代理系统，实现从LLM工具调用（OpenAI/Anthropic/DeepSeek）到本地确定性Python状态机的无缝降级，确保离线场景可靠性。",
+      "status": "implemented_unverified",
+      "qualification": "The shared tool-call contract and deterministic fallback are implemented and verified with prominently labelled mock-provider fixtures. No real OpenAI, Anthropic, or DeepSeek API call was executed in this evidence run, so the end-to-end provider integration remains unverified.",
+      "code_locations": [
+        "web_app.py: invoke_provider_tool_contract, run_provider_to_deterministic_graph, run_hierarchical_trading_team",
+        "tests/test_provider_contract.py"
+      ],
+      "verification_commands": [
+        ".venv/bin/python -m pytest tests/test_provider_contract.py -q"
+      ],
+      "versions_and_hashes": [
+        "openai=3.0.0",
+        "anthropic=0.121.0",
+        "manager_tool_contract_count=7"
+      ],
+      "artifacts": [
+        "docs/evidence/runtime-evidence.json#provider_contract"
+      ]
+    },
+    {
+      "id": "fastmcp-six-tools",
+      "resume_text": "通过FastMCP实现6个标准化MCP工具（市场数据、交易执行、账户管理），支持与任何MCP兼容客户端无缝集成。",
+      "status": "implemented_unverified",
+      "qualification": "Exactly six schemas and all three categories are runtime-enumerated and hash-checked. Compatibility with every MCP client is an unbounded interoperability claim and was not tested, so the whole sentence cannot be marked verified.",
+      "code_locations": [
+        "server.py: six @mcp.tool registrations",
+        "scripts/generate_runtime_evidence.py: mcp_snapshot",
+        "scripts/validate_resume_evidence.py",
+        "tests/test_evidence_gate.py"
+      ],
+      "verification_commands": [
+        ".venv/bin/python scripts/generate_runtime_evidence.py",
+        ".venv/bin/python scripts/validate_resume_evidence.py",
+        ".venv/bin/python -m pytest tests/test_evidence_gate.py -q"
+      ],
+      "versions_and_hashes": [
+        "mcp=1.29.0",
+        "mcp_schema_sha256=b573b60e83670173195d07216c15b30b3fec679c8f0657b1b0c846feed0f8f5f"
+      ],
+      "artifacts": [
+        "docs/evidence/runtime-evidence.json#mcp",
+        "docs/evidence/mcp-tools.json"
+      ]
+    }
+  ]
+}

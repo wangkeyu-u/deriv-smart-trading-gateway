@@ -8,7 +8,7 @@ branches:
 ```text
 parent
 ├── execution_subgraph
-│   manager -> strategy -> market -> risk -> compliance -> chart
+│   manager -> strategy -> market -> compliance -> risk -> chart
 │                                                    |
 │                                              safety_gate
 │                                                /       \
@@ -58,7 +58,7 @@ Only `execution_agent` can call the MCP write tools
 `execute_simulated_trade` and `close_open_contract`. Before that node is routed:
 
 1. Manager parses the command into a deterministic plan.
-2. Market, Risk, and Compliance roles produce reports.
+2. Market, Compliance, and Risk roles produce reports in that order.
 3. The deterministic `safety_gate` checks required parameters, compliance,
    hard risk blockers, and market conditions.
 4. The Execution role preserves the existing token, HITL confirmation, account
@@ -88,8 +88,15 @@ Fallbacks are explicit:
 - Execution graph failure -> deterministic Python manager state machine.
 - Advisor graph failure -> local advisor council.
 - Advisor LLM synthesis failure/unavailability -> deterministic local consensus.
+- OpenAI, Anthropic, or DeepSeek Manager tool-calling failure -> the same
+  deterministic execution StateGraph; provider output never directly dispatches
+  a Deriv write tool.
 
 Fallback does not relax the Execution role's HITL or live-account gates.
+
+Every decision budget is clamped to 4–25 seconds. State carries an absolute
+deadline plus per-node elapsed and remaining time. Exhaustion routes through a
+deterministic safety/report path and cannot enter the Execution role.
 
 ## What is not claimed
 
