@@ -54,9 +54,19 @@ def check_prompts_and_symbols() -> None:
 
 def check_langgraph_compile() -> None:
     assert_true(web_app.advisor_langgraph_available(), "LangGraph is not available")
-    graph = web_app.build_advisor_langgraph()
-    assert_true(type(graph).__name__ == "CompiledStateGraph", "advisor graph did not compile")
-    print("langgraph_compile: OK")
+    execution = web_app.build_execution_langgraph()
+    advisor = web_app.build_advisor_langgraph()
+    parent = web_app.build_gateway_parent_graph()
+    assert_true(type(execution).__name__ == "CompiledStateGraph", "execution graph did not compile")
+    assert_true(type(advisor).__name__ == "CompiledStateGraph", "advisor graph did not compile")
+    assert_true(type(parent).__name__ == "CompiledStateGraph", "parent graph did not compile")
+    execution_nodes = set(execution.get_graph().nodes)
+    assert_true(
+        {"manager", "market", "strategy", "risk", "compliance", "execution", "chart", "report"}
+        <= execution_nodes,
+        "execution graph is missing one or more role nodes",
+    )
+    print("langgraph_compile_and_topology: OK")
 
 
 async def check_deriv_market_tools() -> None:
