@@ -23,19 +23,20 @@ Deriv 智能交易网关把自然语言交易意图转化为协调的多智能�
 
 AI trading control room for Deriv. It turns natural-language trading intent into market snapshots, multi-agent advice, risk checks, and human-confirmed execution.
 
-**Built for:** Deriv market data, LangGraph advisor teams, FastMCP tools, Streamlit operations, safer trade review.
+**Built for:** Deriv market data, LangGraph execution and advisor subgraphs, FastMCP tools, Streamlit operations, safer trade review.
 
 ## What It Is
 
 Deriv Smart Trading Gateway turns natural-language trading intent into a coordinated multi-agent workflow. It can read live Deriv market data, build candle snapshots, simulate trades, review risk, and prepare execution through a human-confirmed safety gate.
 
-The newest layer is the **Boss Advisor Room**: a LangGraph council where multiple advisor agents read market context, optional web research, and short-horizon signals before producing one clear `CALL`, `PUT`, or `WAIT` recommendation.
+The runtime uses a LangGraph parent graph with two isolated branches: an eight-role execution subgraph (Manager + seven Workers), and the **Boss Advisor Room**, where five Advisor roles produce opinions for a Chief synthesizer. The Advisor branch returns advice only and has no edge to order execution.
 
 Streamlit is the operator UI. LangGraph is the agent orchestration engine. FastMCP exposes the Deriv tool layer for MCP-compatible clients.
 
 ## Highlights
 
-- **LangGraph advisor council** with independent advisor nodes, merged graph state, and a chief synthesizer.
+- **LangGraph execution subgraph** that runs Manager + seven Worker roles as real StateGraph nodes around a deterministic safety gate.
+- **LangGraph advisor subgraph** with five parallel Advisor nodes, reducer-merged graph state, and a Chief synthesizer.
 - **Extensible agent prompts** through `agent_prompts.json`, including manager, execution workers, and advisor personas.
 - **Deriv WebSocket tools** for ticks, historical candles, account checks, simulated trades, open-contract status, and close-contract flows.
 - **Natural-language command center** for Chinese and English trading prompts.
@@ -43,7 +44,7 @@ Streamlit is the operator UI. LangGraph is the agent orchestration engine. FastM
 - **Live-account protection** that blocks live trading unless both UI and backend explicitly allow it.
 - **Multi-symbol charting** for synthetic indices, jump indices, boom/crash, and forex symbols such as `R_100`, `R_75`, `BOOM1000`, and `frxEURUSD`.
 - **Local audit trail** for team runs, advisor decisions, role dialogue, API traces, and trade receipts.
-- **Smoke and pytest coverage** for agent configuration, symbol parsing, LangGraph compilation, advisor runtime, and safety gates.
+- **Pytest coverage** for parent/subgraph topology, routing, parallel reducers, fallback, parsing, and safety gates.
 
 ## Architecture
 
@@ -51,13 +52,17 @@ Streamlit is the operator UI. LangGraph is the agent orchestration engine. FastM
 User / Boss
   |
   v
-Streamlit Command Center
+Streamlit Command Center -> LangGraph Parent Router
   |
-  +--> LangGraph Advisor Council
-  |      web_research -> market_snapshot -> news_signal -> advisor_* -> synthesize
+  +--> Advisor Subgraph (advice only)
+  |      web_research -> market_snapshot -> news_signal -> 5 advisors -> Chief
   |
-  +--> Hierarchical Execution Team
-  |      manager -> market / strategy / chart / risk / compliance / execution / report
+  +--> Execution Subgraph
+         manager -> strategy -> market -> compliance -> risk -> chart
+                                                               |
+                                                         safety_gate
+                                                           /      \
+                                                  execution      report
   |
   v
 FastMCP Deriv Tool Server
@@ -71,6 +76,7 @@ Deriv WebSocket API
 ```text
 .
 ├── agent_prompts.json              # Editable prompt registry for manager, workers, and advisors
+├── docs/ARCHITECTURE.md            # Verified graph boundaries and terminology
 ├── docs/assets/                    # README and project media
 ├── mcp_config.json                 # MCP client configuration
 ├── requirements.txt                # Python dependencies
@@ -121,7 +127,7 @@ Available MCP tools:
 
 ## Agent System
 
-The app uses two complementary agent systems.
+The app uses two complementary subgraphs behind one parent router.
 
 **Execution Team**
 
@@ -129,6 +135,8 @@ The app uses two complementary agent systems.
 - Market Analyst, Strategy Researcher, Chart Engineer, and Report Agent gather context and produce artifacts.
 - Risk Sentinel and Compliance Reviewer block unsafe or incomplete trade requests.
 - Execution Trader is the only worker allowed to submit Deriv write operations.
+- A deterministic safety-gate node routes to Execution only after parameters, conditions, Risk, and Compliance have passed.
+- Both subgraphs enforce a configurable 4–25 second deadline and record per-node elapsed/remaining budget; deadline exhaustion fails closed before execution.
 
 **Advisor Council**
 
@@ -138,7 +146,14 @@ The app uses two complementary agent systems.
 - Risk Advisor challenges overconfident trades.
 - Contrarian Advisor attacks the consensus before the chief advisor synthesizes the final view.
 
-When `langgraph` is installed, each advisor runs as a graph node. If LangGraph is unavailable, the app falls back to a local council runner so the UI remains usable.
+All eight execution roles and all five Advisor roles run as LangGraph nodes. The Chief is a sixth Advisor-side role. A role node is not automatically an LLM call: local rules use zero LLM calls, and Chief model synthesis is optional. See [Architecture and terminology](docs/ARCHITECTURE.md).
+
+If execution-graph invocation fails, the app falls back to the existing deterministic Python manager state machine. If the Advisor graph fails, it falls back to the local council runner. Neither fallback bypasses HITL or live-account protection.
+
+OpenAI, Anthropic, and DeepSeek share the same Manager tool-call schemas. Their
+tool calls are planning input only: business execution always enters the same
+deterministic StateGraph. Provider failure therefore degrades to that graph
+without granting a direct Deriv write path.
 
 ## Extend Agents
 
@@ -222,19 +237,16 @@ Run the checks:
 ```bash
 .venv/bin/python -m py_compile web_app.py server.py smoke_test.py
 .venv/bin/python -m pytest -q
+.venv/bin/python scripts/generate_runtime_evidence.py
+.venv/bin/python scripts/validate_resume_evidence.py
 .venv/bin/python smoke_test.py
 ```
 
-Recent validation:
-
-```text
-13 passed
-dependencies: OK
-prompts_and_symbols: OK
-langgraph_compile: OK
-deriv_market_tools: OK
-advisor_runtime: OK
-```
+The current evidence status, exact resume wording, package versions, hashes,
+runtime-enumerated MCP schemas, offline fixture benchmark, and separate
+read-only network smoke are documented in
+[`docs/RESUME_EVIDENCE.md`](docs/RESUME_EVIDENCE.md). Recompute counts rather
+than copying a prior test total; it changes as coverage grows.
 
 ## Deriv Endpoint
 

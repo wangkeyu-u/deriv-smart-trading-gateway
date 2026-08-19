@@ -10,7 +10,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import ssl
+from collections import deque
+from collections.abc import Callable
 from datetime import datetime, timezone
 from itertools import count
 from typing import Any, Literal
@@ -31,6 +34,8 @@ DERIV_WS_URL_TEMPLATE = os.getenv(
 )
 REQUEST_TIMEOUT_SECONDS = 5.0
 SUBSCRIPTION_SAMPLE_SIZE = 5
+SUBSCRIPTION_QUEUE_MAXSIZE = 64
+SUBSCRIPTION_BACKLOG_MAXSIZE = 64
 
 NonEmptyString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 Granularity = Literal[60, 300, 3600]
@@ -114,6 +119,15 @@ def mask_secret(value: str | None) -> str | None:
     return f"{value[:3]}***{value[-3:]}"
 
 
+def redact_secrets(message: str, secrets: list[str | None] | None = None) -> str:
+    """Remove known credentials before an exception or log message is exposed."""
+    redacted = str(message)
+    for secret in secrets or []:
+        if secret:
+            redacted = redacted.replace(secret, mask_secret(secret) or "***")
+    return redacted
+
+
 def account_type_from_authorize(authorize: dict[str, Any]) -> str:
     loginid = str(authorize.get("loginid") or authorize.get("account") or "")
     landing_company = str(authorize.get("landing_company_name") or "").lower()
@@ -149,13 +163,18 @@ def ok_response(tool: str, data: dict[str, Any]) -> str:
     )
 
 
-def error_response(tool: str, error: Exception | str) -> str:
+def error_response(
+    tool: str,
+    error: Exception | str,
+    *,
+    secrets: list[str | None] | None = None,
+) -> str:
     if isinstance(error, ValidationError):
         message = "Input validation failed"
         details: Any = error.errors()
         error_type = "validation_error"
     else:
-        message = str(error)
+        message = redact_secrets(str(error), secrets)
         details = None
         error_type = error.__class__.__name__ if isinstance(error, Exception) else "error"
 
@@ -190,18 +209,30 @@ class DerivWebSocketClient:
         api_token: str | None = None,
         timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
         max_retries: int = 2,
+        subscription_queue_maxsize: int = SUBSCRIPTION_QUEUE_MAXSIZE,
+        backoff_base_seconds: float = 0.25,
+        backoff_cap_seconds: float = 2.0,
+        backoff_jitter_ratio: float = 0.2,
+        random_source: Callable[[], float] = random.random,
     ) -> None:
         self.app_id = app_id
         self.api_token = api_token
         self.timeout_seconds = min(timeout_seconds, REQUEST_TIMEOUT_SECONDS)
         self.max_retries = max_retries
+        self.subscription_queue_maxsize = max(1, subscription_queue_maxsize)
+        self.backoff_base_seconds = max(0.0, backoff_base_seconds)
+        self.backoff_cap_seconds = max(self.backoff_base_seconds, backoff_cap_seconds)
+        self.backoff_jitter_ratio = max(0.0, min(backoff_jitter_ratio, 1.0))
+        self._random_source = random_source
         self.url = DERIV_WS_URL_TEMPLATE.format(app_id=app_id)
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._receiver_task: asyncio.Task[None] | None = None
         self._req_ids = count(1)
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self._subscriptions: dict[str, asyncio.Queue[dict[str, Any]]] = {}
-        self._request_lock = asyncio.Lock()
+        self._subscription_backlog: dict[str, deque[dict[str, Any]]] = {}
+        self._subscription_dropped: dict[str, int] = {}
+        self._send_lock = asyncio.Lock()
         self._authorized = False
         self.authorization: dict[str, Any] | None = None
 
@@ -226,6 +257,8 @@ class DerivWebSocketClient:
                 future.cancel()
         self._pending.clear()
         self._subscriptions.clear()
+        self._subscription_backlog.clear()
+        self._subscription_dropped.clear()
 
         if self._ws:
             try:
@@ -289,7 +322,12 @@ class DerivWebSocketClient:
 
                 subscription_id = (message.get("subscription") or {}).get("id")
                 if subscription_id in self._subscriptions:
-                    await self._subscriptions[subscription_id].put(message)
+                    self._enqueue_subscription(subscription_id, message)
+                elif subscription_id:
+                    backlog = self._subscription_backlog.setdefault(
+                        subscription_id, deque(maxlen=SUBSCRIPTION_BACKLOG_MAXSIZE)
+                    )
+                    backlog.append(message)
         except asyncio.CancelledError:
             raise
         except ConnectionClosed as exc:
@@ -302,6 +340,19 @@ class DerivWebSocketClient:
             if not future.done():
                 future.set_exception(exc)
             self._pending.pop(req_id, None)
+
+    def _enqueue_subscription(self, subscription_id: str, message: dict[str, Any]) -> None:
+        """Apply drop-oldest backpressure so the receiver can never block."""
+        queue = self._subscriptions[subscription_id]
+        if queue.full():
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            self._subscription_dropped[subscription_id] = (
+                self._subscription_dropped.get(subscription_id, 0) + 1
+            )
+        queue.put_nowait(message)
 
     async def request(
         self,
@@ -333,24 +384,26 @@ class DerivWebSocketClient:
         if self._ws is None:
             raise DerivTimeoutError("WebSocket is not connected")
 
-        async with self._request_lock:
-            req_id = next(self._req_ids)
-            request_payload = dict(payload)
-            request_payload["req_id"] = req_id
-            loop = asyncio.get_running_loop()
-            future: asyncio.Future[dict[str, Any]] = loop.create_future()
-            self._pending[req_id] = future
+        req_id = next(self._req_ids)
+        request_payload = dict(payload)
+        request_payload["req_id"] = req_id
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[dict[str, Any]] = loop.create_future()
+        self._pending[req_id] = future
 
-            try:
+        try:
+            # Serialize only writes to the socket. Responses remain independently
+            # correlated by req_id and may complete in any order.
+            async with self._send_lock:
                 await asyncio.wait_for(
                     self._ws.send(json.dumps(request_payload)),
                     timeout=self.timeout_seconds,
                 )
-                return await asyncio.wait_for(future, timeout=self.timeout_seconds)
-            except asyncio.TimeoutError as exc:
-                raise DerivTimeoutError("Timed out waiting for Deriv response") from exc
-            finally:
-                self._pending.pop(req_id, None)
+            return await asyncio.wait_for(future, timeout=self.timeout_seconds)
+        except asyncio.TimeoutError as exc:
+            raise DerivTimeoutError("Timed out waiting for Deriv response") from exc
+        finally:
+            self._pending.pop(req_id, None)
 
     async def collect_subscription(
         self,
@@ -358,8 +411,13 @@ class DerivWebSocketClient:
         *,
         limit: int = SUBSCRIPTION_SAMPLE_SIZE,
     ) -> list[dict[str, Any]]:
-        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
+            maxsize=self.subscription_queue_maxsize
+        )
         self._subscriptions[subscription_id] = queue
+        self._subscription_dropped.setdefault(subscription_id, 0)
+        for message in self._subscription_backlog.pop(subscription_id, deque()):
+            self._enqueue_subscription(subscription_id, message)
         messages: list[dict[str, Any]] = []
 
         try:
@@ -379,8 +437,23 @@ class DerivWebSocketClient:
         return messages
 
     @staticmethod
-    def _backoff(attempt: int) -> float:
-        return min(0.25 * (2**attempt), 2.0)
+    def _bounded_jitter(
+        raw_delay: float,
+        cap: float,
+        jitter_ratio: float,
+        random_value: float,
+    ) -> float:
+        jitter = raw_delay * jitter_ratio * ((2.0 * random_value) - 1.0)
+        return max(0.0, min(raw_delay + jitter, cap))
+
+    def _backoff(self, attempt: int) -> float:
+        raw = min(self.backoff_base_seconds * (2**attempt), self.backoff_cap_seconds)
+        return self._bounded_jitter(
+            raw,
+            self.backoff_cap_seconds,
+            self.backoff_jitter_ratio,
+            self._random_source(),
+        )
 
 
 def extract_tick(message: dict[str, Any]) -> dict[str, Any]:
@@ -601,7 +674,7 @@ async def execute_simulated_trade(
             }
             return ok_response(tool, {"receipt": receipt})
     except Exception as exc:
-        return error_response(tool, exc)
+        return error_response(tool, exc, secrets=[api_token])
 
 
 @mcp.tool()
@@ -632,7 +705,7 @@ async def check_account_status(api_token: str) -> str:
                 },
             )
     except Exception as exc:
-        return error_response(tool, exc)
+        return error_response(tool, exc, secrets=[api_token])
 
 
 @mcp.tool()
@@ -660,7 +733,7 @@ async def get_open_contract_status(api_token: str, contract_id: int | None = Non
                 },
             )
     except Exception as exc:
-        return error_response(tool, exc)
+        return error_response(tool, exc, secrets=[api_token])
 
 
 @mcp.tool()
@@ -700,7 +773,7 @@ async def close_open_contract(
                 },
             )
     except Exception as exc:
-        return error_response(tool, exc)
+        return error_response(tool, exc, secrets=[api_token])
 
 
 if __name__ == "__main__":

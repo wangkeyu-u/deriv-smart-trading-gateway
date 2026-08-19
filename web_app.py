@@ -9,7 +9,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import concurrent.futures
+import contextvars
 import html
+import inspect
 import operator
 import json
 import math
@@ -41,11 +43,18 @@ from server import (
 
 
 Provider = Literal["本地规则", "OpenAI", "DeepSeek", "Anthropic", "OpenAI-Compatible"]
+ToolCallingProvider = Literal["OpenAI", "DeepSeek", "Anthropic"]
 Action = Literal["get_market_ticks", "get_historical_candles", "execute_simulated_trade", "chat"]
 
 DEFAULT_SYMBOL = "R_100"
 DEFAULT_GRANULARITY = 60
 DEFAULT_COUNT = 60
+MIN_DECISION_BUDGET_SECONDS = 4
+MAX_DECISION_BUDGET_SECONDS = 25
+DEFAULT_DECISION_BUDGET_SECONDS = 10
+CURRENT_GRAPH_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "current_graph_deadline", default=None
+)
 COMMON_DERIV_SYMBOLS = [
     "R_10",
     "R_25",
@@ -391,6 +400,7 @@ class TeamRunResult:
     execution_report: dict[str, Any] | None = None
     ok: bool = True
     agent_reports: dict[str, Any] | None = None
+    runtime_evidence: dict[str, Any] | None = None
 
 
 AGENT_SPECS: dict[str, dict[str, str]] = {
@@ -528,6 +538,146 @@ class AdvisorGraphState(TypedDict, total=False):
     confidence: float
     vote_counts: dict[str, int]
     graph_runtime: str
+    deadline_at: float
+    node_timings: Annotated[dict[str, Any], merge_graph_reports]
+    timed_out: bool
+    timeout_node: str
+
+
+def merge_graph_reports(
+    left: dict[str, Any], right: dict[str, Any]
+) -> dict[str, Any]:
+    """Merge independent node reports without dropping sibling updates."""
+    return {**left, **right}
+
+
+def normalize_decision_budget(value: int | float) -> int:
+    """Clamp every decision budget to the resume's implemented 4-25s range."""
+    return max(MIN_DECISION_BUDGET_SECONDS, min(int(value), MAX_DECISION_BUDGET_SECONDS))
+
+
+def remaining_budget_seconds(state: dict[str, Any]) -> float:
+    return max(0.0, float(state.get("deadline_at") or 0.0) - time.perf_counter())
+
+
+def timed_graph_node(
+    node_name: str,
+    node: Callable[[Any], dict[str, Any]],
+    *,
+    allow_after_deadline: bool = False,
+) -> Callable[[Any], dict[str, Any]]:
+    """Add auditable timing and deadline state around a synchronous graph node."""
+
+    def wrapped(state: dict[str, Any]) -> dict[str, Any]:
+        started = time.perf_counter()
+        deadline_at = float(state.get("deadline_at") or (started + DEFAULT_DECISION_BUDGET_SECONDS))
+        remaining_before = max(0.0, deadline_at - started)
+        if remaining_before <= 0 and not allow_after_deadline:
+            return {
+                "timed_out": True,
+                "timeout_node": str(state.get("timeout_node") or node_name),
+                "node_timings": {
+                    node_name: {
+                        "status": "skipped_deadline",
+                        "elapsed_ms": 0.0,
+                        "remaining_before_ms": 0.0,
+                        "remaining_after_ms": 0.0,
+                    }
+                },
+            }
+
+        deadline_token = CURRENT_GRAPH_DEADLINE.set(deadline_at)
+        try:
+            updates = dict(node(state) or {})
+        finally:
+            CURRENT_GRAPH_DEADLINE.reset(deadline_token)
+        finished = time.perf_counter()
+        remaining_after = max(0.0, deadline_at - finished)
+        deadline_exhausted = finished >= deadline_at
+        updates["node_timings"] = {
+            **dict(updates.get("node_timings") or {}),
+            node_name: {
+                "status": "completed_after_deadline" if deadline_exhausted else "completed",
+                "elapsed_ms": round((finished - started) * 1000, 3),
+                "remaining_before_ms": round(remaining_before * 1000, 3),
+                "remaining_after_ms": round(remaining_after * 1000, 3),
+            },
+        }
+        if deadline_exhausted:
+            updates["timed_out"] = True
+            updates["timeout_node"] = str(state.get("timeout_node") or node_name)
+        return updates
+
+    return wrapped
+
+
+class ExecutionGraphState(TypedDict, total=False):
+    """State owned by the eight-role execution subgraph.
+
+    ``events`` and ``graph_trace`` use reducers so nodes can emit isolated
+    updates. The safety gate is intentionally a deterministic node, not an
+    agent role and not an LLM call.
+    """
+
+    user_text: str
+    writer: Callable[[str], None] | None
+    plan: dict[str, Any]
+    events: Annotated[list[AgentEvent], operator.add]
+    graph_trace: Annotated[list[str], operator.add]
+    agent_reports: Annotated[dict[str, Any], merge_graph_reports]
+    market_report: dict[str, Any] | None
+    execution_report: dict[str, Any] | None
+    safety_decision: dict[str, Any]
+    final_answer: str
+    ok: bool
+    graph_runtime: str
+    budget_seconds: int
+    started_at: float
+    deadline_at: float
+    node_timings: Annotated[dict[str, Any], merge_graph_reports]
+    timed_out: bool
+    timeout_node: str
+
+
+class GatewayParentState(TypedDict, total=False):
+    """Shared envelope for the mutually exclusive execution/advisor subgraphs."""
+
+    workflow: Literal["execution", "advisor"]
+    boundary_trace: Annotated[list[str], operator.add]
+    # Execution-subgraph fields.
+    user_text: str
+    writer: Callable[[str], None] | None
+    plan: dict[str, Any]
+    events: Annotated[list[AgentEvent], operator.add]
+    graph_trace: Annotated[list[str], operator.add]
+    agent_reports: Annotated[dict[str, Any], merge_graph_reports]
+    market_report: dict[str, Any] | None
+    execution_report: dict[str, Any] | None
+    safety_decision: dict[str, Any]
+    final_answer: str
+    ok: bool
+    # Advisor-subgraph fields.
+    question: str
+    symbol: str
+    budget: int
+    use_web: bool
+    language: str
+    started_at: float
+    sources: list[dict[str, str]]
+    market: dict[str, Any]
+    news_signal: dict[str, Any]
+    opinions: Annotated[list[dict[str, Any]], operator.add]
+    logs: Annotated[list[str], operator.add]
+    local_consensus: dict[str, Any]
+    consensus: str
+    stance: str
+    confidence: float
+    vote_counts: dict[str, int]
+    graph_runtime: str
+    deadline_at: float
+    node_timings: Annotated[dict[str, Any], merge_graph_reports]
+    timed_out: bool
+    timeout_node: str
 
 
 def default_agent_prompts() -> dict[str, dict[str, str]]:
@@ -2709,12 +2859,19 @@ def build_advisor_langgraph() -> Any:
             "logs": [f"Chief Advisor -> {local_consensus['stance']} confidence={local_consensus['confidence']:.0%}"],
         }
 
-    graph.add_node("web_research", web_research_node)
-    graph.add_node("market_snapshot", market_snapshot_node)
-    graph.add_node("news_signal", news_signal_node)
+    graph.add_node("web_research", timed_graph_node("web_research", web_research_node))
+    graph.add_node("market_snapshot", timed_graph_node("market_snapshot", market_snapshot_node))
+    graph.add_node("news_signal", timed_graph_node("news_signal", news_signal_node))
     for advisor in advisor_specs():
-        graph.add_node(advisor_node_name(advisor["id"]), make_langgraph_advisor_node(advisor))
-    graph.add_node("synthesize", synthesize_node)
+        node_name = advisor_node_name(advisor["id"])
+        graph.add_node(
+            node_name,
+            timed_graph_node(node_name, make_langgraph_advisor_node(advisor)),
+        )
+    graph.add_node(
+        "synthesize",
+        timed_graph_node("synthesize", synthesize_node, allow_after_deadline=True),
+    )
 
     graph.add_edge(START, "web_research")
     graph.add_edge("web_research", "market_snapshot")
@@ -2735,18 +2892,24 @@ def run_advisor_langgraph(
     writer: Callable[[str], None] | None = None,
 ) -> dict[str, Any] | None:
     try:
-        app = build_advisor_langgraph()
+        normalized_budget = normalize_decision_budget(budget)
+        started_at = time.perf_counter()
+        app = build_gateway_parent_graph()
         return dict(
             app.invoke(
                 {
+                    "workflow": "advisor",
                     "question": question,
                     "symbol": symbol,
-                    "budget": budget,
+                    "budget": normalized_budget,
                     "use_web": use_web,
                     "language": current_lang(),
-                    "started_at": time.perf_counter(),
+                    "started_at": started_at,
+                    "deadline_at": started_at + normalized_budget,
                     "opinions": [],
                     "logs": [],
+                    "node_timings": {},
+                    "boundary_trace": ["parent:advisor"],
                 }
             )
         )
@@ -2765,7 +2928,7 @@ def run_advisor_council(
     writer: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
-    budget = max(4, min(int(time_budget_seconds), 25))
+    budget = normalize_decision_budget(time_budget_seconds)
     push_runtime_event("advisor", "Boss", "Advisor Council", f"question received: {question[:80]}")
     if writer:
         writer(f"Advisor Council START · budget={budget}s · symbol={symbol}")
@@ -2837,6 +3000,10 @@ def run_advisor_council(
         "stance": stance,
         "confidence": confidence,
         "vote_counts": vote_counts,
+        "deadline_enforced": True,
+        "timed_out": bool((graph_state or {}).get("timed_out", False)),
+        "timeout_node": (graph_state or {}).get("timeout_node"),
+        "node_timings": dict((graph_state or {}).get("node_timings") or {}),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     if in_streamlit_runtime():
@@ -2868,6 +3035,19 @@ def parse_tool_response(raw: str) -> dict[str, Any]:
         return json.loads(raw)
     except json.JSONDecodeError:
         return {"ok": False, "error": {"message": raw}}
+
+
+def redact_runtime_secrets(message: str, params: dict[str, Any] | None = None) -> str:
+    redacted = str(message)
+    candidates = [
+        str(value)
+        for key, value in (params or {}).items()
+        if "token" in key.lower() or "key" in key.lower()
+    ]
+    for secret in candidates:
+        if secret:
+            redacted = redacted.replace(secret, mask_secret(secret) or "***")
+    return redacted
 
 
 def append_team_event(
@@ -2926,10 +3106,7 @@ def record_api_trace(
 ) -> None:
     if not in_streamlit_runtime():
         return
-    safe_params = {
-        key: ("***" if "token" in key.lower() else value)
-        for key, value in params.items()
-    }
+    safe_params = redact_sensitive_values(params)
     trace = {
         "time": datetime.now(LOCAL_TZ).strftime("%H:%M:%S.%f")[:-3],
         "tool": tool,
@@ -2941,6 +3118,30 @@ def record_api_trace(
     }
     st.session_state.api_trace = (st.session_state.api_trace + [trace])[-80:]
     push_runtime_event("api", tool, "state", status, trace)
+
+
+def redact_sensitive_values(value: Any, known_secrets: list[str] | None = None) -> Any:
+    """Recursively redact credential-like keys and known secret strings."""
+    secrets = [item for item in (known_secrets or []) if item]
+    if isinstance(value, dict):
+        return {
+            str(key): (
+                "***"
+                if any(marker in str(key).lower() for marker in ("token", "api_key", "secret"))
+                else redact_sensitive_values(item, secrets)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_sensitive_values(item, secrets) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_sensitive_values(item, secrets) for item in value)
+    if isinstance(value, str):
+        result = value
+        for secret in secrets:
+            result = result.replace(secret, mask_secret(secret) or "***")
+        return result
+    return value
 
 
 def summarize_api_result(result: dict[str, Any] | None) -> str:
@@ -2977,10 +3178,35 @@ def call_deriv_tool(
 ) -> dict[str, Any]:
     record_api_trace(tool_name, "START", params)
     started = time.perf_counter()
+    deadline_at = CURRENT_GRAPH_DEADLINE.get()
     try:
-        result = parse_tool_response(run_async(coro))
+        if deadline_at is not None:
+            remaining = deadline_at - time.perf_counter()
+            if remaining <= 0:
+                if inspect.iscoroutine(coro):
+                    coro.close()
+                result = {
+                    "ok": False,
+                    "error": {"message": "decision deadline reached before API call"},
+                }
+            else:
+                result = parse_tool_response(
+                    run_async(asyncio.wait_for(coro, timeout=remaining))
+                )
+        else:
+            result = parse_tool_response(run_async(coro))
+    except TimeoutError:
+        result = {
+            "ok": False,
+            "error": {"message": "decision deadline reached during API call"},
+        }
     except Exception as exc:
-        result = {"ok": False, "error": {"message": str(exc)}}
+        result = {
+            "ok": False,
+            "error": {
+                "message": redact_runtime_secrets(str(exc), params),
+            },
+        }
     elapsed = (time.perf_counter() - started) * 1000
     record_api_trace(tool_name, "DONE" if result.get("ok") else "FAILED", params, result, elapsed)
     if writer:
@@ -3701,6 +3927,79 @@ def manager_tool_dispatch(
     return {"ok": False, "error": f"unknown manager tool: {name}"}
 
 
+def validate_manager_tool_calls(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize provider output against one shared manager-tool contract."""
+    allowed = {item["function"]["name"] for item in MANAGER_TOOLS}
+    normalized: list[dict[str, Any]] = []
+    for call in calls:
+        name = str(call.get("name") or "")
+        arguments = call.get("arguments") or {}
+        if name not in allowed:
+            raise ValueError(f"provider returned unknown manager tool: {name}")
+        if not isinstance(arguments, dict):
+            raise ValueError(f"provider returned non-object arguments for {name}")
+        normalized.append({"name": name, "arguments": dict(arguments)})
+    return normalized
+
+
+def invoke_provider_tool_contract(
+    provider: ToolCallingProvider,
+    user_text: str,
+) -> list[dict[str, Any]]:
+    """Call one provider with MANAGER_TOOLS without executing returned calls."""
+    if provider in {"OpenAI", "DeepSeek"}:
+        from openai import OpenAI
+
+        kwargs: dict[str, Any] = {"api_key": st.session_state.llm_api_key}
+        base_url = OPENAI_COMPATIBLE_BASE_URLS.get(provider)
+        if base_url:
+            kwargs["base_url"] = base_url
+        response = OpenAI(**kwargs).chat.completions.create(
+            model=st.session_state.llm_model,
+            messages=[
+                {"role": "system", "content": manager_system_prompt()},
+                {"role": "user", "content": user_text},
+            ],
+            tools=MANAGER_TOOLS,
+            tool_choice="auto",
+            temperature=0.1,
+        )
+        message = response.choices[0].message
+        calls = [
+            {
+                "name": item.function.name,
+                "arguments": json.loads(item.function.arguments or "{}"),
+            }
+            for item in (message.tool_calls or [])
+        ]
+        return validate_manager_tool_calls(calls)
+
+    from anthropic import Anthropic
+
+    tools = [
+        {
+            "name": item["function"]["name"],
+            "description": item["function"]["description"],
+            "input_schema": item["function"]["parameters"],
+        }
+        for item in MANAGER_TOOLS
+    ]
+    response = Anthropic(api_key=st.session_state.llm_api_key).messages.create(
+        model=st.session_state.llm_model,
+        max_tokens=1000,
+        temperature=0.1,
+        system=manager_system_prompt(),
+        tools=tools,
+        messages=[{"role": "user", "content": user_text}],
+    )
+    calls = [
+        {"name": block.name, "arguments": dict(block.input)}
+        for block in response.content
+        if getattr(block, "type", None) == "tool_use"
+    ]
+    return validate_manager_tool_calls(calls)
+
+
 def manager_with_openai_tool_calling(
     user_text: str,
     events: list[AgentEvent],
@@ -3910,6 +4209,390 @@ def deterministic_manager_summary(
     return "经理总结：当前指令没有形成可执行交易任务。"
 
 
+def build_execution_plan(user_text: str) -> dict[str, Any]:
+    """Parse one command into the deterministic plan shared by graph nodes."""
+    symbol = extract_symbol(user_text)
+    trade_intent = has_trade_intent(user_text)
+    amount = extract_amount(user_text)
+    contract_type = extract_contract_type(user_text)
+    duration = extract_duration(user_text)
+    duration_unit = extract_duration_unit(user_text)
+    if trade_intent and duration <= 0:
+        duration, duration_unit = 5, "t"
+    needs_market = trade_intent or any(
+        keyword in user_text
+        for keyword in ["走势", "Tick", "tick", "行情", "价格", "K线", "k线", "连续", "图", "chart"]
+    )
+    return {
+        "symbol": symbol,
+        "trade_intent": trade_intent,
+        "amount": amount,
+        "contract_type": contract_type or "",
+        "duration": duration,
+        "duration_unit": duration_unit,
+        "needs_market": needs_market,
+        "needs_chart": any(
+            keyword in user_text for keyword in ["图", "K线", "k线", "chart", "表格", "走势"]
+        ),
+        "granularity": extract_granularity(user_text),
+        "count": extract_count(user_text),
+        "numeric_condition": extract_condition(user_text),
+        "condition_requires_down": "连续" in user_text and "跌" in user_text,
+        "condition_requires_up": "连续" in user_text and "涨" in user_text,
+    }
+
+
+def execution_safety_decision(state: ExecutionGraphState) -> dict[str, Any]:
+    """Evaluate deterministic preconditions before the sole write-capable role."""
+    if state.get("timed_out") or (
+        state.get("deadline_at") is not None
+        and remaining_budget_seconds(dict(state)) <= 0
+    ):
+        return {
+            "allow_execution": False,
+            "reason": "decision_deadline_exceeded",
+            "timeout_node": state.get("timeout_node"),
+        }
+    plan = dict(state.get("plan") or {})
+    if not plan.get("trade_intent"):
+        return {"allow_execution": False, "reason": "no_trade_intent"}
+
+    missing = []
+    if float(plan.get("amount") or 0) <= 0:
+        missing.append("amount")
+    if plan.get("contract_type") not in {"CALL", "PUT"}:
+        missing.append("contract_type")
+    if missing:
+        return {
+            "allow_execution": False,
+            "reason": "missing_trade_parameters",
+            "missing": missing,
+        }
+
+    reports = dict(state.get("agent_reports") or {})
+    compliance = dict(reports.get("compliance") or {})
+    if not compliance.get("ok", True):
+        return {
+            "allow_execution": False,
+            "reason": "compliance_blocked",
+            "blockers": list(compliance.get("blockers") or []),
+        }
+    risk = dict(reports.get("risk") or {})
+    if risk.get("reason") not in {None, "missing_deriv_api_token"}:
+        return {"allow_execution": False, "reason": "risk_blocked"}
+
+    market_report = dict(state.get("market_report") or {})
+    tick_analysis = dict(market_report.get("tick_analysis") or {})
+    condition_passed = True
+    condition_note = "用户未设置市场条件，允许进入执行角色的安全门。"
+    if plan.get("condition_requires_down"):
+        condition_passed = bool(tick_analysis.get("consecutive_three_down"))
+        condition_note = f"连续三个 Tick 下跌条件 -> {condition_passed}"
+    elif plan.get("condition_requires_up"):
+        condition_passed = bool(tick_analysis.get("consecutive_three_up"))
+        condition_note = f"连续三个 Tick 上涨条件 -> {condition_passed}"
+    numeric_condition = plan.get("numeric_condition")
+    if numeric_condition:
+        latest_quote = tick_analysis.get("latest_quote")
+        if latest_quote is None:
+            condition_passed = False
+            condition_note = "数值条件需要最新行情，但行情不可用"
+        else:
+            condition_passed, condition_note = evaluate_condition(
+                numeric_condition, float(latest_quote)
+            )
+    return {
+        "allow_execution": condition_passed,
+        "reason": "cleared" if condition_passed else "condition_not_met",
+        "condition_note": condition_note,
+    }
+
+
+def build_execution_langgraph() -> Any:
+    """Compile Manager + seven workers into the execution StateGraph."""
+    from langgraph.graph import END, START, StateGraph
+
+    graph = StateGraph(ExecutionGraphState)
+
+    def manager_node(state: ExecutionGraphState) -> dict[str, Any]:
+        text = str(state.get("user_text") or "")
+        event = AgentEvent("用户", "经理", text)
+        writer = state.get("writer")
+        if writer:
+            writer(localized_event_line(event))
+        return {
+            "plan": build_execution_plan(text),
+            "events": [event],
+            "graph_trace": ["manager"],
+            "graph_runtime": "langgraph",
+        }
+
+    def run_role(
+        state: ExecutionGraphState,
+        role_id: str,
+        call: Callable[[dict[str, Any], list[AgentEvent], Callable[[str], None] | None], dict[str, Any]],
+    ) -> dict[str, Any]:
+        local_events: list[AgentEvent] = []
+        report = call(dict(state.get("plan") or {}), local_events, state.get("writer"))
+        updates: dict[str, Any] = {
+            "events": local_events,
+            "agent_reports": {role_id: report},
+            "graph_trace": [role_id],
+        }
+        if role_id == "market":
+            updates["market_report"] = report
+        if role_id == "execution":
+            updates["execution_report"] = report
+        return updates
+
+    def strategy_node(state: ExecutionGraphState) -> dict[str, Any]:
+        return run_role(
+            state,
+            "strategy",
+            lambda plan, events, writer: assign_task_to_strategy_agent(
+                {"task": state.get("user_text", ""), "symbol": plan.get("symbol")}, events, writer
+            ),
+        )
+
+    def market_node(state: ExecutionGraphState) -> dict[str, Any]:
+        plan = dict(state.get("plan") or {})
+        if not plan.get("needs_market"):
+            return {"agent_reports": {"market": {"role": "Market Analyst Agent", "status": "not_required"}}, "graph_trace": ["market"]}
+        return run_role(
+            state,
+            "market",
+            lambda plan, events, writer: assign_task_to_market_agent(
+                {
+                    "task": "读取最新行情并验证用户条件。",
+                    "symbol": plan.get("symbol"),
+                    "tick_count": 10,
+                    "granularity": plan.get("granularity"),
+                    "candle_count": plan.get("count") or 60,
+                    "analysis_goal": "consecutive_down" if plan.get("condition_requires_down") else "tick_trend",
+                },
+                events,
+                writer,
+            ),
+        )
+
+    def risk_node(state: ExecutionGraphState) -> dict[str, Any]:
+        plan = dict(state.get("plan") or {})
+        if not plan.get("trade_intent"):
+            return {"agent_reports": {"risk": {"role": "Risk Sentinel", "status": "not_required", "ok": True}}, "graph_trace": ["risk"]}
+        return run_role(
+            state,
+            "risk",
+            lambda plan, events, writer: assign_task_to_risk_agent(
+                {"task": state.get("user_text", ""), "symbol": plan.get("symbol"), "amount": plan.get("amount")}, events, writer
+            ),
+        )
+
+    def compliance_node(state: ExecutionGraphState) -> dict[str, Any]:
+        return run_role(
+            state,
+            "compliance",
+            lambda plan, events, writer: assign_task_to_compliance_agent(
+                {"task": state.get("user_text", ""), "amount": plan.get("amount"), "contract_type": plan.get("contract_type")}, events, writer
+            ),
+        )
+
+    def chart_node(state: ExecutionGraphState) -> dict[str, Any]:
+        plan = dict(state.get("plan") or {})
+        if not plan.get("needs_chart"):
+            return {"agent_reports": {"chart": {"role": "Chart Engineer", "status": "not_required", "ok": True}}, "graph_trace": ["chart"]}
+        return run_role(
+            state,
+            "chart",
+            lambda plan, events, writer: assign_task_to_chart_agent(
+                {"task": "生成 K 线图表快照。", "symbol": plan.get("symbol"), "granularity": plan.get("granularity"), "count": plan.get("count") or 120}, events, writer
+            ),
+        )
+
+    def safety_gate_node(state: ExecutionGraphState) -> dict[str, Any]:
+        decision = execution_safety_decision(state)
+        event = AgentEvent("经理", "经理", f"确定性安全门：{decision.get('reason')}")
+        return {"safety_decision": decision, "events": [event], "graph_trace": ["safety_gate"]}
+
+    def execution_node(state: ExecutionGraphState) -> dict[str, Any]:
+        decision = dict(state.get("safety_decision") or {})
+        return run_role(
+            state,
+            "execution",
+            lambda plan, events, writer: assign_task_to_execution_agent(
+                {
+                    "task": "确定性条件已通过，执行用户授权的订单。",
+                    "symbol": plan.get("symbol"),
+                    "amount": plan.get("amount"),
+                    "contract_type": plan.get("contract_type"),
+                    "duration": plan.get("duration"),
+                    "duration_unit": plan.get("duration_unit"),
+                    "risk_note": decision.get("condition_note") or decision.get("reason"),
+                },
+                events,
+                writer,
+            ),
+        )
+
+    def report_node(state: ExecutionGraphState) -> dict[str, Any]:
+        updates = run_role(
+            state,
+            "report",
+            lambda plan, events, writer: assign_task_to_report_agent(
+                {"task": "整理本轮 StateGraph 多角色协作复盘。"}, events, writer
+            ),
+        )
+        decision = dict(state.get("safety_decision") or {})
+        execution_report = state.get("execution_report")
+        if not execution_report and decision.get("reason") not in {None, "no_trade_intent"}:
+            execution_report = {
+                "role": "Execution Trader",
+                "ok": False,
+                "status": "not_invoked",
+                "reason": decision.get("reason"),
+                "details": decision,
+            }
+            updates["execution_report"] = execution_report
+        final = deterministic_manager_summary(state.get("market_report"), execution_report)
+        final_event = AgentEvent("经理", "用户", final)
+        updates["events"] = list(updates.get("events") or []) + [final_event]
+        updates["final_answer"] = final
+        updates["ok"] = not bool(execution_report and execution_report.get("ok") is False)
+        return updates
+
+    graph.add_node("manager", timed_graph_node("manager", manager_node))
+    graph.add_node("strategy", timed_graph_node("strategy", strategy_node))
+    graph.add_node("market", timed_graph_node("market", market_node))
+    graph.add_node("compliance", timed_graph_node("compliance", compliance_node))
+    graph.add_node("risk", timed_graph_node("risk", risk_node))
+    graph.add_node("chart", timed_graph_node("chart", chart_node))
+    graph.add_node(
+        "safety_gate",
+        timed_graph_node("safety_gate", safety_gate_node, allow_after_deadline=True),
+    )
+    graph.add_node("execution", timed_graph_node("execution", execution_node))
+    graph.add_node(
+        "report", timed_graph_node("report", report_node, allow_after_deadline=True)
+    )
+    graph.add_edge(START, "manager")
+    graph.add_edge("manager", "strategy")
+    graph.add_edge("strategy", "market")
+    graph.add_edge("market", "compliance")
+    graph.add_edge("compliance", "risk")
+    graph.add_edge("risk", "chart")
+    graph.add_edge("chart", "safety_gate")
+    graph.add_conditional_edges(
+        "safety_gate",
+        lambda state: "execute" if (state.get("safety_decision") or {}).get("allow_execution") else "skip",
+        {"execute": "execution", "skip": "report"},
+    )
+    graph.add_edge("execution", "report")
+    graph.add_edge("report", END)
+    return graph.compile()
+
+
+def build_gateway_parent_graph() -> Any:
+    """Compile the parent boundary around execution and advisor subgraphs."""
+    from langgraph.graph import END, START, StateGraph
+
+    graph = StateGraph(GatewayParentState)
+    graph.add_node("execution_subgraph", build_execution_langgraph())
+    graph.add_node("advisor_subgraph", build_advisor_langgraph())
+    graph.add_conditional_edges(
+        START,
+        lambda state: str(state.get("workflow") or "execution"),
+        {"execution": "execution_subgraph", "advisor": "advisor_subgraph"},
+    )
+    graph.add_edge("execution_subgraph", END)
+    graph.add_edge("advisor_subgraph", END)
+    return graph.compile()
+
+
+def run_execution_langgraph(
+    user_text: str,
+    writer: Callable[[str], None] | None = None,
+    budget_seconds: int = DEFAULT_DECISION_BUDGET_SECONDS,
+) -> TeamRunResult:
+    """Run the parent graph's execution branch and adapt its state for the UI."""
+    budget = normalize_decision_budget(budget_seconds)
+    started_at = time.perf_counter()
+    app = build_gateway_parent_graph()
+    state = dict(
+        app.invoke(
+            {
+                "workflow": "execution",
+                "user_text": user_text,
+                "writer": writer,
+                "budget_seconds": budget,
+                "started_at": started_at,
+                "deadline_at": started_at + budget,
+                "events": [],
+                "graph_trace": [],
+                "agent_reports": {},
+                "node_timings": {},
+                "boundary_trace": ["parent:execution"],
+            }
+        )
+    )
+    events = list(state.get("events") or [])
+    market_report = state.get("market_report")
+    execution_report = state.get("execution_report")
+    publish_team_log(events, build_team_extra_lines(market_report, execution_report))
+    return TeamRunResult(
+        final_answer=str(state.get("final_answer") or deterministic_manager_summary(market_report, execution_report)),
+        events=events,
+        market_report=market_report,
+        execution_report=execution_report,
+        ok=bool(state.get("ok", True)),
+        agent_reports=dict(state.get("agent_reports") or {}),
+        runtime_evidence={
+            "runtime": "langgraph",
+            "budget_seconds": budget,
+            "deadline_enforced": True,
+            "observed_elapsed_ms": round((time.perf_counter() - started_at) * 1000, 3),
+            "timed_out": bool(state.get("timed_out", False)),
+            "timeout_node": state.get("timeout_node"),
+            "node_timings": dict(state.get("node_timings") or {}),
+            "graph_trace": list(state.get("graph_trace") or []),
+        },
+    )
+
+
+def run_provider_to_deterministic_graph(
+    provider: ToolCallingProvider,
+    user_text: str,
+    writer: Callable[[str], None] | None = None,
+    *,
+    provider_invoker: Callable[[ToolCallingProvider, str], list[dict[str, Any]]] | None = None,
+    budget_seconds: int = DEFAULT_DECISION_BUDGET_SECONDS,
+) -> TeamRunResult:
+    """Use provider tool-calling for planning, then always enter one safe graph."""
+    invoker = provider_invoker or invoke_provider_tool_contract
+    tool_calls: list[dict[str, Any]] = []
+    provider_status = "tool_calls_received"
+    provider_error: str | None = None
+    try:
+        tool_calls = validate_manager_tool_calls(invoker(provider, user_text))
+    except Exception as exc:
+        provider_status = "deterministic_fallback"
+        provider_error = redact_runtime_secrets(
+            str(exc), {"llm_api_key": st.session_state.get("llm_api_key", "")}
+        )
+    result = run_execution_langgraph(user_text, writer, budget_seconds=budget_seconds)
+    runtime = dict(result.runtime_evidence or {})
+    runtime.update(
+        {
+            "provider": provider,
+            "provider_status": provider_status,
+            "provider_tool_contract_count": len(MANAGER_TOOLS),
+            "provider_tool_calls": tool_calls,
+            "provider_error": provider_error,
+            "business_runtime": "deterministic_langgraph_python",
+        }
+    )
+    result.runtime_evidence = runtime
+    return result
+
+
 def deterministic_manager_state_machine(
     user_text: str,
     events: list[AgentEvent],
@@ -3966,18 +4649,18 @@ def deterministic_manager_state_machine(
         if duration <= 0:
             duration = 5
             duration_unit = "t"
-        risk_report = assign_task_to_risk_agent(
-            {"task": user_text, "symbol": symbol, "amount": amount},
-            events,
-            writer,
-        )
         compliance_report = assign_task_to_compliance_agent(
             {"task": user_text, "amount": amount, "contract_type": contract_type or ""},
             events,
             writer,
         )
-        agent_reports["risk"] = risk_report
         agent_reports["compliance"] = compliance_report
+        risk_report = assign_task_to_risk_agent(
+            {"task": user_text, "symbol": symbol, "amount": amount},
+            events,
+            writer,
+        )
+        agent_reports["risk"] = risk_report
         missing = []
         if amount <= 0:
             missing.append("金额 amount")
@@ -4056,16 +4739,25 @@ def run_hierarchical_trading_team(
     writer: Callable[[str], None] | None = None,
 ) -> TeamRunResult:
     events: list[AgentEvent] = []
-    provider: Provider = st.session_state.llm_provider
-    if provider in {"OpenAI", "DeepSeek", "OpenAI-Compatible"} and st.session_state.llm_api_key:
-        result = manager_with_openai_tool_calling(user_text, events, writer)
-        if result:
-            return result
-    if provider == "Anthropic" and st.session_state.llm_api_key:
-        result = manager_with_anthropic_tool_calling(user_text, events, writer)
-        if result:
-            return result
-    return deterministic_manager_state_machine(user_text, events, writer)
+    try:
+        provider: Provider = st.session_state.llm_provider
+        if provider in {"OpenAI", "DeepSeek", "Anthropic"} and st.session_state.llm_api_key:
+            return run_provider_to_deterministic_graph(
+                provider,  # type: ignore[arg-type]
+                user_text,
+                writer,
+            )
+        return run_execution_langgraph(user_text, writer)
+    except Exception as exc:
+        append_team_event(
+            events,
+            "系统",
+            "经理",
+            f"执行 StateGraph 失败，切换确定性 Python fallback：{exc}",
+            writer,
+        )
+        push_runtime_event("langgraph", "Execution Graph", "Fallback", str(exc))
+        return deterministic_manager_state_machine(user_text, events, writer)
 
 
 def reset_agent_log() -> list[str]:

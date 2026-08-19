@@ -1,0 +1,581 @@
+{
+  "decision_budget": {
+    "artificial_sleep_used": false,
+    "budget_range_seconds": [
+      4,
+      25
+    ],
+    "fixture": true,
+    "fixture_scope": "offline orchestration only; no Deriv network, provider API, or order",
+    "runs": [
+      {
+        "effective_budget_seconds": 4,
+        "graph_trace": [
+          "manager",
+          "strategy",
+          "market",
+          "compliance",
+          "risk",
+          "chart",
+          "safety_gate",
+          "report"
+        ],
+        "node_timings": {
+          "chart": {
+            "elapsed_ms": 0.002,
+            "remaining_after_ms": 3966.328,
+            "remaining_before_ms": 3966.33,
+            "status": "completed"
+          },
+          "compliance": {
+            "elapsed_ms": 0.274,
+            "remaining_after_ms": 3966.732,
+            "remaining_before_ms": 3967.006,
+            "status": "completed"
+          },
+          "manager": {
+            "elapsed_ms": 0.924,
+            "remaining_after_ms": 3968.375,
+            "remaining_before_ms": 3969.299,
+            "status": "completed"
+          },
+          "market": {
+            "elapsed_ms": 0.003,
+            "remaining_after_ms": 3967.21,
+            "remaining_before_ms": 3967.212,
+            "status": "completed"
+          },
+          "report": {
+            "elapsed_ms": 0.007,
+            "remaining_after_ms": 3965.893,
+            "remaining_before_ms": 3965.9,
+            "status": "completed"
+          },
+          "risk": {
+            "elapsed_ms": 0.003,
+            "remaining_after_ms": 3966.511,
+            "remaining_before_ms": 3966.514,
+            "status": "completed"
+          },
+          "safety_gate": {
+            "elapsed_ms": 0.007,
+            "remaining_after_ms": 3966.16,
+            "remaining_before_ms": 3966.166,
+            "status": "completed"
+          },
+          "strategy": {
+            "elapsed_ms": 0.009,
+            "remaining_after_ms": 3967.478,
+            "remaining_before_ms": 3967.487,
+            "status": "completed"
+          }
+        },
+        "observed_elapsed_ms": 34.543,
+        "requested_budget_seconds": 4,
+        "timed_out": false
+      },
+      {
+        "effective_budget_seconds": 25,
+        "graph_trace": [
+          "manager",
+          "strategy",
+          "market",
+          "compliance",
+          "risk",
+          "chart",
+          "safety_gate",
+          "report"
+        ],
+        "node_timings": {
+          "chart": {
+            "elapsed_ms": 0.002,
+            "remaining_after_ms": 24970.51,
+            "remaining_before_ms": 24970.512,
+            "status": "completed"
+          },
+          "compliance": {
+            "elapsed_ms": 0.224,
+            "remaining_after_ms": 24970.89,
+            "remaining_before_ms": 24971.115,
+            "status": "completed"
+          },
+          "manager": {
+            "elapsed_ms": 0.054,
+            "remaining_after_ms": 24971.674,
+            "remaining_before_ms": 24971.727,
+            "status": "completed"
+          },
+          "market": {
+            "elapsed_ms": 0.002,
+            "remaining_after_ms": 24971.291,
+            "remaining_before_ms": 24971.294,
+            "status": "completed"
+          },
+          "report": {
+            "elapsed_ms": 0.014,
+            "remaining_after_ms": 24969.532,
+            "remaining_before_ms": 24969.545,
+            "status": "completed"
+          },
+          "risk": {
+            "elapsed_ms": 0.003,
+            "remaining_after_ms": 24970.687,
+            "remaining_before_ms": 24970.689,
+            "status": "completed"
+          },
+          "safety_gate": {
+            "elapsed_ms": 0.005,
+            "remaining_after_ms": 24970.347,
+            "remaining_before_ms": 24970.353,
+            "status": "completed"
+          },
+          "strategy": {
+            "elapsed_ms": 0.004,
+            "remaining_after_ms": 24971.476,
+            "remaining_before_ms": 24971.48,
+            "status": "completed"
+          }
+        },
+        "observed_elapsed_ms": 31.137,
+        "requested_budget_seconds": 25,
+        "timed_out": false
+      }
+    ],
+    "supports_real_network_latency_claim": false
+  },
+  "generated_at": "2026-08-12T17:41:44.335989+00:00",
+  "generator": "scripts/generate_runtime_evidence.py",
+  "git": {
+    "branch": "codex/interview-alignment",
+    "evidence_source_head": "c31a2220c5dc7f3a861c31e91a2f9089bbc26327",
+    "origin_main": "d7659d9a57d6c7ca4a51e874335fc9e58b1f79f2",
+    "original_main": "d7659d9a57d6c7ca4a51e874335fc9e58b1f79f2",
+    "round1_tag_target": "101ca58ec53db457b01db57ba6a125c66f6f7f51"
+  },
+  "graph": {
+    "advisor_chief_node": "synthesize",
+    "advisor_parallel_role_count": 5,
+    "advisor_parallel_role_ids": [
+      "advisor_contrarian",
+      "advisor_flow",
+      "advisor_macro",
+      "advisor_quant",
+      "advisor_risk"
+    ],
+    "execution_control_nodes": [
+      "safety_gate"
+    ],
+    "execution_edges": [
+      [
+        "__start__",
+        "manager"
+      ],
+      [
+        "chart",
+        "safety_gate"
+      ],
+      [
+        "compliance",
+        "risk"
+      ],
+      [
+        "execution",
+        "report"
+      ],
+      [
+        "manager",
+        "strategy"
+      ],
+      [
+        "market",
+        "compliance"
+      ],
+      [
+        "report",
+        "__end__"
+      ],
+      [
+        "risk",
+        "chart"
+      ],
+      [
+        "safety_gate",
+        "execution"
+      ],
+      [
+        "safety_gate",
+        "report"
+      ],
+      [
+        "strategy",
+        "market"
+      ]
+    ],
+    "execution_role_count": 8,
+    "execution_role_ids": [
+      "chart",
+      "compliance",
+      "execution",
+      "manager",
+      "market",
+      "report",
+      "risk",
+      "strategy"
+    ],
+    "parent_edges": [
+      [
+        "__start__",
+        "advisor_subgraph"
+      ],
+      [
+        "__start__",
+        "execution_subgraph"
+      ],
+      [
+        "advisor_subgraph",
+        "__end__"
+      ],
+      [
+        "execution_subgraph",
+        "__end__"
+      ]
+    ],
+    "parent_nodes": [
+      "__end__",
+      "__start__",
+      "advisor_subgraph",
+      "execution_subgraph"
+    ]
+  },
+  "mcp": {
+    "categories": {
+      "account_management": [
+        "check_account_status",
+        "get_open_contract_status"
+      ],
+      "market_data": [
+        "get_historical_candles",
+        "get_market_ticks"
+      ],
+      "trade_execution": [
+        "close_open_contract",
+        "execute_simulated_trade"
+      ]
+    },
+    "schema_sha256": "b573b60e83670173195d07216c15b30b3fec679c8f0657b1b0c846feed0f8f5f",
+    "tool_count": 6,
+    "tools": [
+      {
+        "description": "Fetch the latest Deriv tick for a symbol, optionally sampling a live stream.",
+        "input_schema": {
+          "properties": {
+            "subscribe": {
+              "default": false,
+              "title": "Subscribe",
+              "type": "boolean"
+            },
+            "symbol": {
+              "title": "Symbol",
+              "type": "string"
+            }
+          },
+          "required": [
+            "symbol"
+          ],
+          "title": "get_market_ticksArguments",
+          "type": "object"
+        },
+        "name": "get_market_ticks",
+        "output_schema": {
+          "properties": {
+            "result": {
+              "title": "Result",
+              "type": "string"
+            }
+          },
+          "required": [
+            "result"
+          ],
+          "title": "get_market_ticksOutput",
+          "type": "object"
+        }
+      },
+      {
+        "description": "Fetch Deriv historical candles in normalized OHLCV format.",
+        "input_schema": {
+          "properties": {
+            "count": {
+              "title": "Count",
+              "type": "integer"
+            },
+            "granularity": {
+              "title": "Granularity",
+              "type": "integer"
+            },
+            "symbol": {
+              "title": "Symbol",
+              "type": "string"
+            }
+          },
+          "required": [
+            "symbol",
+            "granularity",
+            "count"
+          ],
+          "title": "get_historical_candlesArguments",
+          "type": "object"
+        },
+        "name": "get_historical_candles",
+        "output_schema": {
+          "properties": {
+            "result": {
+              "title": "Result",
+              "type": "string"
+            }
+          },
+          "required": [
+            "result"
+          ],
+          "title": "get_historical_candlesOutput",
+          "type": "object"
+        }
+      },
+      {
+        "description": "Authorize and buy a Deriv CALL/PUT contract, returning an immutable receipt.",
+        "input_schema": {
+          "properties": {
+            "allow_live": {
+              "default": false,
+              "title": "Allow Live",
+              "type": "boolean"
+            },
+            "amount": {
+              "title": "Amount",
+              "type": "number"
+            },
+            "api_token": {
+              "title": "Api Token",
+              "type": "string"
+            },
+            "contract_type": {
+              "title": "Contract Type",
+              "type": "string"
+            },
+            "duration": {
+              "title": "Duration",
+              "type": "integer"
+            },
+            "duration_unit": {
+              "title": "Duration Unit",
+              "type": "string"
+            },
+            "symbol": {
+              "title": "Symbol",
+              "type": "string"
+            }
+          },
+          "required": [
+            "api_token",
+            "symbol",
+            "amount",
+            "contract_type",
+            "duration",
+            "duration_unit"
+          ],
+          "title": "execute_simulated_tradeArguments",
+          "type": "object"
+        },
+        "name": "execute_simulated_trade",
+        "output_schema": {
+          "properties": {
+            "result": {
+              "title": "Result",
+              "type": "string"
+            }
+          },
+          "required": [
+            "result"
+          ],
+          "title": "execute_simulated_tradeOutput",
+          "type": "object"
+        }
+      },
+      {
+        "description": "Authorize and return balance plus open-contract portfolio metrics.",
+        "input_schema": {
+          "properties": {
+            "api_token": {
+              "title": "Api Token",
+              "type": "string"
+            }
+          },
+          "required": [
+            "api_token"
+          ],
+          "title": "check_account_statusArguments",
+          "type": "object"
+        },
+        "name": "check_account_status",
+        "output_schema": {
+          "properties": {
+            "result": {
+              "title": "Result",
+              "type": "string"
+            }
+          },
+          "required": [
+            "result"
+          ],
+          "title": "check_account_statusOutput",
+          "type": "object"
+        }
+      },
+      {
+        "description": "Authorize and fetch latest status for one open contract or all open contracts.",
+        "input_schema": {
+          "properties": {
+            "api_token": {
+              "title": "Api Token",
+              "type": "string"
+            },
+            "contract_id": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Contract Id"
+            }
+          },
+          "required": [
+            "api_token"
+          ],
+          "title": "get_open_contract_statusArguments",
+          "type": "object"
+        },
+        "name": "get_open_contract_status",
+        "output_schema": {
+          "properties": {
+            "result": {
+              "title": "Result",
+              "type": "string"
+            }
+          },
+          "required": [
+            "result"
+          ],
+          "title": "get_open_contract_statusOutput",
+          "type": "object"
+        }
+      },
+      {
+        "description": "Authorize and sell an open contract by contract_id. price=0 means sell at market.",
+        "input_schema": {
+          "properties": {
+            "allow_live": {
+              "default": false,
+              "title": "Allow Live",
+              "type": "boolean"
+            },
+            "api_token": {
+              "title": "Api Token",
+              "type": "string"
+            },
+            "contract_id": {
+              "title": "Contract Id",
+              "type": "integer"
+            },
+            "price": {
+              "default": 0.0,
+              "title": "Price",
+              "type": "number"
+            }
+          },
+          "required": [
+            "api_token",
+            "contract_id"
+          ],
+          "title": "close_open_contractArguments",
+          "type": "object"
+        },
+        "name": "close_open_contract",
+        "output_schema": {
+          "properties": {
+            "result": {
+              "title": "Result",
+              "type": "string"
+            }
+          },
+          "required": [
+            "result"
+          ],
+          "title": "close_open_contractOutput",
+          "type": "object"
+        }
+      }
+    ]
+  },
+  "provider_contract": {
+    "business_runtime": "deterministic_langgraph_python",
+    "manager_tool_contract_count": 7,
+    "providers": [
+      "OpenAI",
+      "Anthropic",
+      "DeepSeek"
+    ],
+    "real_provider_api_executed": false,
+    "test_mode": "mock_provider_fixture"
+  },
+  "safety": {
+    "hitl_default": true,
+    "live_execution_default": false,
+    "ordered_layers": [
+      "compliance",
+      "risk",
+      "execution"
+    ],
+    "write_tools_executed": false
+  },
+  "schema_version": 1,
+  "versions_and_hashes": {
+    "files": {
+      "agent_prompts": {
+        "path": "/Users/wangkeyu/Documents/Codex/2026-08-12/deriv-interview-alignment/deriv-smart-trading-gateway/agent_prompts.json",
+        "sha256": "96d116311d08c614089cd23b45a55076738034e15ac6bd1f134709b6d290f95c"
+      },
+      "requirements": {
+        "path": "/Users/wangkeyu/Documents/Codex/2026-08-12/deriv-interview-alignment/deriv-smart-trading-gateway/requirements.txt",
+        "sha256": "2e5711b74f8b40e9c3e083ecb483481574fa93dba99b4fcd82a22fbaecee3ac1"
+      },
+      "resume_pdf": {
+        "path": "/Users/wangkeyu/Downloads/123简历.pdf",
+        "sha256": "dc82b04dd8ca3d628c9b5c1b2cc17ed079c1b8356ea2079b7c44870be29ca4cb"
+      }
+    },
+    "packages": {
+      "anthropic": "0.121.0",
+      "langgraph": "1.2.11",
+      "mcp": "1.29.0",
+      "openai": "3.0.0",
+      "pytest": "9.1.1",
+      "pytest-asyncio": "1.4.0",
+      "streamlit": "1.61.1",
+      "websockets": "15.0.1"
+    },
+    "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+    "python": "3.14.5"
+  },
+  "websocket": {
+    "backoff_base_seconds": 0.25,
+    "backoff_cap_seconds": 2.0,
+    "backoff_jitter_ratio": 0.2,
+    "backpressure_policy": "drop_oldest",
+    "request_correlation": "req_id -> pending Future",
+    "subscription_backlog_maxsize": 64,
+    "subscription_queue_maxsize": 64
+  }
+}

@@ -1,0 +1,272 @@
+{
+  "categories": {
+    "account_management": [
+      "check_account_status",
+      "get_open_contract_status"
+    ],
+    "market_data": [
+      "get_historical_candles",
+      "get_market_ticks"
+    ],
+    "trade_execution": [
+      "close_open_contract",
+      "execute_simulated_trade"
+    ]
+  },
+  "schema_sha256": "b573b60e83670173195d07216c15b30b3fec679c8f0657b1b0c846feed0f8f5f",
+  "tool_count": 6,
+  "tools": [
+    {
+      "description": "Fetch the latest Deriv tick for a symbol, optionally sampling a live stream.",
+      "input_schema": {
+        "properties": {
+          "subscribe": {
+            "default": false,
+            "title": "Subscribe",
+            "type": "boolean"
+          },
+          "symbol": {
+            "title": "Symbol",
+            "type": "string"
+          }
+        },
+        "required": [
+          "symbol"
+        ],
+        "title": "get_market_ticksArguments",
+        "type": "object"
+      },
+      "name": "get_market_ticks",
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "get_market_ticksOutput",
+        "type": "object"
+      }
+    },
+    {
+      "description": "Fetch Deriv historical candles in normalized OHLCV format.",
+      "input_schema": {
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "granularity": {
+            "title": "Granularity",
+            "type": "integer"
+          },
+          "symbol": {
+            "title": "Symbol",
+            "type": "string"
+          }
+        },
+        "required": [
+          "symbol",
+          "granularity",
+          "count"
+        ],
+        "title": "get_historical_candlesArguments",
+        "type": "object"
+      },
+      "name": "get_historical_candles",
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "get_historical_candlesOutput",
+        "type": "object"
+      }
+    },
+    {
+      "description": "Authorize and buy a Deriv CALL/PUT contract, returning an immutable receipt.",
+      "input_schema": {
+        "properties": {
+          "allow_live": {
+            "default": false,
+            "title": "Allow Live",
+            "type": "boolean"
+          },
+          "amount": {
+            "title": "Amount",
+            "type": "number"
+          },
+          "api_token": {
+            "title": "Api Token",
+            "type": "string"
+          },
+          "contract_type": {
+            "title": "Contract Type",
+            "type": "string"
+          },
+          "duration": {
+            "title": "Duration",
+            "type": "integer"
+          },
+          "duration_unit": {
+            "title": "Duration Unit",
+            "type": "string"
+          },
+          "symbol": {
+            "title": "Symbol",
+            "type": "string"
+          }
+        },
+        "required": [
+          "api_token",
+          "symbol",
+          "amount",
+          "contract_type",
+          "duration",
+          "duration_unit"
+        ],
+        "title": "execute_simulated_tradeArguments",
+        "type": "object"
+      },
+      "name": "execute_simulated_trade",
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "execute_simulated_tradeOutput",
+        "type": "object"
+      }
+    },
+    {
+      "description": "Authorize and return balance plus open-contract portfolio metrics.",
+      "input_schema": {
+        "properties": {
+          "api_token": {
+            "title": "Api Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "api_token"
+        ],
+        "title": "check_account_statusArguments",
+        "type": "object"
+      },
+      "name": "check_account_status",
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "check_account_statusOutput",
+        "type": "object"
+      }
+    },
+    {
+      "description": "Authorize and fetch latest status for one open contract or all open contracts.",
+      "input_schema": {
+        "properties": {
+          "api_token": {
+            "title": "Api Token",
+            "type": "string"
+          },
+          "contract_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Contract Id"
+          }
+        },
+        "required": [
+          "api_token"
+        ],
+        "title": "get_open_contract_statusArguments",
+        "type": "object"
+      },
+      "name": "get_open_contract_status",
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "get_open_contract_statusOutput",
+        "type": "object"
+      }
+    },
+    {
+      "description": "Authorize and sell an open contract by contract_id. price=0 means sell at market.",
+      "input_schema": {
+        "properties": {
+          "allow_live": {
+            "default": false,
+            "title": "Allow Live",
+            "type": "boolean"
+          },
+          "api_token": {
+            "title": "Api Token",
+            "type": "string"
+          },
+          "contract_id": {
+            "title": "Contract Id",
+            "type": "integer"
+          },
+          "price": {
+            "default": 0.0,
+            "title": "Price",
+            "type": "number"
+          }
+        },
+        "required": [
+          "api_token",
+          "contract_id"
+        ],
+        "title": "close_open_contractArguments",
+        "type": "object"
+      },
+      "name": "close_open_contract",
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "close_open_contractOutput",
+        "type": "object"
+      }
+    }
+  ]
+}
