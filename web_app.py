@@ -3461,6 +3461,16 @@ def execution_agent(
     )
     account_ok = bool(account_result.get("ok"))
     account_type = ((account_result.get("data") or {}).get("account_type") or "unknown")
+    if not account_ok or account_type not in {"demo", "live"}:
+        report = {
+            "role": "Execution Trader",
+            "ok": False,
+            "status": "blocked",
+            "reason": "account_authorization_unverified",
+        }
+        append_team_event(events, "执行交易员", "经理", "账户授权未验证，已阻止写操作。", writer)
+        remember_agent_report("execution", report)
+        return report
     if account_type == "live" and not st.session_state.allow_live_execution:
         report = {
             "role": "Execution Trader",
@@ -3684,6 +3694,14 @@ def manager_tool_dispatch(
     events: list[AgentEvent],
     writer: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
+    if not isinstance(arguments, dict):
+        return {"ok": False, "error": "manager tool arguments must be an object"}
+    required = {
+        item["function"]["name"]: item["function"]["parameters"].get("required", [])
+        for item in MANAGER_TOOLS
+    }
+    if name in required and any(key not in arguments for key in required[name]):
+        return {"ok": False, "error": "missing required manager tool arguments"}
     if name == "assign_task_to_market_agent":
         return assign_task_to_market_agent(arguments, events, writer)
     if name == "assign_task_to_execution_agent":
