@@ -126,6 +126,8 @@ def account_type_from_authorize(authorize: dict[str, Any]) -> str:
 
 def enforce_demo_or_explicit_live(authorize: dict[str, Any], allow_live: bool) -> str:
     account_type = account_type_from_authorize(authorize)
+    if account_type == "unknown":
+        raise DerivAPIError("Account type is unverified; execution is blocked")
     if account_type == "live" and not allow_live:
         raise DerivAPIError(
             "Live account execution is blocked by default. Use a demo token, "
