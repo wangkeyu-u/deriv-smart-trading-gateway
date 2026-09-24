@@ -29,7 +29,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from jev_router import ThinkingRoute, route_thinking
+from jev_router import MarketAssessment, ThinkingRoute, assess_market, route_thinking
 from server import (
     check_account_status,
     close_open_contract,
@@ -91,9 +91,9 @@ I18N = {
         "deriv_token": "Deriv API Token",
         "llm_api": "大模型 API",
         "thinking_control": "实时思考调度",
-        "jev_toggle": "启用 Jev 快慢路由",
-        "jev_key_help": "仅保存在当前 Streamlit 会话；Jev 只决定是否走本地快路，不决定下单。",
-        "jev_scope": "Jev 只调度只读行情任务和谋士结论；交易指令仍走原经理、风控和人工确认。",
+        "jev_toggle": "启用 Jev 实时决策",
+        "jev_key_help": "仅保存在当前 Streamlit 会话；Jev 参与谋士团行情判断，不决定下单。",
+        "jev_scope": "Jev 根据本轮行情给出 CALL/PUT/WAIT 独立意见，并可加快只读查询；交易仍走原风控和人工确认。",
         "model": "模型",
         "connection": "连接状态",
         "clear_chat": "清空聊天记录",
@@ -230,9 +230,9 @@ I18N = {
         "deriv_token": "Deriv API Token",
         "llm_api": "Model API",
         "thinking_control": "Real-time thinking control",
-        "jev_toggle": "Enable Jev fast/deep routing",
-        "jev_key_help": "Stored only in this Streamlit session. Jev routes analysis; it cannot authorize orders.",
-        "jev_scope": "Jev routes read-only market requests and advisor synthesis. Trade instructions keep the existing manager and confirmation path.",
+        "jev_toggle": "Enable Jev live decisions",
+        "jev_key_help": "Stored only in this Streamlit session. Jev advises on market stance; it cannot authorize orders.",
+        "jev_scope": "Jev contributes a CALL/PUT/WAIT opinion from current market evidence and can speed up read-only requests. Trades retain risk checks and confirmation.",
         "model": "Model",
         "connection": "Connection",
         "clear_chat": "Clear Chat",
@@ -539,6 +539,7 @@ class AdvisorGraphState(TypedDict, total=False):
     vote_counts: dict[str, int]
     graph_runtime: str
     thinking_route: dict[str, Any]
+    jev_assessment: dict[str, Any]
 
 
 def default_agent_prompts() -> dict[str, dict[str, str]]:
@@ -2542,7 +2543,9 @@ def local_advisor_opinion(
 def consensus_from_opinions(opinions: list[dict[str, Any]], market: dict[str, Any], sources: list[dict[str, str]]) -> dict[str, Any]:
     votes = [str(item.get("stance") or "WAIT") for item in opinions]
     counts = {stance: votes.count(stance) for stance in {"CALL", "PUT", "WAIT"}}
-    winner = max(counts, key=counts.get)
+    winner = "WAIT" if not market.get("tick") and not market.get("candles") else max(
+        ("WAIT", "CALL", "PUT"), key=lambda stance: counts[stance]
+    )
     support = counts[winner] / max(len(votes), 1)
     data_bonus = 0.12 if market.get("candles") else 0.04
     web_bonus = min(len(sources), 6) * 0.025
@@ -2645,44 +2648,131 @@ Symbol: {symbol}
     return None
 
 
-def advisor_synthesis_with_route(
+def combine_jev_advice(
+    local: dict[str, Any],
+    market: dict[str, Any],
+    assessment: MarketAssessment,
+) -> dict[str, Any]:
+    """Turn Jev's market opinion into advisory direction under evidence checks."""
+    if assessment.source != "jev" or not assessment.stance or not assessment.probabilities:
+        return local
+    stance = assessment.stance
+    selected_probability = assessment.probabilities[stance]
+    local_stance = str(local["stance"])
+    trend = str(market.get("trend") or "unknown")
+    has_market = bool(market.get("tick") or market.get("candles"))
+    supported = (
+        stance == "WAIT"
+        or (stance == "CALL" and trend == "up")
+        or (stance == "PUT" and trend == "down")
+    )
+    if not has_market or selected_probability < 0.8 or (assessment.confidence or 0) < 0.7:
+        final_stance, reason = "WAIT", "Jev 判断或行情证据不足"
+    elif not supported:
+        final_stance, reason = "WAIT", "Jev 方向缺少行情趋势支持"
+    elif stance in {"CALL", "PUT"} and local_stance in {"CALL", "PUT"} and stance != local_stance:
+        final_stance, reason = "WAIT", "Jev 与本地谋士方向冲突"
+    else:
+        final_stance, reason = stance, "Jev 与现有行情证据一致"
+    confidence = min(float(local["confidence"]), selected_probability)
+    if final_stance == "WAIT":
+        confidence = min(confidence, 0.6)
+    return {
+        **local,
+        "stance": final_stance,
+        "confidence": round(confidence, 3),
+        "summary": f"Jev 参与本轮行情判断：{reason}，建议 {final_stance}。该建议只供复核，不触发下单。",
+        "jev_effect": reason,
+    }
+
+
+def market_tick_is_current(market: dict[str, Any]) -> bool:
+    tick = market.get("tick") or {}
+    if not isinstance(tick, dict) or tick.get("quote") is None:
+        return False
+    epoch = tick.get("epoch")
+    if epoch is None:
+        return True
+    try:
+        age = datetime.now(timezone.utc).timestamp() - float(epoch)
+    except (TypeError, ValueError):
+        return False
+    return 0 <= age <= 30
+
+
+def advisor_synthesis_with_jev(
     question: str,
     symbol: str,
     market: dict[str, Any],
     sources: list[dict[str, str]],
     opinions: list[dict[str, Any]],
-    consensus: dict[str, Any],
+    local_consensus: dict[str, Any],
     started_at: float,
     budget: int,
-) -> tuple[str | None, dict[str, Any]]:
-    remaining = budget - (time.perf_counter() - started_at)
-    route = ThinkingRoute("deep", "disabled")
+) -> tuple[str | None, dict[str, Any], dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    assessment = MarketAssessment(None, "disabled")
+    consensus = local_consensus
+    enriched_opinions = list(opinions)
     if in_streamlit_runtime() and st.session_state.get("jev_enabled") and st.session_state.get("jev_api_key"):
-        if st.session_state.get("llm_provider") == "本地规则" or not st.session_state.get("llm_api_key"):
-            route = ThinkingRoute("fast", "local_provider")
-        elif not market.get("tick") and not market.get("candles"):
-            route = ThinkingRoute("fast", "no_market_data")
+        if not market_tick_is_current(market):
+            assessment = MarketAssessment(None, "no_current_tick")
+            consensus = {
+                **local_consensus,
+                "stance": "WAIT",
+                "confidence": min(float(local_consensus["confidence"]), 0.5),
+                "summary": "当前 Tick 缺失或过时，Jev 未参与方向判断；建议 WAIT。",
+            }
         else:
-            route = route_thinking(
+            assessment = assess_market(
                 {
-                    "task": "advisor_synthesis",
+                    "task": "short_term_market_advice",
                     "question": question[:600],
                     "symbol": symbol,
-                    "market_trend": market.get("trend", "unknown"),
-                    "market_summary": str(market.get("summary") or "")[:400],
-                    "source_titles": [str(item.get("title") or "")[:120] for item in sources[:3]],
-                    "votes": consensus.get("vote_counts"),
-                    "local_confidence": consensus.get("confidence"),
-                    "remaining_seconds": round(max(0.0, remaining), 1),
+                    "market": {
+                        "trend": market.get("trend"),
+                        "latest_quote": (market.get("tick") or {}).get("quote"),
+                        "tick_epoch": (market.get("tick") or {}).get("epoch"),
+                        "latest_close": market.get("latest_close"),
+                        "change_pct": market.get("change_pct"),
+                        "ma5": market.get("ma5"),
+                        "ma20": market.get("ma20"),
+                        "summary": str(market.get("summary") or "")[:400],
+                    },
+                    "news": [
+                        {"title": str(item.get("title") or "")[:120], "published": item.get("published")}
+                        for item in sources[:3]
+                    ],
+                    "evaluated_at": datetime.now(timezone.utc).isoformat(),
                 },
                 st.session_state.jev_api_key,
                 deadline_at=started_at + budget,
             )
-    push_runtime_event("thinking", "Jev", "Advisor", f"{route.mode} ({route.source}, {route.latency_ms:.0f}ms)")
-    if route.mode == "fast":
-        return None, route.as_dict()
+        if assessment.source == "jev" and assessment.stance:
+            consensus = combine_jev_advice(local_consensus, market, assessment)
+            probability = (assessment.probabilities or {}).get(assessment.stance, 0)
+            enriched_opinions.append({
+                "advisor_id": "jev",
+                "name": "Jev 实时判断" if current_lang() == "zh" else "Jev live assessment",
+                "role": "结构化行情决策" if current_lang() == "zh" else "Structured market decision",
+                "prompt": "Jev Choice: CALL / PUT / WAIT",
+                "stance": assessment.stance,
+                "rationale": f"Jev 选择 {assessment.stance}，选项概率 {probability:.0%}；最终采纳：{consensus['stance']}。",
+                "invalidation": "行情反转、数据过时或新信息出现时重新评估。",
+                "question": question,
+                "model_confidence": assessment.confidence,
+                "probabilities": assessment.probabilities,
+            })
+            push_runtime_event("thinking", "Jev", "Chief Advisor", f"{assessment.stance} -> {consensus['stance']} ({assessment.latency_ms:.0f}ms)")
+            route = ThinkingRoute("fast", "jev_decision", assessment.latency_ms, assessment.confidence, None)
+            return None, route.as_dict(), assessment.as_dict(), consensus, enriched_opinions
+    push_runtime_event("thinking", "Jev", "Advisor", f"{assessment.source} ({assessment.latency_ms:.0f}ms)")
+    if assessment.source == "no_current_tick":
+        route = ThinkingRoute("fast", "no_current_tick", assessment.latency_ms)
+        return None, route.as_dict(), assessment.as_dict(), consensus, enriched_opinions
     remaining = budget - (time.perf_counter() - started_at)
-    return advisor_llm_synthesis(question, symbol, market, sources, opinions, consensus, remaining), route.as_dict()
+    llm_summary = advisor_llm_synthesis(question, symbol, market, sources, opinions, consensus, remaining)
+    route = ThinkingRoute("deep", assessment.source, assessment.latency_ms)
+    return llm_summary, route.as_dict(), assessment.as_dict(), consensus, enriched_opinions
 
 
 def advisor_langgraph_available() -> bool:
@@ -2751,7 +2841,7 @@ def build_advisor_langgraph() -> Any:
         sources = list(state.get("sources") or [])
         market = dict(state.get("market") or {})
         local_consensus = consensus_from_opinions(opinions, market, sources)
-        llm_summary, thinking_route = advisor_synthesis_with_route(
+        llm_summary, thinking_route, jev_assessment, consensus, enriched_opinions = advisor_synthesis_with_jev(
             str(state.get("question") or ""),
             str(state.get("symbol") or DEFAULT_SYMBOL),
             market,
@@ -2762,17 +2852,19 @@ def build_advisor_langgraph() -> Any:
             int(state.get("budget") or 10),
         )
         final_summary = llm_summary or (
-            f"{local_consensus['summary']} 方向={local_consensus['stance']}，"
-            f"置信度={local_consensus['confidence']:.0%}；执行前先让行情、风控、合规和执行交易员复核。"
+            f"{consensus['summary']} 方向={consensus['stance']}，"
+            f"内部支持度={consensus['confidence']:.0%}；执行前先让行情、风控、合规和执行交易员复核。"
         )
         return {
             "local_consensus": local_consensus,
             "consensus": final_summary,
-            "stance": local_consensus["stance"],
-            "confidence": local_consensus["confidence"],
-            "vote_counts": local_consensus["vote_counts"],
+            "stance": consensus["stance"],
+            "confidence": consensus["confidence"],
+            "vote_counts": consensus["vote_counts"],
             "thinking_route": thinking_route,
-            "logs": [f"Chief Advisor -> {local_consensus['stance']} confidence={local_consensus['confidence']:.0%}"],
+            "jev_assessment": jev_assessment,
+            "opinions": enriched_opinions[len(opinions):],
+            "logs": [f"Chief Advisor -> {consensus['stance']} confidence={consensus['confidence']:.0%}"],
         }
 
     graph.add_node("web_research", web_research_node)
@@ -2847,6 +2939,7 @@ def run_advisor_council(
         confidence = float(graph_state.get("confidence") or 0)
         vote_counts = dict(graph_state.get("vote_counts") or {})
         thinking_route = dict(graph_state.get("thinking_route") or {})
+        jev_assessment = dict(graph_state.get("jev_assessment") or {})
         runtime = "langgraph"
         persist_advisor_market_state(market)
         for line in graph_state.get("logs") or []:
@@ -2867,7 +2960,7 @@ def run_advisor_council(
                 writer(f"{opinion['name']} -> {opinion['stance']}: {opinion['rationale']}")
 
         consensus = consensus_from_opinions(opinions, market, sources)
-        llm_summary, thinking_route = advisor_synthesis_with_route(
+        llm_summary, thinking_route, jev_assessment, consensus, opinions = advisor_synthesis_with_jev(
             question,
             symbol,
             market,
@@ -2879,7 +2972,7 @@ def run_advisor_council(
         )
         final_summary = llm_summary or (
             f"{consensus['summary']} 方向={consensus['stance']}，"
-            f"置信度={consensus['confidence']:.0%}；执行前先让行情、风控、合规和执行交易员复核。"
+            f"内部支持度={consensus['confidence']:.0%}；执行前先让行情、风控、合规和执行交易员复核。"
         )
         stance = consensus["stance"]
         confidence = consensus["confidence"]
@@ -2905,6 +2998,7 @@ def run_advisor_council(
         "confidence": confidence,
         "vote_counts": vote_counts,
         "thinking_route": thinking_route,
+        "jev_assessment": jev_assessment,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     if in_streamlit_runtime():
@@ -5476,12 +5570,16 @@ def render_advisor_result(result: dict[str, Any]) -> None:
     route = result.get("thinking_route") or {}
     if route:
         st.caption(f"Thinking route: `{route.get('mode')}` · {route.get('source')} · {float(route.get('latency_ms') or 0):.0f}ms")
+    jev = result.get("jev_assessment") or {}
+    if jev.get("source") == "jev":
+        selected = (jev.get("probabilities") or {}).get(jev.get("stance"), 0)
+        st.caption(f"Jev: `{jev.get('stance')}` · choice probability {selected:.0%} · model confidence {float(jev.get('confidence') or 0):.0%}")
 
     opinions = result.get("opinions") or []
     cards = []
     for opinion in opinions:
         specs = advisor_specs()
-        spec = next((item for item in specs if item["id"] == opinion.get("advisor_id")), specs[0])
+        spec = next((item for item in specs if item["id"] == opinion.get("advisor_id")), {"code": "JV", "color": "#f5b84b"})
         cards.append(
             f"""
 <div class="advisor-card">
@@ -5531,6 +5629,7 @@ def render_advisor_result(result: dict[str, Any]) -> None:
                 "opinions": result.get("opinions"),
                 "vote_counts": result.get("vote_counts"),
                 "thinking_route": result.get("thinking_route"),
+                "jev_assessment": result.get("jev_assessment"),
             }
         )
     st.download_button(

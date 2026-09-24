@@ -139,6 +139,7 @@ The app uses two complementary agent systems.
 - Flow Advisor watches rhythm, volatility, and execution windows.
 - Risk Advisor challenges overconfident trades.
 - Contrarian Advisor attacks the consensus before the chief advisor synthesizes the final view.
+- Optional Jev Advisor reads the current Tick, candle trend metrics, and recent headline titles, then contributes a typed `CALL` / `PUT` / `WAIT` opinion. Its decision and probability distribution are visible in the advisor result; it never calls the execution worker.
 
 When `langgraph` is installed, each advisor runs as a graph node. If LangGraph is unavailable, the app falls back to a local council runner so the UI remains usable.
 
@@ -195,6 +196,8 @@ The model selector supports:
 - DeepSeek through the OpenAI-compatible base URL `https://api.deepseek.com`.
 - Anthropic.
 - Custom OpenAI-compatible providers with a configurable base URL.
+
+Jev uses a separate TypeSafe API key and the System One decision endpoint. Enable it in the sidebar to let it participate in the Advisor Council even when the main model provider is the local rule engine. With a valid, supported Jev decision, the council skips the final prose model call to reduce response time. See [README.md](README.md#optional-jev-live-decision) for the decision rules and limits.
 
 ## Symbol Examples
 
