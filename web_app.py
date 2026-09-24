@@ -29,6 +29,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from jev_router import ThinkingRoute, route_thinking
 from server import (
     check_account_status,
     close_open_contract,
@@ -89,6 +90,10 @@ I18N = {
         "pending_trade": "待确认交易",
         "deriv_token": "Deriv API Token",
         "llm_api": "大模型 API",
+        "thinking_control": "实时思考调度",
+        "jev_toggle": "启用 Jev 快慢路由",
+        "jev_key_help": "仅保存在当前 Streamlit 会话；Jev 只决定是否走本地快路，不决定下单。",
+        "jev_scope": "Jev 只调度只读行情任务和谋士结论；交易指令仍走原经理、风控和人工确认。",
         "model": "模型",
         "connection": "连接状态",
         "clear_chat": "清空聊天记录",
@@ -224,6 +229,10 @@ I18N = {
         "pending_trade": "Pending Trade",
         "deriv_token": "Deriv API Token",
         "llm_api": "Model API",
+        "thinking_control": "Real-time thinking control",
+        "jev_toggle": "Enable Jev fast/deep routing",
+        "jev_key_help": "Stored only in this Streamlit session. Jev routes analysis; it cannot authorize orders.",
+        "jev_scope": "Jev routes read-only market requests and advisor synthesis. Trade instructions keep the existing manager and confirmation path.",
         "model": "Model",
         "connection": "Connection",
         "clear_chat": "Clear Chat",
@@ -391,6 +400,7 @@ class TeamRunResult:
     execution_report: dict[str, Any] | None = None
     ok: bool = True
     agent_reports: dict[str, Any] | None = None
+    thinking_route: dict[str, Any] | None = None
 
 
 AGENT_SPECS: dict[str, dict[str, str]] = {
@@ -528,6 +538,7 @@ class AdvisorGraphState(TypedDict, total=False):
     confidence: float
     vote_counts: dict[str, int]
     graph_runtime: str
+    thinking_route: dict[str, Any]
 
 
 def default_agent_prompts() -> dict[str, dict[str, str]]:
@@ -1270,6 +1281,8 @@ def init_state() -> None:
         "direct_prompt_nonce": 0,
         "advisor_prompt_nonce": 0,
         "advisor_time_budget": 10,
+        "jev_enabled": False,
+        "jev_api_key": "",
         "advisor_use_web": True,
         "advisor_symbol": DEFAULT_SYMBOL,
         "advisor_runs": [],
@@ -1781,6 +1794,19 @@ def render_sidebar() -> None:
         st.session_state.llm_provider = selected_provider
 
         st.session_state.deriv_token = deriv_token
+
+        st.subheader(t("thinking_control"))
+        st.session_state.jev_enabled = st.toggle(
+            t("jev_toggle"), value=bool(st.session_state.jev_enabled)
+        )
+        if st.session_state.jev_enabled:
+            st.session_state.jev_api_key = st.text_input(
+                "TypeSafe API Key",
+                value=st.session_state.jev_api_key,
+                type="password",
+                help=t("jev_key_help"),
+            )
+            st.caption(t("jev_scope"))
 
         st.subheader(t("execution_safety"))
         st.session_state.require_trade_confirmation = st.toggle(
@@ -2584,7 +2610,8 @@ Symbol: {symbol}
                     return None
             kwargs: dict[str, Any] = {
                 "api_key": st.session_state.llm_api_key,
-                "timeout": max(2.0, min(8.0, remaining_seconds)),
+                "timeout": min(8.0, remaining_seconds),
+                "max_retries": 0,
             }
             if base_url:
                 kwargs["base_url"] = base_url
@@ -2602,7 +2629,7 @@ Symbol: {symbol}
         if provider == "Anthropic":
             from anthropic import Anthropic
 
-            client = Anthropic(api_key=st.session_state.llm_api_key, timeout=max(2.0, min(8.0, remaining_seconds)))
+            client = Anthropic(api_key=st.session_state.llm_api_key, timeout=min(8.0, remaining_seconds), max_retries=0)
             response = client.messages.create(
                 model=st.session_state.llm_model,
                 max_tokens=220,
@@ -2616,6 +2643,46 @@ Symbol: {symbol}
     except Exception:
         return None
     return None
+
+
+def advisor_synthesis_with_route(
+    question: str,
+    symbol: str,
+    market: dict[str, Any],
+    sources: list[dict[str, str]],
+    opinions: list[dict[str, Any]],
+    consensus: dict[str, Any],
+    started_at: float,
+    budget: int,
+) -> tuple[str | None, dict[str, Any]]:
+    remaining = budget - (time.perf_counter() - started_at)
+    route = ThinkingRoute("deep", "disabled")
+    if in_streamlit_runtime() and st.session_state.get("jev_enabled") and st.session_state.get("jev_api_key"):
+        if st.session_state.get("llm_provider") == "本地规则" or not st.session_state.get("llm_api_key"):
+            route = ThinkingRoute("fast", "local_provider")
+        elif not market.get("tick") and not market.get("candles"):
+            route = ThinkingRoute("fast", "no_market_data")
+        else:
+            route = route_thinking(
+                {
+                    "task": "advisor_synthesis",
+                    "question": question[:600],
+                    "symbol": symbol,
+                    "market_trend": market.get("trend", "unknown"),
+                    "market_summary": str(market.get("summary") or "")[:400],
+                    "source_titles": [str(item.get("title") or "")[:120] for item in sources[:3]],
+                    "votes": consensus.get("vote_counts"),
+                    "local_confidence": consensus.get("confidence"),
+                    "remaining_seconds": round(max(0.0, remaining), 1),
+                },
+                st.session_state.jev_api_key,
+                deadline_at=started_at + budget,
+            )
+    push_runtime_event("thinking", "Jev", "Advisor", f"{route.mode} ({route.source}, {route.latency_ms:.0f}ms)")
+    if route.mode == "fast":
+        return None, route.as_dict()
+    remaining = budget - (time.perf_counter() - started_at)
+    return advisor_llm_synthesis(question, symbol, market, sources, opinions, consensus, remaining), route.as_dict()
 
 
 def advisor_langgraph_available() -> bool:
@@ -2684,17 +2751,15 @@ def build_advisor_langgraph() -> Any:
         sources = list(state.get("sources") or [])
         market = dict(state.get("market") or {})
         local_consensus = consensus_from_opinions(opinions, market, sources)
-        remaining = int(state.get("budget") or 10) - (
-            time.perf_counter() - float(state.get("started_at") or time.perf_counter())
-        )
-        llm_summary = advisor_llm_synthesis(
+        llm_summary, thinking_route = advisor_synthesis_with_route(
             str(state.get("question") or ""),
             str(state.get("symbol") or DEFAULT_SYMBOL),
             market,
             sources,
             opinions,
             local_consensus,
-            remaining,
+            float(state.get("started_at") or time.perf_counter()),
+            int(state.get("budget") or 10),
         )
         final_summary = llm_summary or (
             f"{local_consensus['summary']} 方向={local_consensus['stance']}，"
@@ -2706,6 +2771,7 @@ def build_advisor_langgraph() -> Any:
             "stance": local_consensus["stance"],
             "confidence": local_consensus["confidence"],
             "vote_counts": local_consensus["vote_counts"],
+            "thinking_route": thinking_route,
             "logs": [f"Chief Advisor -> {local_consensus['stance']} confidence={local_consensus['confidence']:.0%}"],
         }
 
@@ -2780,6 +2846,7 @@ def run_advisor_council(
         stance = str(graph_state.get("stance") or "WAIT")
         confidence = float(graph_state.get("confidence") or 0)
         vote_counts = dict(graph_state.get("vote_counts") or {})
+        thinking_route = dict(graph_state.get("thinking_route") or {})
         runtime = "langgraph"
         persist_advisor_market_state(market)
         for line in graph_state.get("logs") or []:
@@ -2800,15 +2867,15 @@ def run_advisor_council(
                 writer(f"{opinion['name']} -> {opinion['stance']}: {opinion['rationale']}")
 
         consensus = consensus_from_opinions(opinions, market, sources)
-        remaining = budget - (time.perf_counter() - started)
-        llm_summary = advisor_llm_synthesis(
+        llm_summary, thinking_route = advisor_synthesis_with_route(
             question,
             symbol,
             market,
             sources,
             opinions,
             consensus,
-            remaining,
+            started,
+            budget,
         )
         final_summary = llm_summary or (
             f"{consensus['summary']} 方向={consensus['stance']}，"
@@ -2837,6 +2904,7 @@ def run_advisor_council(
         "stance": stance,
         "confidence": confidence,
         "vote_counts": vote_counts,
+        "thinking_route": thinking_route,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     if in_streamlit_runtime():
@@ -4069,21 +4137,59 @@ def deterministic_manager_state_machine(
     )
 
 
+def jev_read_only_candidate(user_text: str) -> bool:
+    """Keep any possible trading instruction on the existing manager path."""
+    lowered = user_text.lower()
+    if has_trade_intent(user_text) or has_close_intent(user_text) or any(
+        word in lowered
+        for word in ("卖出", "止损", "止盈", "梭哈", "换仓", "sell", "short", "long", "stake", "contract")
+    ):
+        return False
+    return any(
+        word in lowered
+        for word in ("行情", "报价", "价格", "走势", "k线", "蜡烛", "图表", "画图", "tick", "candle", "chart", "market price")
+    )
+
+
 def run_hierarchical_trading_team(
     user_text: str,
     writer: Callable[[str], None] | None = None,
 ) -> TeamRunResult:
     events: list[AgentEvent] = []
     provider: Provider = st.session_state.llm_provider
+    thinking_route: dict[str, Any] | None = None
+    if (
+        provider != "本地规则"
+        and st.session_state.llm_api_key
+        and st.session_state.get("jev_enabled")
+        and st.session_state.get("jev_api_key")
+        and jev_read_only_candidate(user_text)
+    ):
+        route = route_thinking(
+            {"task": "read_only_manager_routing", "request": user_text[:1000], "symbol": extract_symbol(user_text)},
+            st.session_state.jev_api_key,
+        )
+        thinking_route = route.as_dict()
+        push_runtime_event("thinking", "Jev", "Manager", f"{route.mode} ({route.source}, {route.latency_ms:.0f}ms)")
+        if writer:
+            writer(f"Jev thinking route -> {route.mode} ({route.latency_ms:.0f}ms)")
+        if route.mode == "fast":
+            result = deterministic_manager_state_machine(user_text, events, writer)
+            result.thinking_route = thinking_route
+            return result
     if provider in {"OpenAI", "DeepSeek", "OpenAI-Compatible"} and st.session_state.llm_api_key:
         result = manager_with_openai_tool_calling(user_text, events, writer)
         if result:
+            result.thinking_route = thinking_route
             return result
     if provider == "Anthropic" and st.session_state.llm_api_key:
         result = manager_with_anthropic_tool_calling(user_text, events, writer)
         if result:
+            result.thinking_route = thinking_route
             return result
-    return deterministic_manager_state_machine(user_text, events, writer)
+    result = deterministic_manager_state_machine(user_text, events, writer)
+    result.thinking_route = thinking_route
+    return result
 
 
 def reset_agent_log() -> list[str]:
@@ -5367,6 +5473,9 @@ def render_advisor_result(result: dict[str, Any]) -> None:
     cols[2].metric(t("advisor_sources"), int(result.get("source_count") or 0))
     cols[3].metric("Runtime", str(result.get("runtime") or "local"))
     st.caption(f"Votes: `{json.dumps(result.get('vote_counts') or {}, ensure_ascii=False)}`")
+    route = result.get("thinking_route") or {}
+    if route:
+        st.caption(f"Thinking route: `{route.get('mode')}` · {route.get('source')} · {float(route.get('latency_ms') or 0):.0f}ms")
 
     opinions = result.get("opinions") or []
     cards = []
@@ -5421,6 +5530,7 @@ def render_advisor_result(result: dict[str, Any]) -> None:
                 "news_signal": result.get("news_signal"),
                 "opinions": result.get("opinions"),
                 "vote_counts": result.get("vote_counts"),
+                "thinking_route": result.get("thinking_route"),
             }
         )
     st.download_button(
@@ -5626,6 +5736,7 @@ def render_chat() -> None:
                         "market_report": team_result.market_report,
                         "execution_report": team_result.execution_report,
                         "events": [event.line() for event in team_result.events],
+                        "thinking_route": team_result.thinking_route,
                     }
                 )
 

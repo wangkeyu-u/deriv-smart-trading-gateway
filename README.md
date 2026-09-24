@@ -29,6 +29,14 @@ flowchart LR
 - **Advisory isolation:** advisor output does not itself execute trades. A transient graph-node failure can fall back to the local advisory flow; persistent component failure is not guaranteed to recover.
 - **Inspectable orchestration:** prompt registry, dispatch names, API traces and receipts are available for review. Advisor count is not a quality metric.
 
+## Optional Jev thinking router
+
+The Streamlit sidebar can enable a bounded Jev decision before two read-only steps: a plain market/chart request in the manager console, and the advisor council's final synthesis. Jev chooses `fast` (existing local analysis) or `deep` (existing language-model path). The app accepts `fast` only when Jev returns a valid Choice with at least 0.8 probability and 0.7 confidence. An uncertain or failed response keeps the existing deeper path; an advisor run near its deadline uses the local result. Each run exposes the chosen route, source and routing latency in the UI and JSON result.
+
+Set a normal model provider and API key, then enable **Jev fast/deep routing** and enter a separate TypeSafe API key in the sidebar. The key stays in the current Streamlit session. Jev uses TypeSafe's documented [`/v1/systemone` Choice API](https://docs.typesafe.ai/api) with a 1.2-second maximum request timeout and no automatic retry. Jev is a structured decision model; it does not generate the final analysis or change an in-progress model call. The feature routes at decision checkpoints, so any end-to-end speed improvement must be measured with a real key and representative requests.
+
+Trading requests never enter the manager fast path. Jev output never supplies order parameters, approves a trade, or bypasses account checks and confirmation. The advisor council remains read-only.
+
 ## Failure evidence and tests
 
 The audit found the UI recorded an unsuccessful account lookup without returning before execution. This revision blocks that path and unknown account types. The dispatcher also rejects non-object/missing-required-field model calls before invoking a worker.
