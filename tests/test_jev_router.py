@@ -267,6 +267,8 @@ def test_langgraph_result_includes_jev_opinion_and_final_stance(monkeypatch: Any
             "budget": 10,
             "use_web": False,
             "language": "zh",
+            "jev_enabled": True,
+            "jev_api_key": "jev-key",
             "started_at": time.perf_counter(),
             "opinions": [],
             "logs": [],

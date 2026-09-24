@@ -1,9 +1,9 @@
 {
   "mcpServers": {
     "deriv-smart-trading-gateway": {
-      "command": "/Users/wangkeyu/Documents/项目/.venv/bin/python",
+      "command": "/absolute/path/to/deriv-smart-trading-gateway/.venv/bin/python",
       "args": [
-        "/Users/wangkeyu/Documents/项目/server.py"
+        "/absolute/path/to/deriv-smart-trading-gateway/server.py"
       ],
       "env": {
         "DERIV_APP_ID": "1089",
