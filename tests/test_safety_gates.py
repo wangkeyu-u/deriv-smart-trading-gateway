@@ -64,6 +64,29 @@ def test_execution_requires_human_confirmation_before_write() -> None:
     assert st.session_state.pending_trade["action"] == "execute_simulated_trade"
 
 
+def test_confirmation_is_bound_to_pending_order_parameters() -> None:
+    st.session_state.deriv_token = "demo-token"
+    st.session_state.require_trade_confirmation = True
+    st.session_state.confirm_next_trade = True
+    events: list[web_app.AgentEvent] = []
+
+    first = web_app.execution_agent(
+        task="执行模拟盘订单", symbol="R_75", amount=10, contract_type="CALL",
+        duration=5, duration_unit="t", events=events,
+    )
+    assert first["reason"] == "pending_human_confirmation"
+    assert st.session_state.confirm_next_trade is False
+
+    st.session_state.confirm_next_trade = True
+    changed = web_app.execution_agent(
+        task="执行模拟盘订单", symbol="R_75", amount=20, contract_type="CALL",
+        duration=5, duration_unit="t", events=events,
+    )
+    assert changed["reason"] == "pending_human_confirmation"
+    assert st.session_state.pending_trade["amount"] == 20
+    assert st.session_state.confirm_next_trade is False
+
+
 def test_execution_blocks_live_account_without_allow_live(monkeypatch: Any) -> None:
     st.session_state.deriv_token = "live-token"
     st.session_state.require_trade_confirmation = False

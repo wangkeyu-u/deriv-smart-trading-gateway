@@ -24,6 +24,9 @@ def isolated_state():
 ])
 def test_failed_account_check_cannot_reach_write(monkeypatch, status):
     st.session_state.deriv_token = "test-token"
+    staged = web_app.execution_agent(task="buy", symbol="R_75", amount=10,
+                                     contract_type="CALL", duration=5, duration_unit="t", events=[])
+    assert staged["reason"] == "pending_human_confirmation"
     st.session_state.confirm_next_trade = True
     called = []
 

@@ -29,6 +29,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from jev_router import MarketAssessment, ThinkingRoute, assess_market, route_thinking
 from server import (
     check_account_status,
     close_open_contract,
@@ -89,12 +90,16 @@ I18N = {
         "pending_trade": "待确认交易",
         "deriv_token": "Deriv API Token",
         "llm_api": "大模型 API",
+        "thinking_control": "实时思考调度",
+        "jev_toggle": "启用 Jev 实时决策",
+        "jev_key_help": "仅保存在当前 Streamlit 会话；Jev 参与谋士团行情判断，不决定下单。",
+        "jev_scope": "Jev 根据本轮行情给出 CALL/PUT/WAIT 独立意见，并可加快只读查询；交易仍走原风控和人工确认。",
         "model": "模型",
         "connection": "连接状态",
         "clear_chat": "清空聊天记录",
-        "hero_kicker": "层级多智能体交易网关",
+        "hero_kicker": "行情判断与人工交易工作台",
         "hero_title": "Deriv Smart Trading Gateway",
-        "hero_subtitle": "交易经理调度行情、策略、风控、合规、图表、执行和报告 Agent，完成实时行情读取、条件判断、模拟盘下单和可审计复盘。",
+        "hero_subtitle": "先看行情与判断依据，再决定是否进入人工确认的模拟交易流程。",
         "agent_team": "交易团队",
         "market_agent": "行情分析师",
         "market_agent_role": "读取 Tick/K 线，判断趋势与条件",
@@ -116,9 +121,9 @@ I18N = {
         "sync_bus_hint": "API 调用、Agent 事件、图谱状态、图表快照都写入这里。",
         "api_trace": "API 调用 Trace",
         "sync_version": "同步版本",
-        "chat_title": "交易经理指令台",
-        "chat_caption": "输入自然语言目标，经理会自动派活给两个子 Agent。",
-        "command_title": "交易指令工作台",
+        "chat_title": "指令与人工确认",
+        "chat_caption": "输入查价、图表或模拟交易目标。交易请求会进入单独的安全检查与人工确认。",
+        "command_title": "输入指令",
         "command_hint": "Enter 只用于中文输入法确认或换行；点击发送按钮才会提交。",
         "send": "发送指令",
         "clear_input": "清空输入",
@@ -191,26 +196,26 @@ I18N = {
         "example_tick": "查 R_100 最新价",
         "example_candles": "画 R_100 最近 120 根 1分钟K线",
         "example_trade": "10 美金看涨 · 5 ticks",
-        "advisor_council": "老板谋士室",
-        "advisor_caption": "多个谋士在限时内读取行情与网页信息，快速讨论后给老板一个可执行倾向。只做决策建议，不自动下单。",
-        "advisor_question": "请谋士团分析什么？",
+        "advisor_council": "快速行情判断",
+        "advisor_caption": "本地规则检查行情与资料；配置 Jev 后，由 Jev 对同一份证据给出实时意见。结果仅供复核，不自动下单。",
+        "advisor_question": "你想判断什么？",
         "advisor_placeholder": "例如：R_100 接下来 5-10 分钟该等还是做多？请结合最新行情和网页消息给我快速结论。",
         "advisor_time_budget": "限时预算（秒）",
         "advisor_web_toggle": "允许联网找资料",
         "advisor_symbol": "分析 Symbol",
-        "advisor_start": "召集谋士",
-        "advisor_empty": "请输入要谋士团分析的问题。",
-        "advisor_processing": "谋士团正在限时讨论...",
-        "advisor_done": "谋士团已给出结论",
-        "advisor_result": "谋士结论",
+        "advisor_start": "开始分析",
+        "advisor_empty": "请输入要分析的问题。",
+        "advisor_processing": "正在读取行情并形成判断...",
+        "advisor_done": "分析完成",
+        "advisor_result": "分析结果",
         "advisor_sources": "网页来源",
         "advisor_no_sources": "本轮没有抓到可用网页来源，结论主要来自行情与内部规则。",
-        "advisor_transcript": "谋士讨论纪要",
-        "advisor_download": "下载谋士报告 JSON",
-        "advisor_consensus": "一致结论",
-        "advisor_confidence": "置信度",
+        "advisor_transcript": "运行数据",
+        "advisor_download": "下载分析报告 JSON",
+        "advisor_consensus": "建议方向",
+        "advisor_confidence": "规则意见一致度",
         "advisor_elapsed": "耗时",
-        "advisor_disclaimer": "谋士结论不会绕过交易安全闸门；下单仍需走执行交易员和人工确认。",
+        "advisor_disclaimer": "分析结果不会触发下单；交易仍需单独输入指令并通过人工确认。",
     },
     "en": {
         "sidebar_title": "Deriv Gateway",
@@ -224,12 +229,16 @@ I18N = {
         "pending_trade": "Pending Trade",
         "deriv_token": "Deriv API Token",
         "llm_api": "Model API",
+        "thinking_control": "Real-time thinking control",
+        "jev_toggle": "Enable Jev live decisions",
+        "jev_key_help": "Stored only in this Streamlit session. Jev advises on market stance; it cannot authorize orders.",
+        "jev_scope": "Jev contributes a CALL/PUT/WAIT opinion from current market evidence and can speed up read-only requests. Trades retain risk checks and confirmation.",
         "model": "Model",
         "connection": "Connection",
         "clear_chat": "Clear Chat",
-        "hero_kicker": "Hierarchical Multi-Agent Trading Gateway",
+        "hero_kicker": "Market decisions and manual trading",
         "hero_title": "Deriv Smart Trading Gateway",
-        "hero_subtitle": "A trading manager coordinates a market analyst and a risk execution agent for market reads, condition checks, demo execution, and auditable receipts.",
+        "hero_subtitle": "Review market evidence and a bounded advisory result before entering the manual demo-trade flow.",
         "agent_team": "Trading Team",
         "market_agent": "Market Analyst",
         "market_agent_role": "Reads ticks/candles and validates market conditions",
@@ -251,9 +260,9 @@ I18N = {
         "sync_bus_hint": "API calls, agent events, graph state, and chart snapshots all write here.",
         "api_trace": "API Trace",
         "sync_version": "Sync Version",
-        "chat_title": "Trading Manager Console",
-        "chat_caption": "Enter a natural-language goal; the manager delegates work to two sub-agents.",
-        "command_title": "Order Command Pad",
+        "chat_title": "Instructions and confirmation",
+        "chat_caption": "Request a quote, chart or demo trade. Trade requests go through separate checks and human confirmation.",
+        "command_title": "Enter an instruction",
         "command_hint": "Enter only confirms IME text or inserts a new line; click Send to submit.",
         "send": "Send Order",
         "clear_input": "Clear Input",
@@ -326,8 +335,8 @@ I18N = {
         "example_tick": "R_100 latest tick",
         "example_candles": "R_100 · 120 candles · 1m",
         "example_trade": "10 USD CALL · 5 ticks",
-        "advisor_council": "Boss Advisor Room",
-        "advisor_caption": "Several advisors read market data and web context under a strict time budget, then produce one actionable view. Advice only; no automatic orders.",
+        "advisor_council": "Quick market decision",
+        "advisor_caption": "Local rules review market and source data. When configured, Jev gives its own live opinion on the same evidence. Advice only; no automatic orders.",
         "advisor_question": "What should the advisors analyze?",
         "advisor_placeholder": "Example: Should I wait or go long on R_100 over the next 5-10 minutes? Use latest market data and web context.",
         "advisor_time_budget": "Time budget (seconds)",
@@ -343,7 +352,7 @@ I18N = {
         "advisor_transcript": "Advisor Transcript",
         "advisor_download": "Download Advisor JSON",
         "advisor_consensus": "Consensus",
-        "advisor_confidence": "Confidence",
+        "advisor_confidence": "Rule agreement",
         "advisor_elapsed": "Elapsed",
         "advisor_disclaimer": "Advisor output does not bypass the execution safety gate; orders still require the execution agent and human confirmation.",
     },
@@ -391,6 +400,7 @@ class TeamRunResult:
     execution_report: dict[str, Any] | None = None
     ok: bool = True
     agent_reports: dict[str, Any] | None = None
+    thinking_route: dict[str, Any] | None = None
 
 
 AGENT_SPECS: dict[str, dict[str, str]] = {
@@ -515,6 +525,9 @@ class AdvisorGraphState(TypedDict, total=False):
     budget: int
     use_web: bool
     language: str
+    jev_enabled: bool
+    jev_api_key: str
+    llm_config: dict[str, str]
     started_at: float
     writer: Callable[[str], None] | None
     sources: list[dict[str, str]]
@@ -523,11 +536,14 @@ class AdvisorGraphState(TypedDict, total=False):
     opinions: Annotated[list[dict[str, Any]], operator.add]
     logs: Annotated[list[str], operator.add]
     local_consensus: dict[str, Any]
+    model_summary: str
     consensus: str
     stance: str
     confidence: float
     vote_counts: dict[str, int]
     graph_runtime: str
+    thinking_route: dict[str, Any]
+    jev_assessment: dict[str, Any]
 
 
 def default_agent_prompts() -> dict[str, dict[str, str]]:
@@ -1251,7 +1267,7 @@ def init_state() -> None:
         "pending_trade": None,
         "language": "zh",
         "last_language": "zh",
-        "messages": [{"role": "assistant", "content": text_for("zh", "initial_message")}],
+        "messages": [],
         "last_candles": None,
         "last_trade_receipt": None,
         "last_tick": None,
@@ -1270,6 +1286,8 @@ def init_state() -> None:
         "direct_prompt_nonce": 0,
         "advisor_prompt_nonce": 0,
         "advisor_time_budget": 10,
+        "jev_enabled": False,
+        "jev_api_key": "",
         "advisor_use_web": True,
         "advisor_symbol": DEFAULT_SYMBOL,
         "advisor_runs": [],
@@ -1277,6 +1295,8 @@ def init_state() -> None:
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
+    if st.session_state.messages == [{"role": "assistant", "content": text_for("zh", "initial_message")}]:
+        st.session_state.messages = []
 
     # Backward-compatible migration from the previous separate-key UI.
     if not st.session_state.llm_api_key:
@@ -1298,7 +1318,7 @@ def configure_page() -> None:
         page_title="Deriv Smart Trading Gateway",
         page_icon="📈",
         layout="wide",
-        initial_sidebar_state="expanded",
+        initial_sidebar_state="collapsed",
     )
     st.markdown(
         """
@@ -1730,6 +1750,35 @@ def configure_page() -> None:
                 padding-right: .85rem;
             }
         }
+        /* The task, evidence and approval controls should carry the page. */
+        .stApp {
+            background: #0b1211;
+        }
+        .block-container {
+            max-width: 1120px;
+            padding-top: 2rem;
+        }
+        .terminal-hero, .advisor-room, .chart-workbench {
+            box-shadow: none;
+            border-radius: 12px;
+            background: #111c19;
+        }
+        .terminal-hero { padding: 1.25rem 1.5rem; }
+        .terminal-title { font-size: 1.7rem; letter-spacing: -.02em; }
+        .terminal-kicker { letter-spacing: .05em; }
+        .advisor-room { padding: 1rem 1.25rem; }
+        .advisor-result { border-radius: 10px; }
+        .advisor-card { border-radius: 8px; min-height: 0; }
+        div[data-testid="stTextArea"] textarea { border-radius: 8px; }
+        .stButton > button { border-radius: 8px; font-weight: 650; }
+        .stButton > button[kind="primary"] { color: #07120e; }
+        @media (max-width: 600px) {
+            .block-container { padding: 1rem .85rem 2rem; }
+            .terminal-hero { padding: 1rem; }
+            .terminal-title { font-size: 1.4rem; }
+            .advisor-room-head { display: block; }
+            .advisor-deadline { display: none; }
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -1782,24 +1831,38 @@ def render_sidebar() -> None:
 
         st.session_state.deriv_token = deriv_token
 
+        st.subheader(t("thinking_control"))
+        st.session_state.jev_enabled = st.toggle(
+            t("jev_toggle"), value=bool(st.session_state.jev_enabled)
+        )
+        if st.session_state.jev_enabled:
+            st.session_state.jev_api_key = st.text_input(
+                "TypeSafe API Key",
+                value=st.session_state.jev_api_key,
+                type="password",
+                help=t("jev_key_help"),
+            )
+            st.caption(t("jev_scope"))
+
         st.subheader(t("execution_safety"))
         st.session_state.require_trade_confirmation = st.toggle(
             t("require_trade_confirmation"),
             value=bool(st.session_state.require_trade_confirmation),
             help="建议保持开启。每次下单后会自动取消确认。",
         )
+        if st.session_state.pending_trade:
+            st.markdown(f"**{t('pending_trade')}**")
+            st.json(st.session_state.pending_trade)
         st.session_state.confirm_next_trade = st.checkbox(
             t("confirm_next_trade"),
             value=bool(st.session_state.confirm_next_trade),
+            disabled=not bool(st.session_state.pending_trade),
         )
         st.session_state.allow_live_execution = st.checkbox(
             t("allow_live_execution"),
             value=bool(st.session_state.allow_live_execution),
             help="默认关闭。开启后服务端仍会要求显式 allow_live=true。",
         )
-        if st.session_state.pending_trade:
-            with st.expander(t("pending_trade"), expanded=True):
-                st.json(st.session_state.pending_trade)
 
         if selected_provider == "本地规则":
             st.session_state.llm_api_key = ""
@@ -1868,7 +1931,7 @@ def render_sidebar() -> None:
                 st.write(row["final_answer"])
         for row in load_recent_advisor_runs(3):
             with st.expander(
-                f"谋士 #{row['id']} · {row['symbol']} · {float(row['confidence']):.0%}",
+                f"分析 #{row['id']} · {row['symbol']}",
                 expanded=False,
             ):
                 st.caption(row["question"])
@@ -2335,7 +2398,8 @@ def collect_advisor_web_context(
     per_query_timeout = max(0.8, min(1.4, web_deadline / max(len(queries), 1) + 0.4))
     sources: list[dict[str, str]] = []
     seen: set[str] = set()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(3, len(queries))) as pool:
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(3, len(queries)))
+    try:
         futures = {
             pool.submit(fetch_news_rss, query, 4, per_query_timeout): query
             for query in queries
@@ -2345,7 +2409,11 @@ def collect_advisor_web_context(
                 futures,
                 timeout=web_deadline,
             ):
-                for item in future.result():
+                try:
+                    items = future.result()
+                except Exception:
+                    continue
+                for item in items:
                     key = item.get("url") or item.get("title")
                     if key and key not in seen:
                         item["query"] = futures[future]
@@ -2355,6 +2423,8 @@ def collect_advisor_web_context(
                     break
         except concurrent.futures.TimeoutError:
             pass
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     if writer:
         writer(f"Web research -> {len(sources)} sources within {time.perf_counter() - started:.1f}s")
     return sources[:8]
@@ -2393,7 +2463,7 @@ def advisor_market_snapshot(
         "get_market_ticks",
         lambda: get_market_ticks(symbol, False),
         {"symbol": symbol, "subscribe": False, "advisor": True},
-        deadline_at,
+        min(deadline_at, time.perf_counter() + 2.5),
         writer,
         trace_api=trace_api,
     )
@@ -2404,12 +2474,12 @@ def advisor_market_snapshot(
             st.session_state.last_tick = tick_result
 
     remaining = deadline_at - time.perf_counter()
-    if remaining > 2.8:
+    if tick_result.get("ok") and remaining > 2.8:
         candle_result = call_deriv_tool_before_deadline(
             "get_historical_candles",
             lambda: get_historical_candles(symbol, 60, 60),
             {"symbol": symbol, "granularity": 60, "count": 60, "advisor": True},
-            deadline_at,
+            min(deadline_at, time.perf_counter() + 3.0),
             writer,
             trace_api=trace_api,
         )
@@ -2486,7 +2556,7 @@ def local_advisor_opinion(
         rationale = "没有网页确认时降低仓位和冲动；若要做，只做 demo 小额并保留撤退条件。"
         invalidation = "最新 Tick 反向突破或连续三根反向波动。"
     elif advisor_id == "contrarian":
-        stance = "WAIT" if base_stance in {"CALL", "PUT"} else "CALL" if trend == "down" else "PUT"
+        stance = "WAIT"
         rationale = "反方视角：短线共识可能已经被价格吸收，必须等下一根确认。"
         invalidation = "若价格继续沿原方向扩大并伴随新闻确认，反方观点失效。"
     elif advisor_id == "quant":
@@ -2516,21 +2586,21 @@ def local_advisor_opinion(
 def consensus_from_opinions(opinions: list[dict[str, Any]], market: dict[str, Any], sources: list[dict[str, str]]) -> dict[str, Any]:
     votes = [str(item.get("stance") or "WAIT") for item in opinions]
     counts = {stance: votes.count(stance) for stance in {"CALL", "PUT", "WAIT"}}
-    winner = max(counts, key=counts.get)
-    support = counts[winner] / max(len(votes), 1)
-    data_bonus = 0.12 if market.get("candles") else 0.04
-    web_bonus = min(len(sources), 6) * 0.025
-    confidence = min(0.92, max(0.25, support * 0.62 + data_bonus + web_bonus))
+    winner = "WAIT" if not market.get("tick") and not market.get("candles") else max(
+        ("WAIT", "CALL", "PUT"), key=lambda stance: counts[stance]
+    )
+    # This is agreement among deterministic rules, not a forecast probability.
+    support = counts[winner] / max(len(votes), 1) if market.get("tick") or market.get("candles") else 0.0
     if winner == "CALL":
-        summary = "谋士团偏向看涨/做多，但只建议进入原交易链复核，不直接下单。"
+        summary = "本地规则偏向看涨，只供交易前复核。"
     elif winner == "PUT":
-        summary = "谋士团偏向看跌/做空，但只建议进入原交易链复核，不直接下单。"
+        summary = "本地规则偏向看跌，只供交易前复核。"
     else:
-        summary = "谋士团建议等待，当前信息不足以支持短线立即出手。"
+        summary = "本地规则建议等待，当前信息不足以支持短线立即出手。"
     return {
         "stance": winner,
         "summary": summary,
-        "confidence": round(confidence, 3),
+        "confidence": round(support, 3),
         "vote_counts": counts,
     }
 
@@ -2543,11 +2613,19 @@ def advisor_llm_synthesis(
     opinions: list[dict[str, Any]],
     consensus: dict[str, Any],
     remaining_seconds: float,
+    llm_config: dict[str, str] | None = None,
 ) -> str | None:
-    if not in_streamlit_runtime():
-        return None
-    provider: Provider = st.session_state.llm_provider
-    if provider == "本地规则" or not st.session_state.llm_api_key or remaining_seconds < 2.5:
+    if llm_config is None:
+        if not in_streamlit_runtime():
+            return None
+        llm_config = {
+            "provider": str(st.session_state.llm_provider),
+            "api_key": str(st.session_state.llm_api_key or ""),
+            "model": str(st.session_state.llm_model),
+            "base_url": str(st.session_state.custom_base_url or ""),
+        }
+    provider = llm_config.get("provider", "本地规则")
+    if provider == "本地规则" or not llm_config.get("api_key") or remaining_seconds < 2.5:
         return None
     source_lines = "\n".join(
         f"- {item.get('title')} ({item.get('source')}, {item.get('published')})"
@@ -2562,7 +2640,7 @@ def advisor_llm_synthesis(
 {agent_prompt("advisor.chief")}
 
 请基于下列材料，在 120 字以内给老板一个短线交易决策建议。
-要求：必须包含 方向(CALL/PUT/WAIT)、置信度、执行前提、失效条件。不要建议绕过人工确认。
+要求：解释证据、执行前提和失效条件。不要把规则票数或模型信心写成盈利概率，不要建议绕过人工确认。
 
 问题: {question}
 Symbol: {symbol}
@@ -2579,18 +2657,19 @@ Symbol: {symbol}
 
             base_url = OPENAI_COMPATIBLE_BASE_URLS.get(provider)
             if provider == "OpenAI-Compatible":
-                base_url = st.session_state.custom_base_url.strip() or None
+                base_url = llm_config.get("base_url", "").strip() or None
                 if not base_url:
                     return None
             kwargs: dict[str, Any] = {
-                "api_key": st.session_state.llm_api_key,
-                "timeout": max(2.0, min(8.0, remaining_seconds)),
+                "api_key": llm_config["api_key"],
+                "timeout": min(8.0, remaining_seconds),
+                "max_retries": 0,
             }
             if base_url:
                 kwargs["base_url"] = base_url
             client = OpenAI(**kwargs)
             response = client.chat.completions.create(
-                model=st.session_state.llm_model,
+                model=llm_config["model"],
                 messages=[
                     {"role": "system", "content": "你输出简洁、可审计、适合短线交易前复核的中文建议。"},
                     {"role": "user", "content": prompt},
@@ -2602,9 +2681,9 @@ Symbol: {symbol}
         if provider == "Anthropic":
             from anthropic import Anthropic
 
-            client = Anthropic(api_key=st.session_state.llm_api_key, timeout=max(2.0, min(8.0, remaining_seconds)))
+            client = Anthropic(api_key=llm_config["api_key"], timeout=min(8.0, remaining_seconds), max_retries=0)
             response = client.messages.create(
-                model=st.session_state.llm_model,
+                model=llm_config["model"],
                 max_tokens=220,
                 temperature=0.15,
                 system="你输出简洁、可审计、适合短线交易前复核的中文建议。",
@@ -2616,6 +2695,137 @@ Symbol: {symbol}
     except Exception:
         return None
     return None
+
+
+def combine_jev_advice(
+    local: dict[str, Any],
+    market: dict[str, Any],
+    assessment: MarketAssessment,
+) -> dict[str, Any]:
+    """Turn Jev's market opinion into advisory direction under evidence checks."""
+    if assessment.source != "jev" or not assessment.stance or not assessment.probabilities:
+        return local
+    stance = assessment.stance
+    selected_probability = assessment.probabilities[stance]
+    local_stance = str(local["stance"])
+    trend = str(market.get("trend") or "unknown")
+    has_market = bool(market.get("tick") or market.get("candles"))
+    supported = (
+        stance == "WAIT"
+        or (stance == "CALL" and trend == "up")
+        or (stance == "PUT" and trend == "down")
+    )
+    if not has_market or selected_probability < 0.8 or (assessment.confidence or 0) < 0.7:
+        final_stance, reason = "WAIT", "Jev 判断或行情证据不足"
+    elif not supported:
+        final_stance, reason = "WAIT", "Jev 方向缺少行情趋势支持"
+    elif stance in {"CALL", "PUT"} and local_stance in {"CALL", "PUT"} and stance != local_stance:
+        final_stance, reason = "WAIT", "Jev 与本地谋士方向冲突"
+    else:
+        final_stance, reason = stance, "Jev 与现有行情证据一致"
+    return {
+        **local,
+        "stance": final_stance,
+        "summary": f"Jev 参与本轮行情判断：{reason}，建议 {final_stance}。该建议只供复核，不触发下单。",
+        "jev_effect": reason,
+    }
+
+
+def market_tick_is_current(market: dict[str, Any]) -> bool:
+    tick = market.get("tick") or {}
+    if not isinstance(tick, dict) or tick.get("quote") is None:
+        return False
+    epoch = tick.get("epoch")
+    if epoch is None:
+        return True
+    try:
+        age = datetime.now(timezone.utc).timestamp() - float(epoch)
+    except (TypeError, ValueError):
+        return False
+    return 0 <= age <= 30
+
+
+def advisor_synthesis_with_jev(
+    question: str,
+    symbol: str,
+    market: dict[str, Any],
+    sources: list[dict[str, str]],
+    opinions: list[dict[str, Any]],
+    local_consensus: dict[str, Any],
+    started_at: float,
+    budget: int,
+    *,
+    jev_enabled: bool | None = None,
+    jev_api_key: str | None = None,
+    llm_config: dict[str, str] | None = None,
+) -> tuple[str | None, dict[str, Any], dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    assessment = MarketAssessment(None, "disabled")
+    consensus = local_consensus
+    enriched_opinions = list(opinions)
+    if jev_enabled is None:
+        jev_enabled = bool(st.session_state.get("jev_enabled")) if in_streamlit_runtime() else False
+    if jev_api_key is None:
+        jev_api_key = str(st.session_state.get("jev_api_key") or "") if in_streamlit_runtime() else ""
+    if jev_enabled and jev_api_key:
+        if not market_tick_is_current(market):
+            assessment = MarketAssessment(None, "no_current_tick")
+            consensus = {
+                **local_consensus,
+                "stance": "WAIT",
+                "confidence": min(float(local_consensus["confidence"]), 0.5),
+                "summary": "当前 Tick 缺失或过时，Jev 未参与方向判断；建议 WAIT。",
+            }
+        else:
+            assessment = assess_market(
+                {
+                    "task": "short_term_market_advice",
+                    "question": question[:600],
+                    "symbol": symbol,
+                    "market": {
+                        "trend": market.get("trend"),
+                        "latest_quote": (market.get("tick") or {}).get("quote"),
+                        "tick_epoch": (market.get("tick") or {}).get("epoch"),
+                        "latest_close": market.get("latest_close"),
+                        "change_pct": market.get("change_pct"),
+                        "ma5": market.get("ma5"),
+                        "ma20": market.get("ma20"),
+                        "summary": str(market.get("summary") or "")[:400],
+                    },
+                    "news": [
+                        {"title": str(item.get("title") or "")[:120], "published": item.get("published")}
+                        for item in sources[:3]
+                    ],
+                    "evaluated_at": datetime.now(timezone.utc).isoformat(),
+                },
+                jev_api_key,
+                deadline_at=started_at + budget,
+            )
+        if assessment.source == "jev" and assessment.stance:
+            consensus = combine_jev_advice(local_consensus, market, assessment)
+            probability = (assessment.probabilities or {}).get(assessment.stance, 0)
+            enriched_opinions.append({
+                "advisor_id": "jev",
+                "name": "Jev 实时判断" if current_lang() == "zh" else "Jev live assessment",
+                "role": "结构化行情决策" if current_lang() == "zh" else "Structured market decision",
+                "prompt": "Jev Choice: CALL / PUT / WAIT",
+                "stance": assessment.stance,
+                "rationale": f"Jev 选择 {assessment.stance}，选项概率 {probability:.0%}；最终采纳：{consensus['stance']}。",
+                "invalidation": "行情反转、数据过时或新信息出现时重新评估。",
+                "question": question,
+                "model_confidence": assessment.confidence,
+                "probabilities": assessment.probabilities,
+            })
+            push_runtime_event("thinking", "Jev", "Chief Advisor", f"{assessment.stance} -> {consensus['stance']} ({assessment.latency_ms:.0f}ms)")
+            route = ThinkingRoute("fast", "jev_decision", assessment.latency_ms, assessment.confidence, None)
+            return None, route.as_dict(), assessment.as_dict(), consensus, enriched_opinions
+    push_runtime_event("thinking", "Jev", "Advisor", f"{assessment.source} ({assessment.latency_ms:.0f}ms)")
+    if assessment.source == "no_current_tick":
+        route = ThinkingRoute("fast", "no_current_tick", assessment.latency_ms)
+        return None, route.as_dict(), assessment.as_dict(), consensus, enriched_opinions
+    remaining = budget - (time.perf_counter() - started_at)
+    llm_summary = advisor_llm_synthesis(question, symbol, market, sources, opinions, consensus, remaining, llm_config)
+    route = ThinkingRoute("deep" if llm_summary else "local", assessment.source, assessment.latency_ms)
+    return llm_summary, route.as_dict(), assessment.as_dict(), consensus, enriched_opinions
 
 
 def advisor_langgraph_available() -> bool:
@@ -2684,29 +2894,31 @@ def build_advisor_langgraph() -> Any:
         sources = list(state.get("sources") or [])
         market = dict(state.get("market") or {})
         local_consensus = consensus_from_opinions(opinions, market, sources)
-        remaining = int(state.get("budget") or 10) - (
-            time.perf_counter() - float(state.get("started_at") or time.perf_counter())
-        )
-        llm_summary = advisor_llm_synthesis(
+        llm_summary, thinking_route, jev_assessment, consensus, enriched_opinions = advisor_synthesis_with_jev(
             str(state.get("question") or ""),
             str(state.get("symbol") or DEFAULT_SYMBOL),
             market,
             sources,
             opinions,
             local_consensus,
-            remaining,
+            float(state.get("started_at") or time.perf_counter()),
+            int(state.get("budget") or 10),
+            jev_enabled=bool(state.get("jev_enabled")),
+            jev_api_key=str(state.get("jev_api_key") or ""),
+            llm_config=dict(state.get("llm_config") or {}),
         )
-        final_summary = llm_summary or (
-            f"{local_consensus['summary']} 方向={local_consensus['stance']}，"
-            f"置信度={local_consensus['confidence']:.0%}；执行前先让行情、风控、合规和执行交易员复核。"
-        )
+        final_summary = consensus["summary"]
         return {
             "local_consensus": local_consensus,
             "consensus": final_summary,
-            "stance": local_consensus["stance"],
-            "confidence": local_consensus["confidence"],
-            "vote_counts": local_consensus["vote_counts"],
-            "logs": [f"Chief Advisor -> {local_consensus['stance']} confidence={local_consensus['confidence']:.0%}"],
+            "model_summary": llm_summary or "",
+            "stance": consensus["stance"],
+            "confidence": consensus["confidence"],
+            "vote_counts": consensus["vote_counts"],
+            "thinking_route": thinking_route,
+            "jev_assessment": jev_assessment,
+            "opinions": enriched_opinions[len(opinions):],
+            "logs": [f"Chief Advisor -> {consensus['stance']} confidence={consensus['confidence']:.0%}"],
         }
 
     graph.add_node("web_research", web_research_node)
@@ -2717,11 +2929,11 @@ def build_advisor_langgraph() -> Any:
     graph.add_node("synthesize", synthesize_node)
 
     graph.add_edge(START, "web_research")
-    graph.add_edge("web_research", "market_snapshot")
-    graph.add_edge("market_snapshot", "news_signal")
+    graph.add_edge(START, "market_snapshot")
+    graph.add_edge("web_research", "news_signal")
     for advisor in advisor_specs():
         node_name = advisor_node_name(advisor["id"])
-        graph.add_edge("news_signal", node_name)
+        graph.add_edge(["market_snapshot", "news_signal"], node_name)
         graph.add_edge(node_name, "synthesize")
     graph.add_edge("synthesize", END)
     return graph.compile()
@@ -2735,6 +2947,14 @@ def run_advisor_langgraph(
     writer: Callable[[str], None] | None = None,
 ) -> dict[str, Any] | None:
     try:
+        jev_enabled = bool(st.session_state.get("jev_enabled")) if in_streamlit_runtime() else False
+        jev_api_key = str(st.session_state.get("jev_api_key") or "") if in_streamlit_runtime() else ""
+        llm_config = {
+            "provider": str(st.session_state.get("llm_provider") or "本地规则"),
+            "api_key": str(st.session_state.get("llm_api_key") or ""),
+            "model": str(st.session_state.get("llm_model") or ""),
+            "base_url": str(st.session_state.get("custom_base_url") or ""),
+        } if in_streamlit_runtime() else {}
         app = build_advisor_langgraph()
         return dict(
             app.invoke(
@@ -2744,6 +2964,9 @@ def run_advisor_langgraph(
                     "budget": budget,
                     "use_web": use_web,
                     "language": current_lang(),
+                    "jev_enabled": jev_enabled,
+                    "jev_api_key": jev_api_key,
+                    "llm_config": llm_config,
                     "started_at": time.perf_counter(),
                     "opinions": [],
                     "logs": [],
@@ -2777,9 +3000,12 @@ def run_advisor_council(
         news_signal = dict(graph_state.get("news_signal") or {})
         opinions = list(graph_state.get("opinions") or [])
         final_summary = str(graph_state.get("consensus") or "")
+        model_summary = str(graph_state.get("model_summary") or "")
         stance = str(graph_state.get("stance") or "WAIT")
         confidence = float(graph_state.get("confidence") or 0)
         vote_counts = dict(graph_state.get("vote_counts") or {})
+        thinking_route = dict(graph_state.get("thinking_route") or {})
+        jev_assessment = dict(graph_state.get("jev_assessment") or {})
         runtime = "langgraph"
         persist_advisor_market_state(market)
         for line in graph_state.get("logs") or []:
@@ -2800,20 +3026,18 @@ def run_advisor_council(
                 writer(f"{opinion['name']} -> {opinion['stance']}: {opinion['rationale']}")
 
         consensus = consensus_from_opinions(opinions, market, sources)
-        remaining = budget - (time.perf_counter() - started)
-        llm_summary = advisor_llm_synthesis(
+        llm_summary, thinking_route, jev_assessment, consensus, opinions = advisor_synthesis_with_jev(
             question,
             symbol,
             market,
             sources,
             opinions,
             consensus,
-            remaining,
+            started,
+            budget,
         )
-        final_summary = llm_summary or (
-            f"{consensus['summary']} 方向={consensus['stance']}，"
-            f"置信度={consensus['confidence']:.0%}；执行前先让行情、风控、合规和执行交易员复核。"
-        )
+        final_summary = consensus["summary"]
+        model_summary = llm_summary or ""
         stance = consensus["stance"]
         confidence = consensus["confidence"]
         vote_counts = consensus["vote_counts"]
@@ -2834,9 +3058,13 @@ def run_advisor_council(
         "news_signal": news_signal,
         "opinions": opinions,
         "consensus": final_summary,
+        "model_summary": model_summary,
         "stance": stance,
         "confidence": confidence,
+        "rule_agreement": confidence,
         "vote_counts": vote_counts,
+        "thinking_route": thinking_route,
+        "jev_assessment": jev_assessment,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     if in_streamlit_runtime():
@@ -3440,8 +3668,11 @@ def execution_agent(
         "contract_id": contract_id,
         "allow_live": bool(st.session_state.allow_live_execution),
     }
-    if st.session_state.require_trade_confirmation and not st.session_state.confirm_next_trade:
+    if st.session_state.require_trade_confirmation and (
+        st.session_state.pending_trade != pending or not st.session_state.confirm_next_trade
+    ):
         st.session_state.pending_trade = pending
+        st.session_state.confirm_next_trade = False
         report = {
             "role": "Execution Trader",
             "ok": False,
@@ -4069,21 +4300,59 @@ def deterministic_manager_state_machine(
     )
 
 
+def jev_read_only_candidate(user_text: str) -> bool:
+    """Keep any possible trading instruction on the existing manager path."""
+    lowered = user_text.lower()
+    if has_trade_intent(user_text) or has_close_intent(user_text) or any(
+        word in lowered
+        for word in ("卖出", "止损", "止盈", "梭哈", "换仓", "sell", "short", "long", "stake", "contract")
+    ):
+        return False
+    return any(
+        word in lowered
+        for word in ("行情", "报价", "价格", "走势", "k线", "蜡烛", "图表", "画图", "tick", "candle", "chart", "market price")
+    )
+
+
 def run_hierarchical_trading_team(
     user_text: str,
     writer: Callable[[str], None] | None = None,
 ) -> TeamRunResult:
     events: list[AgentEvent] = []
     provider: Provider = st.session_state.llm_provider
+    thinking_route: dict[str, Any] | None = None
+    if (
+        provider != "本地规则"
+        and st.session_state.llm_api_key
+        and st.session_state.get("jev_enabled")
+        and st.session_state.get("jev_api_key")
+        and jev_read_only_candidate(user_text)
+    ):
+        route = route_thinking(
+            {"task": "read_only_manager_routing", "request": user_text[:1000], "symbol": extract_symbol(user_text)},
+            st.session_state.jev_api_key,
+        )
+        thinking_route = route.as_dict()
+        push_runtime_event("thinking", "Jev", "Manager", f"{route.mode} ({route.source}, {route.latency_ms:.0f}ms)")
+        if writer:
+            writer(f"Jev thinking route -> {route.mode} ({route.latency_ms:.0f}ms)")
+        if route.mode == "fast":
+            result = deterministic_manager_state_machine(user_text, events, writer)
+            result.thinking_route = thinking_route
+            return result
     if provider in {"OpenAI", "DeepSeek", "OpenAI-Compatible"} and st.session_state.llm_api_key:
         result = manager_with_openai_tool_calling(user_text, events, writer)
         if result:
+            result.thinking_route = thinking_route
             return result
     if provider == "Anthropic" and st.session_state.llm_api_key:
         result = manager_with_anthropic_tool_calling(user_text, events, writer)
         if result:
+            result.thinking_route = thinking_route
             return result
-    return deterministic_manager_state_machine(user_text, events, writer)
+    result = deterministic_manager_state_machine(user_text, events, writer)
+    result.thinking_route = thinking_route
+    return result
 
 
 def reset_agent_log() -> list[str]:
@@ -4319,6 +4588,11 @@ def stream_text(text: str) -> Generator[str, None, None]:
 
 
 def render_header() -> None:
+    connection = "Deriv 已配置" if st.session_state.deriv_token else "Deriv 未配置"
+    jev_status = "Jev 已配置" if st.session_state.jev_enabled and st.session_state.jev_api_key else "Jev 未配置"
+    if current_lang() == "en":
+        connection = "Deriv configured" if st.session_state.deriv_token else "Deriv not configured"
+        jev_status = "Jev configured" if st.session_state.jev_enabled and st.session_state.jev_api_key else "Jev not configured"
     st.markdown(
         f"""
         <div class="terminal-hero">
@@ -4330,7 +4604,7 @@ def render_header() -> None:
                 {html.escape(t("hero_subtitle"))}
               </div>
             </div>
-            <div class="live-chip">LIVE · MCP WS</div>
+            <div class="live-chip">{html.escape(connection)} · {html.escape(jev_status)}</div>
           </div>
         </div>
         """,
@@ -5301,7 +5575,6 @@ def direct_arguments(agent_id: str, task: str) -> dict[str, Any]:
 
 
 def render_direct_dispatch() -> None:
-    st.markdown(f"#### {t('direct_dispatch')}")
     agent_options = ["market", "strategy", "risk", "compliance", "chart", "execution", "report"]
     col_agent, col_button = st.columns([0.68, 0.32])
     selected_agent = col_agent.selectbox(
@@ -5351,6 +5624,9 @@ def render_direct_dispatch() -> None:
 
 
 def render_advisor_result(result: dict[str, Any]) -> None:
+    market = result.get("market") or {}
+    if not market.get("tick") and not market.get("candles"):
+        st.warning("未取得行情数据，本轮只提供 WAIT 结论。" if current_lang() == "zh" else "No market data was received. This run can only recommend WAIT.")
     st.markdown(
         f"""
         <div class="advisor-result">
@@ -5361,18 +5637,49 @@ def render_advisor_result(result: dict[str, Any]) -> None:
         """,
         unsafe_allow_html=True,
     )
-    cols = st.columns(4)
-    cols[0].metric(t("advisor_confidence"), f"{float(result.get('confidence') or 0):.0%}")
+    cols = st.columns(3)
+    cols[0].metric(t("advisor_confidence"), f"{float(result.get('rule_agreement', result.get('confidence')) or 0):.0%}" if market.get("tick") or market.get("candles") else "—")
     cols[1].metric(t("advisor_elapsed"), f"{float(result.get('elapsed_ms') or 0) / 1000:.1f}s")
     cols[2].metric(t("advisor_sources"), int(result.get("source_count") or 0))
-    cols[3].metric("Runtime", str(result.get("runtime") or "local"))
-    st.caption(f"Votes: `{json.dumps(result.get('vote_counts') or {}, ensure_ascii=False)}`")
+    tick = market.get("tick") or {}
+    if tick:
+        quote = tick.get("quote", "—")
+        observed_at = tick.get("timestamp") or tick.get("epoch") or "—"
+        st.caption(
+            f"行情证据：{result.get('symbol')} · Tick {quote} · 趋势 {market.get('trend') or 'unknown'} · 时间 {observed_at}"
+            if current_lang() == "zh" else
+            f"Market evidence: {result.get('symbol')} · Tick {quote} · trend {market.get('trend') or 'unknown'} · time {observed_at}"
+        )
+    st.caption("规则意见一致度仅表示本地规则的投票比例，不是盈利概率。" if current_lang() == "zh" else "Rule agreement is a vote share, not a profit probability.")
+    votes = result.get("vote_counts") or {}
+    if votes:
+        st.caption(
+            "本地规则票数：" + " · ".join(f"{stance} {int(votes.get(stance) or 0)}" for stance in ("CALL", "PUT", "WAIT"))
+            if current_lang() == "zh" else
+            "Local rule votes: " + " · ".join(f"{stance} {int(votes.get(stance) or 0)}" for stance in ("CALL", "PUT", "WAIT"))
+        )
+    jev = result.get("jev_assessment") or {}
+    if jev.get("source") == "jev":
+        selected = (jev.get("probabilities") or {}).get(jev.get("stance"), 0)
+        st.caption(f"Jev: `{jev.get('stance')}` · 选项概率 {selected:.0%} · 模型信心 {float(jev.get('confidence') or 0):.0%}" if current_lang() == "zh" else f"Jev: `{jev.get('stance')}` · choice probability {selected:.0%} · model confidence {float(jev.get('confidence') or 0):.0%}")
+    else:
+        reasons = {
+            "disabled": ("Jev 尚未启用。可在左上角设置中启用并填写 TypeSafe API Key。", "Jev is not enabled. Open settings and enter a TypeSafe API Key."),
+            "no_current_tick": ("Jev 未参与：缺少新鲜 Tick。", "Jev was skipped: no fresh Tick."),
+            "deadline": ("Jev 未参与：本轮时间预算已用完。", "Jev was skipped: time budget exhausted."),
+            "jev_error": ("Jev 请求失败，本轮使用本地规则。", "Jev request failed; this run used local rules."),
+        }
+        zh, en = reasons.get(str(jev.get("source") or "disabled"), ("Jev 未参与本轮。", "Jev did not participate in this run."))
+        st.caption(zh if current_lang() == "zh" else en)
+    if result.get("model_summary"):
+        with st.expander("大模型补充说明（独立复核）" if current_lang() == "zh" else "Model explanation (review separately)", expanded=False):
+            st.write(str(result["model_summary"]))
 
     opinions = result.get("opinions") or []
     cards = []
     for opinion in opinions:
         specs = advisor_specs()
-        spec = next((item for item in specs if item["id"] == opinion.get("advisor_id")), specs[0])
+        spec = next((item for item in specs if item["id"] == opinion.get("advisor_id")), {"code": "JV", "color": "#f5b84b"})
         cards.append(
             f"""
 <div class="advisor-card">
@@ -5390,7 +5697,8 @@ def render_advisor_result(result: dict[str, Any]) -> None:
             """.strip()
         )
     if cards:
-        st.markdown(f'<div class="advisor-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+        with st.expander("查看本地规则与 Jev 意见" if current_lang() == "zh" else "Inspect rule and Jev opinions", expanded=False):
+            st.markdown(f'<div class="advisor-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
 
     with st.expander(t("advisor_sources"), expanded=bool(result.get("sources"))):
         sources = result.get("sources") or []
@@ -5421,6 +5729,8 @@ def render_advisor_result(result: dict[str, Any]) -> None:
                 "news_signal": result.get("news_signal"),
                 "opinions": result.get("opinions"),
                 "vote_counts": result.get("vote_counts"),
+                "thinking_route": result.get("thinking_route"),
+                "jev_assessment": result.get("jev_assessment"),
             }
         )
     st.download_button(
@@ -5441,7 +5751,6 @@ def render_advisor_council() -> None:
               <div class="advisor-title">{html.escape(t("advisor_council"))}</div>
               <div class="advisor-caption">{html.escape(t("advisor_caption"))}</div>
             </div>
-            <div class="advisor-deadline">FAST · WEB · COUNCIL</div>
           </div>
         </div>
         """,
@@ -5455,7 +5764,7 @@ def render_advisor_council() -> None:
             height=96,
             placeholder=t("advisor_placeholder"),
         )
-        controls = st.columns([0.24, 0.24, 0.22, 0.16, 0.14])
+        symbol_col, custom_col = st.columns([1, 1])
         current_symbol = normalize_deriv_symbol(str(st.session_state.advisor_symbol))
         symbol_options = COMMON_DERIV_SYMBOLS + ["自定义"]
         current_symbol_index = (
@@ -5463,29 +5772,30 @@ def render_advisor_council() -> None:
             if current_symbol in symbol_options
             else len(symbol_options) - 1
         )
-        selected_symbol = controls[0].selectbox(
+        selected_symbol = symbol_col.selectbox(
             t("advisor_symbol"),
             symbol_options,
             index=current_symbol_index,
         )
-        custom_symbol = controls[1].text_input(
-            "Custom Symbol",
-            value="" if selected_symbol != "自定义" else current_symbol,
-            placeholder="例如 R_75 / BOOM1000 / frxEURUSD",
-            disabled=selected_symbol != "自定义",
-        )
-        budget = controls[2].slider(
+        custom_symbol = ""
+        if selected_symbol == "自定义":
+            custom_symbol = custom_col.text_input(
+                "Custom Symbol", value=current_symbol,
+                placeholder="R_75 / BOOM1000 / frxEURUSD",
+            )
+        budget_col, web_col, start_col = st.columns([2, 1, 1])
+        budget = budget_col.slider(
             t("advisor_time_budget"),
             min_value=4,
             max_value=25,
             value=int(st.session_state.advisor_time_budget),
             step=1,
         )
-        use_web = controls[3].toggle(
+        use_web = web_col.toggle(
             t("advisor_web_toggle"),
             value=bool(st.session_state.advisor_use_web),
         )
-        submitted = controls[4].form_submit_button(t("advisor_start"), type="primary", width="stretch")
+        submitted = start_col.form_submit_button(t("advisor_start"), type="primary", width="stretch")
 
     if submitted:
         cleaned_question = question.strip()
@@ -5498,7 +5808,7 @@ def render_advisor_council() -> None:
         )
         st.session_state.advisor_time_budget = int(budget)
         st.session_state.advisor_use_web = bool(use_web)
-        with st.status(t("advisor_processing"), expanded=True) as status:
+        with st.status(t("advisor_processing"), expanded=False) as status:
 
             def advisor_writer(line: str) -> None:
                 st.write(line)
@@ -5510,7 +5820,7 @@ def render_advisor_council() -> None:
                 bool(use_web),
                 advisor_writer,
             )
-            status.update(label=t("advisor_done"), state="complete", expanded=True)
+            status.update(label=t("advisor_done"), state="complete", expanded=False)
         st.session_state.advisor_prompt_nonce += 1
         render_advisor_result(result)
         return
@@ -5546,21 +5856,8 @@ def render_chat() -> None:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
-        render_direct_dispatch()
-
-        st.markdown(
-            f"""
-            <div class="command-panel">
-              <div class="command-title">{html.escape(t("command_title"))}</div>
-              <div class="command-hint">{html.escape(t("command_hint"))}</div>
-              <div class="example-strip">
-                <span class="example-pill">{html.escape(t("example_tick"))}</span>
-                <span class="example-pill">{html.escape(t("example_candles"))}</span>
-                <span class="example-pill">{html.escape(t("example_trade"))}</span>
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+        st.caption(
+            f"{t('example_tick')} · {t('example_candles')} · {t('example_trade')}"
         )
 
         input_key = f"command_input_{st.session_state.prompt_nonce}"
@@ -5579,16 +5876,18 @@ def render_chat() -> None:
             unsafe_allow_html=True,
         )
 
-        st.markdown(f"#### {t('agent_log')}")
-        st.code(st.session_state.agent_execution_log, language="text")
-        render_sync_bus()
-        st.download_button(
-            t("download_log"),
-            data=st.session_state.agent_execution_log,
-            file_name=f"deriv-agent-log-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt",
-            mime="text/plain",
-            width="stretch",
-        )
+        with st.expander(t("direct_dispatch"), expanded=False):
+            render_direct_dispatch()
+
+        with st.expander(t("agent_log"), expanded=False):
+            st.code(st.session_state.agent_execution_log, language="text")
+            st.download_button(
+                t("download_log"),
+                data=st.session_state.agent_execution_log,
+                file_name=f"deriv-agent-log-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt",
+                mime="text/plain",
+                width="stretch",
+            )
 
         if clear_clicked:
             st.session_state.prompt_nonce += 1
@@ -5613,12 +5912,12 @@ def render_chat() -> None:
                 st.write(line)
                 live_slot.code(format_runtime_events(22), language="text")
 
-            with st.status(t("team_processing"), expanded=True) as status:
+            with st.status(t("team_processing"), expanded=False) as status:
                 team_result = run_hierarchical_trading_team(prompt, writer=live_writer)
                 if team_result.ok:
-                    status.update(label=t("team_done"), state="complete", expanded=True)
+                    status.update(label=t("team_done"), state="complete", expanded=False)
                 else:
-                    status.update(label=t("team_blocked"), state="error", expanded=True)
+                    status.update(label=t("team_blocked"), state="error", expanded=False)
 
             with st.expander(t("structured_result"), expanded=False):
                 st.json(
@@ -5626,6 +5925,7 @@ def render_chat() -> None:
                         "market_report": team_result.market_report,
                         "execution_report": team_result.execution_report,
                         "events": [event.line() for event in team_result.events],
+                        "thinking_route": team_result.thinking_route,
                     }
                 )
 
@@ -5642,17 +5942,30 @@ def main() -> None:
     configure_page()
     render_sidebar()
     render_header()
-    render_advisor_council()
-
-    left, right = st.columns([0.36, 0.64], gap="large")
-    with left:
-        render_chat()
-    with right:
-        render_swarm_graph()
-        render_agent_roster()
-        st.markdown(f"### {t('live_results')}")
-        st.markdown(f'<p class="small-muted">{html.escape(t("results_hint"))}</p>', unsafe_allow_html=True)
+    workspace = st.segmented_control(
+        "工作区" if current_lang() == "zh" else "Workspace",
+        ["analysis", "market", "trade", "audit"],
+        format_func=lambda value: {
+            "analysis": "分析决策" if current_lang() == "zh" else "Decision",
+            "market": "行情图表" if current_lang() == "zh" else "Market",
+            "trade": "指令与确认" if current_lang() == "zh" else "Orders",
+            "audit": "运行记录" if current_lang() == "zh" else "Audit",
+        }[value],
+        default="analysis",
+        key="workspace_section",
+        label_visibility="collapsed",
+    )
+    if workspace == "analysis":
+        render_advisor_council()
+    elif workspace == "market":
         render_last_artifacts()
+    elif workspace == "trade":
+        render_chat()
+    else:
+        render_sync_bus()
+        with st.expander("Agent 结构" if current_lang() == "zh" else "Agent structure", expanded=False):
+            render_swarm_graph()
+            render_agent_roster()
 
 
 if __name__ == "__main__":

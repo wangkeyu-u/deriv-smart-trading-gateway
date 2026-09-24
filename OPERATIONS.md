@@ -74,7 +74,8 @@ Deriv WebSocket API
 .
 ├── agent_prompts.json              # Editable prompt registry for manager, workers, and advisors
 ├── docs/assets/                    # README and project media
-├── mcp_config.json                 # MCP client configuration
+├── mcp_config.example.json         # MCP client configuration template
+├── scripts/print_mcp_config.py     # Prints paths for this checkout
 ├── requirements.txt                # Python dependencies
 ├── server.py                       # FastMCP server with Deriv WebSocket tools
 ├── smoke_test.py                   # End-to-end runtime smoke checks
@@ -85,7 +86,7 @@ Deriv WebSocket API
 ## Quick Start
 
 ```bash
-cd /Users/wangkeyu/Documents/项目
+cd /path/to/deriv-smart-trading-gateway
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/streamlit run web_app.py --server.port 8501
@@ -100,17 +101,25 @@ http://localhost:8501
 On macOS you can also double-click:
 
 ```text
-/Users/wangkeyu/Documents/项目/Deriv Gateway.command
+/path/to/deriv-smart-trading-gateway/Deriv Gateway.command
 ```
 
-The launcher creates `.venv` if needed, installs dependencies, and opens the Streamlit app.
+The launcher creates `.venv` if needed and installs dependencies only when `requirements.txt` changes.
 
 ## Run The MCP Server
 
 ```bash
-cd /Users/wangkeyu/Documents/项目
+cd /path/to/deriv-smart-trading-gateway
 .venv/bin/python server.py
 ```
+
+To configure an MCP client, generate absolute paths for this checkout:
+
+```bash
+.venv/bin/python scripts/print_mcp_config.py
+```
+
+Copy the printed JSON into your MCP client configuration. `mcp_config.example.json` shows the same structure with placeholders.
 
 Available MCP tools:
 
@@ -132,15 +141,12 @@ The app uses two complementary agent systems.
 - Risk Sentinel and Compliance Reviewer block unsafe or incomplete trade requests.
 - Execution Trader is the only worker allowed to submit Deriv write operations.
 
-**Advisor Council**
+**Quick market decision**
 
-- Macro Advisor reads external catalysts and broad risk tone.
-- Quant Advisor focuses on short-window momentum and moving averages.
-- Flow Advisor watches rhythm, volatility, and execution windows.
-- Risk Advisor challenges overconfident trades.
-- Contrarian Advisor attacks the consensus before the chief advisor synthesizes the final view.
+- Five deterministic local rules inspect news tone, momentum, price rhythm, risk and the opposite case. Their vote share is shown as rule agreement, never as a profit probability.
+- When configured, Jev reads the current Tick, candle trend metrics and recent headline titles. It contributes a typed `CALL` / `PUT` / `WAIT` opinion that can change the published advisory stance under evidence checks. It never calls the execution worker.
 
-When `langgraph` is installed, each advisor runs as a graph node. If LangGraph is unavailable, the app falls back to a local council runner so the UI remains usable.
+With LangGraph installed, web research and the market snapshot start in parallel. The local checks follow after both finish. If LangGraph is unavailable, the app uses a local runner. Jev and language-model settings are passed into the graph at invocation so background nodes use the selected configuration.
 
 ## Extend Agents
 
@@ -195,6 +201,8 @@ The model selector supports:
 - DeepSeek through the OpenAI-compatible base URL `https://api.deepseek.com`.
 - Anthropic.
 - Custom OpenAI-compatible providers with a configurable base URL.
+
+Jev uses a separate TypeSafe API key and the System One decision endpoint. Enable it in the sidebar to let it participate in the Advisor Council even when the main model provider is the local rule engine. With a valid, supported Jev decision, the council skips the final prose model call to reduce response time. See [README.md](README.md#optional-jev-live-decision) for the decision rules and limits.
 
 ## Symbol Examples
 
