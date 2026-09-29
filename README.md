@@ -2,7 +2,9 @@
 
 An agent orchestration prototype that turns a request into bounded tools, checks account authorization and human confirmation, and records execution outcomes.
 
-The Streamlit workbench now has four focused areas: **Decision**, **Market**, **Orders**, and **Audit**. The decision screen shows market evidence, the final stance, source links, Jev participation and measured elapsed time. Detailed rule opinions and runtime traces stay available on demand.
+The Streamlit workbench uses a compact graphite and blue interface with shared widget, chart and result styles. Settings live in the header, advanced analysis controls are collapsed, and the workspace has four focused areas: **Analysis**, **Market**, **Orders**, and **History**. Analysis shows market evidence, the final stance, source links, Jev participation and measured elapsed time. Detailed rule opinions and runtime traces stay available on demand.
+
+![Analysis workspace](docs/assets/workbench-desktop.png)
 
 ## Problem
 
@@ -28,18 +30,26 @@ flowchart LR
 - **Authorization before effects:** reject failed or unrecognized account checks; live-account writes require explicit opt-in. Invalid proposals must stop before buy.
 - **Human-in-the-loop:** the Streamlit execution path stages the exact order parameters for confirmation by default. A changed order returns to the pending state. This is a UI policy, configurable by the operator; direct MCP clients must enforce their own approval boundary. The backend does not cryptographically prove human consent.
 - **Write timeout behavior:** buy requests use zero automatic retries. An ambiguous outcome requires account/contract reconciliation before another write.
-- **Advisory isolation:** advisor output does not itself execute trades. A transient graph-node failure can fall back to the local advisory flow; persistent component failure is not guaranteed to recover.
+- **Advisory isolation:** advisor output does not itself execute trades. A graph-node failure returns WAIT without repeating network or model calls. If LangGraph is unavailable, the local flow uses the same evidence policy and time budget.
 - **Inspectable orchestration:** prompt registry, dispatch names, API traces and receipts are available for review. Advisor count is not a quality metric.
 
-## Optional Jev live decision
+## Jev scenario controller
 
-Enable **Jev live decisions** in the Streamlit sidebar and enter a TypeSafe API key. After each advisor run gathers a new market snapshot, Jev receives a small, explicit state: the question, symbol, latest Tick and candle trend metrics, and up to three dated news headlines. It returns a typed `CALL / PUT / WAIT` Choice with the full probability distribution. The Jev opinion appears as its own advisor card and in the downloadable JSON. A valid Jev response replaces the slow final language-model synthesis for that run.
+The Analysis workspace supports **Observe**, **Review** and **Research**. Jev participates in the actual control flow: a single batched request assesses observed direction and selects `finish / deep / wait`; thesis review adds a separate consistency question. A `deep` response invokes the configured explanation model within the same deadline. Missing configuration, timeout and incomplete evidence are shown explicitly.
 
-Jev's opinion affects the published stance. A high-confidence `CALL` or `PUT` can promote a local `WAIT` only when the measured candle trend supports the same direction; `WAIT` can hold back a directional local consensus. A conflict between Jev and a directional local consensus, weak model confidence, missing or stale Tick data, or an unsupported trend results in `WAIT`. Tick timestamps older than 30 seconds are rejected when provided. The app shows the selected option probability and model confidence separately from the local rule vote share. These values are not a calibrated probability of trading profit.
+Open **Settings** in the upper right and enable Jev, enter a TypeSafe key (or set `TYPESAFE_API_KEY` before starting), and optionally configure an explanation model. The default is pinned to `jev-1.13.0`; each result records the actual model version, prompt/policy version, probabilities, usage, evidence ID and stage timings. Credentials stay outside graph state and saved results.
 
-The local "advisor" perspectives are deterministic rules, not five independent language models. The graph passes the selected Jev and optional language-model settings into worker nodes explicitly. Web research and the market snapshot run in parallel, and network calls have shorter per-step caps so unavailable feeds return a `WAIT` result promptly. An optional language model can add an explanation; it does not overwrite the evidence-gated stance.
+Synthetic indices such as R_100 skip external news and keep the final stance at WAIT: this project has no validated predictive strategy for them. Forex CALL/PUT describes an observed historical window, not the next tick or a contract's profitability. Fresh timestamped ticks and valid contiguous candles are required. Model confidence and rule agreement are not profit probabilities.
 
-The existing bounded Jev fast/deep router also applies to explicit read-only market/chart commands in the manager console. Trading requests never enter that fast path. Jev uses TypeSafe's documented [`/v1/systemone` Choice API](https://docs.typesafe.ai/api) with a 1.2-second request cap and no automatic retry. Errors or timeouts preserve the prior advisory path. Its API key stays in the current Streamlit session. Jev does not generate prose, supply order parameters, approve trades, or bypass account checks and confirmation. End-to-end speed improvement still requires a real key and representative latency measurements.
+See the [research and scenario design](docs/jev-scenario-design.md) for official sources, exact thresholds, failure behavior and evaluation limits.
+
+```bash
+.venv/bin/python scripts/evaluate_jev.py --output local_data/jev-offline-replay.json
+# Optional: real model calls on synthetic fixtures, requires TYPESAFE_API_KEY
+.venv/bin/python scripts/evaluate_jev.py --live --output local_data/jev-live-eval.json
+```
+
+Offline replay checks policy behavior using mocked answers; it is not a model accuracy or speed benchmark. Jev and explanation calls have total network deadlines and no retries. The manager console retains its separate read-only fast/deep router. Order authorization remains in the existing deterministic account and confirmation checks.
 
 ## Failure evidence and tests
 

@@ -3,3 +3,7 @@ __pycache__/
 *.py[cod]
 .DS_Store
 local_data/
+
+.env
+.env.*
+!.env.example

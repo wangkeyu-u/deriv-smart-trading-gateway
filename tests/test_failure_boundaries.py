@@ -93,9 +93,10 @@ def test_trade_transport_failure_never_retries_buy(monkeypatch, failure):
     assert len(buys) == (0 if failure == "invalid_symbol" else 1)
 
 
-def test_one_advisor_failure_falls_back_without_executing_trade(monkeypatch):
+def test_one_advisor_failure_does_not_restart_or_execute_trade(monkeypatch):
     original = web_app.local_advisor_opinion
     failed = False
+    market_calls = []
 
     def flaky(advisor, *args, **kwargs):
         nonlocal failed
@@ -109,12 +110,15 @@ def test_one_advisor_failure_falls_back_without_executing_trade(monkeypatch):
 
     monkeypatch.setattr(web_app, "local_advisor_opinion", flaky)
     monkeypatch.setattr(web_app, "collect_advisor_web_context", lambda *a, **k: [])
-    monkeypatch.setattr(web_app, "advisor_market_snapshot", lambda *a, **k: {
+    monkeypatch.setattr(web_app, "advisor_market_snapshot", lambda *a, **k: market_calls.append(1) or {
         "symbol": "R_75", "summary": "synthetic market", "trend": "up", "latest_close": 100.0})
     monkeypatch.setattr(web_app, "advisor_llm_synthesis", lambda *a, **k: None)
     monkeypatch.setattr(web_app, "save_advisor_run", lambda *a, **k: None)
     monkeypatch.setattr(web_app, "execute_simulated_trade", forbidden_write)
     result = web_app.run_advisor_council("inspect R_75", "R_75", 4, False)
     assert failed
-    assert result["runtime"] == "local_fallback"
-    assert result["opinions"]
+    assert result["runtime"] == "langgraph"
+    assert result["ok"] is False
+    assert result["status"] == "error"
+    assert result["stance"] == "WAIT"
+    assert market_calls == [1]

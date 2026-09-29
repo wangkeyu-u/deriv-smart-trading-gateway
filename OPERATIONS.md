@@ -202,7 +202,8 @@ The model selector supports:
 - Anthropic.
 - Custom OpenAI-compatible providers with a configurable base URL.
 
-Jev uses a separate TypeSafe API key and the System One decision endpoint. Enable it in the sidebar to let it participate in the Advisor Council even when the main model provider is the local rule engine. With a valid, supported Jev decision, the council skips the final prose model call to reduce response time. See [README.md](README.md#optional-jev-live-decision) for the decision rules and limits.
+Jev uses a separate TypeSafe API key. Open **Settings** in the upper right to enable it. The analysis workspace supports observation, thesis review and research: Jev evaluates direction and the next reasoning step in one typed batch, and an optional explanation model runs only when needed. Model settings, news context, time budget and raw evidence are available without crowding the main workflow. See [README.md](README.md#jev-scenario-controller) and [scenario design](docs/jev-scenario-design.md) for the exact policy, evaluation and limits.
+
 
 ## Symbol Examples
 
