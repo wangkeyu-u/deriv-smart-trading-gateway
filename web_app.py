@@ -77,7 +77,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "local_data"
 DB_PATH = DATA_DIR / "gateway.sqlite3"
 AGENT_PROMPTS_PATH = APP_DIR / "agent_prompts.json"
-LOCAL_TZ = ZoneInfo("Asia/Kuala_Lumpur")
+LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
 I18N = {
     "zh": {
@@ -1025,6 +1025,29 @@ def load_recent_advisor_runs(limit: int = 3) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def load_advisor_run(run_id: int) -> dict[str, Any] | None:
+    init_local_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT result_json FROM advisor_runs WHERE id = ?", (run_id,)).fetchone()
+    if not row:
+        return None
+    try:
+        result = json.loads(row[0])
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return result if isinstance(result, dict) else None
+
+
+def display_snapshot_time(value: Any) -> str:
+    try:
+        stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            return "—"
+        return stamp.astimezone(LOCAL_TZ).strftime("%m-%d %H:%M:%S")
+    except (TypeError, ValueError, OverflowError):
+        return "—"
+
+
 SYSTEM_PROMPT = """
 你是 Deriv Smart Trading Gateway 的中文自动交易执行智能体。你的任务是把用户自然语言转换成严格 JSON，并优先支持交易执行闭环。
 只能输出 JSON，不要输出 Markdown。
@@ -1286,12 +1309,15 @@ def init_state() -> None:
         "sync_version": 0,
         "chart_snapshots": [],
         "direct_prompt_nonce": 0,
-        "advisor_prompt_nonce": 0,
         "advisor_time_budget": 10,
         "jev_enabled": bool(os.environ.get("TYPESAFE_API_KEY")),
         "jev_api_key": os.environ.get("TYPESAFE_API_KEY", ""),
         "jev_model": JEV_MODEL,
         "advisor_scene": "observe",
+        "advisor_question": "",
+        "advisor_thesis": "CALL",
+        "advisor_symbol_choice": st.session_state.get("advisor_symbol", DEFAULT_SYMBOL) if st.session_state.get("advisor_symbol", DEFAULT_SYMBOL) in COMMON_DERIV_SYMBOLS else "custom",
+        "advisor_custom_symbol": st.session_state.get("advisor_symbol", DEFAULT_SYMBOL),
         "advisor_use_web": True,
         "advisor_symbol": DEFAULT_SYMBOL,
         "advisor_runs": [],
@@ -1378,10 +1404,20 @@ def render_history() -> None:
     rows = load_recent_advisor_runs(10)
     if not rows:
         st.caption("分析完成后，结论与依据会保存在这里。" if zh else "Completed analyses and evidence will appear here.")
-    for row in rows:
-        with st.expander(f"{row['symbol']} · {row['created_at'][:16]}"):
-            st.caption(row["question"])
-            st.write(row["consensus"])
+    if rows:
+        by_id = {row["id"]: row for row in rows}
+        selected = st.selectbox(
+            "选择分析记录" if zh else "Analysis record", list(by_id),
+            format_func=lambda run_id: f"{by_id[run_id]['symbol']} · {display_snapshot_time(by_id[run_id]['created_at'])} · {by_id[run_id]['question'][:32]}",
+        )
+        result = load_advisor_run(selected)
+        if result is not None:
+            st.caption(result.get("question") or by_id[selected]["question"])
+            st.button("复用问题与参数" if zh else "Reuse question and settings", icon=":material/refresh:", on_click=restore_advisor_inputs, args=(result,))
+            render_advisor_result(result, historical=True, key_prefix=f"history_{selected}")
+        else:
+            st.write(by_id[selected]["consensus"])
+            st.caption("这条记录的详情无法读取。" if zh else "Details for this record are unavailable.")
     with st.expander("交易与指令记录" if zh else "Orders and commands"):
         for row in load_recent_runs(10):
             st.caption(f"#{row['id']} · {row['created_at'][:16]}")
@@ -2050,6 +2086,7 @@ def advisor_synthesis_with_jev(
     *, jev_enabled: bool | None = None, jev_api_key: str | None = None,
     llm_config: dict[str, str] | None = None, scene: str = "observe", thesis: str = "",
     jev_model: str = JEV_MODEL,
+    progress: Callable[[str], None] | None = None,
 ) -> tuple[str | None, dict[str, Any], dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
     if jev_enabled is None:
         jev_enabled = bool(st.session_state.get("jev_enabled")) if in_streamlit_runtime() else False
@@ -2058,11 +2095,16 @@ def advisor_synthesis_with_jev(
     deadline = started_at + budget
     state = build_state(question, symbol, market, sources, scene, thesis, deadline - time.perf_counter())
     assessment = MarketAssessment(None, "disabled")
+    if progress:
+        progress("Progress -> assessment_start")
     if not state["evidence"]["tick_current"]:
         assessment = MarketAssessment(None, "no_current_tick")
     elif jev_enabled:
         assessment = assess_market(state, jev_api_key, deadline_at=deadline, model=jev_model)
     decision = decide(state, assessment, str(local_consensus["stance"]), enabled=bool(jev_enabled))
+    if progress:
+        participant = "jev" if assessment.source == "jev" else "path"
+        progress(f"Progress -> {participant}_{decision['requested_path']}")
     reason = reason_text(decision["reason"])
     suffix = ""
     consensus = {**local_consensus, "stance": decision["stance"], "summary": f"{reason}；{reason_text(decision['direction_reason'])}；结论 {decision['stance']}。" + suffix, "decision_state": state}
@@ -2080,8 +2122,12 @@ def advisor_synthesis_with_jev(
         elif not llm_config or llm_config.get("provider") == "本地规则" or not llm_config.get("api_key"):
             explanation_status, mode = "not_configured", "wait"
         else:
+            if progress:
+                progress("Progress -> explanation_start")
             summary = advisor_llm_synthesis(question, symbol, market, sources, enriched, consensus, remaining, llm_config)
             explanation_status = "completed" if summary else "failed_or_timed_out"
+            if progress:
+                progress("Progress -> explanation_done")
             if not summary:
                 mode = "wait"
         # Uncompleted review/research must not look like an accepted directional answer.
@@ -2135,13 +2181,13 @@ def advisor_runtime_config() -> dict[str, Any]:
     }
 
 
-def advisor_synthesis_node(state: AdvisorGraphState, runtime: dict[str, Any]) -> dict[str, Any]:
+def advisor_synthesis_node(state: AdvisorGraphState, runtime: dict[str, Any], progress: Callable[[str], None] | None = None) -> dict[str, Any]:
     started = time.perf_counter()
     opinions, sources, market = list(state.get("opinions") or []), list(state.get("sources") or []), dict(state.get("market") or {})
     local = consensus_from_opinions(opinions, market, sources)
     summary, route, assessment, consensus, enriched = advisor_synthesis_with_jev(
         str(state["question"]), str(state["symbol"]), market, sources, opinions, local,
-        float(state["started_at"]), int(state["budget"]), scene=str(state.get("scene") or "observe"), thesis=str(state.get("thesis") or ""), **runtime,
+        float(state["started_at"]), int(state["budget"]), scene=str(state.get("scene") or "observe"), thesis=str(state.get("thesis") or ""), progress=progress, **runtime,
     )
     return {"local_consensus": local, "consensus": consensus["summary"], "model_summary": summary or "", "stance": consensus["stance"], "confidence": local["confidence"], "vote_counts": local["vote_counts"], "thinking_route": route, "jev_assessment": assessment, "opinions": enriched[len(opinions):], "logs": [f"Jev -> {route['reason_text']}; actual path={route['mode']}"], "stages": [{"stage": "jev", "elapsed_ms": assessment["latency_ms"], "status": assessment["error_code"] or assessment["source"]}, {"stage": "explanation", "elapsed_ms": route["explanation_ms"], "status": route["explanation_status"]}, {"stage": "decision_total", "elapsed_ms": round((time.perf_counter() - started) * 1000, 1), "status": route["mode"]}]}
 
@@ -2169,12 +2215,17 @@ def build_advisor_langgraph(runtime: dict[str, Any] | None = None) -> Any:
     def news_signal_node(state: AdvisorGraphState) -> dict[str, Any]:
         return {"news_signal": {"label": "context_only" if instrument_profile(str(state["symbol"]))["news_applicable"] else "not_applicable", "source_count": len(state.get("sources") or [])}}
 
+    def synthesis_node(state: AdvisorGraphState) -> dict[str, Any]:
+        from langgraph.config import get_stream_writer
+        emit = get_stream_writer()
+        return advisor_synthesis_node(state, runtime, lambda message: emit({"kind": "analysis_progress", "message": message}))
+
     graph.add_node("web_research", web_research_node)
     graph.add_node("market_snapshot", market_snapshot_node)
     graph.add_node("news_signal", news_signal_node)
     for advisor in advisor_specs():
         graph.add_node(advisor_node_name(advisor["id"]), make_langgraph_advisor_node(advisor))
-    graph.add_node("synthesize", lambda state: advisor_synthesis_node(state, runtime))
+    graph.add_node("synthesize", synthesis_node)
     graph.add_edge(START, "web_research")
     graph.add_edge(START, "market_snapshot")
     graph.add_edge("web_research", "news_signal")
@@ -2197,7 +2248,11 @@ def run_advisor_langgraph(
     initial: AdvisorGraphState = {"question": question, "symbol": symbol, "budget": budget, "use_web": use_web, "language": current_lang(), "scene": scene, "thesis": thesis, "started_at": started_at if started_at is not None else time.perf_counter(), "opinions": [], "logs": [], "stages": []}
     combined = dict(initial)
     try:
-        for updates in app.stream(initial, stream_mode="updates"):
+        for stream_kind, updates in app.stream(initial, stream_mode=["updates", "custom"]):
+            if stream_kind == "custom":
+                if writer and updates.get("kind") == "analysis_progress":
+                    writer(str(updates["message"]))
+                continue
             for update in updates.values():
                 for key, value in update.items():
                     combined[key] = combined.get(key, []) + value if key in {"logs", "opinions", "stages"} else value
@@ -2239,7 +2294,7 @@ def run_advisor_council(
         signal = {"label": "context_only" if instrument_profile(symbol)["news_applicable"] else "not_applicable"}
         opinions = [local_advisor_opinion(advisor, question, market, sources, signal) for advisor in advisor_specs()]
         graph_state = {"question": question, "symbol": symbol, "budget": budget, "started_at": started, "scene": scene, "thesis": thesis, "sources": sources, "market": market, "news_signal": signal, "opinions": opinions, "stages": []}
-        update = advisor_synthesis_node(graph_state, runtime)
+        update = advisor_synthesis_node(graph_state, runtime, writer)
         graph_state.update({**update, "opinions": opinions + update["opinions"]})
     market = dict(graph_state.get("market") or {})
     persist_advisor_market_state(market)
@@ -4682,7 +4737,7 @@ def render_direct_dispatch() -> None:
     st.session_state.direct_prompt_nonce += 1
 
 
-def render_advisor_result(result: dict[str, Any]) -> None:
+def render_advisor_result(result: dict[str, Any], *, historical: bool = False, key_prefix: str = "analysis") -> None:
     zh = current_lang() == "zh"
     market = result.get("market") or {}
     evidence = result.get("evidence") or {}
@@ -4694,10 +4749,14 @@ def render_advisor_result(result: dict[str, Any]) -> None:
     tick = market.get("tick") or {}
     quote = tick.get("quote")
     price = f"{quote:,.5f}".rstrip("0").rstrip(".") if type(quote) in (int, float) and math.isfinite(quote) else "—"
-    status = ("数据有效" if zh else "Valid data") if evidence.get("status") == "ready" else ("证据待补全" if zh else "Incomplete evidence")
-    facts = [("最新报价" if zh else "Latest price", price), ("窗口走势" if zh else "Observed trend", trends.get(evidence.get("trend"), "—")), ("行情状态" if zh else "Evidence", status)]
+    status = ("当时有效" if zh else "Valid at analysis") if evidence.get("status") == "ready" else ("当时证据不足" if zh else "Incomplete at analysis")
+    facts = [("快照报价" if zh else "Snapshot price", price), ("窗口走势" if zh else "Observed trend", trends.get(evidence.get("trend"), "—")), ("证据状态" if zh else "Evidence", status)]
     scene = SCENES.get(str(result.get("scene")), ("分析", "Analysis"))[0 if zh else 1]
     st.markdown(f'<section class="result-surface" aria-label="Analysis result"><div class="result-topline"><span>{html.escape(str(result.get("symbol") or ""))} · {scene}</span><span>{float(result.get("elapsed_ms") or 0) / 1000:.1f}s</span></div><div class="result-title">{titles.get(stance, titles["WAIT"])}<span class="result-code">{html.escape(stance)}</span></div><p class="result-description">{html.escape(str(result.get("consensus") or ""))}</p><div class="result-facts">' + ''.join(f'<div class="result-fact"><span>{label}</span><strong>{html.escape(value)}</strong></div>' for label, value in facts) + '</div></section>', unsafe_allow_html=True)
+    snapshot_label = "历史快照" if historical else "分析快照"
+    if not zh:
+        snapshot_label = "Historical snapshot" if historical else "Analysis snapshot"
+    st.caption(f"{snapshot_label} · {display_snapshot_time(result.get('created_at'))} (UTC+8) · " + ("再次分析会重新读取行情。" if zh else "Run again to fetch fresh market data."))
     paths = {"finish": "完成观察", "deep": "深入解释", "wait": "等待补充"} if zh else {"finish": "Finish", "deep": "Explain", "wait": "Wait"}
     path = paths.get(route.get("mode"), "—")
     participant = ("Jev 判断" if zh else "Jev decision") if jev.get("source") == "jev" else ("本地检查" if zh else "Local checks")
@@ -4724,6 +4783,10 @@ def render_advisor_result(result: dict[str, Any]) -> None:
         st.write(reason_text(str(route.get("reason") or "graph_error"), current_lang()))
         if jev.get("source") == "jev":
             st.caption(f"Jev {jev.get('model')} · {jev.get('latency_ms', 0):.0f} ms · {jev.get('prompt_version')}")
+            if jev.get("path_probabilities"):
+                st.write("**Jev 如何选择思考路径**" if zh else "**How Jev chose the reasoning path**")
+                st.dataframe([{"路径" if zh else "Path": paths.get(k, k), "选项概率" if zh else "Probability": v} for k, v in jev["path_probabilities"].items()], hide_index=True, width="stretch")
+                st.caption(f"Path confidence: {jev.get('path_confidence')} · " + ("实际路径：" if zh else "Actual path: ") + path)
             st.dataframe([{"判断" if zh else "Choice": k, "选项概率" if zh else "Probability": v} for k,v in (jev.get("probabilities") or {}).items()], hide_index=True, width="stretch")
         else:
             st.caption(("Jev：" if zh else "Jev: ") + reason_text(str(jev.get("source") or "disabled"), current_lang()))
@@ -4739,20 +4802,58 @@ def render_advisor_result(result: dict[str, Any]) -> None:
             st.dataframe([{k: item.get(k) for k in ("title", "source", "published", "url")} for item in result["sources"]], hide_index=True, width="stretch", column_config={"url": st.column_config.LinkColumn("来源" if zh else "Source")})
     with st.expander("完整记录与下载" if zh else "Full record & export", expanded=False):
         st.json({"evidence": evidence, "route": route, "jev": jev})
-        st.download_button("下载 JSON" if zh else "Download JSON", data=json.dumps(result, ensure_ascii=False, indent=2, default=str).encode(), file_name=f"analysis-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json", mime="application/json", icon=":material/download:")
+        st.download_button("下载 JSON" if zh else "Download JSON", data=json.dumps(result, ensure_ascii=False, indent=2, default=str).encode(), file_name=f"{key_prefix}.json", mime="application/json", icon=":material/download:", key=f"{key_prefix}_download")
+
+
+ADVISOR_INPUT_KEYS = {
+    "advisor_scene_choice": "advisor_scene",
+    "_advisor_symbol_choice": "advisor_symbol_choice",
+    "_advisor_custom_symbol": "advisor_custom_symbol",
+    "_advisor_question": "advisor_question",
+    "_advisor_thesis": "advisor_thesis",
+    "_advisor_budget": "advisor_time_budget",
+    "_advisor_news": "advisor_use_web",
+}
+
+
+def remember_advisor_inputs() -> None:
+    for widget_key, saved_key in ADVISOR_INPUT_KEYS.items():
+        if widget_key in st.session_state:
+            st.session_state[saved_key] = st.session_state[widget_key]
+
+
+def restore_advisor_inputs(result: dict[str, Any]) -> None:
+    symbol = normalize_deriv_symbol(str(result.get("symbol") or DEFAULT_SYMBOL))
+    st.session_state.update(
+        advisor_question=str(result.get("question") or ""),
+        advisor_scene=result.get("scene") if result.get("scene") in SCENES else "observe",
+        advisor_thesis=result.get("thesis") if result.get("thesis") in {"CALL", "PUT"} else "CALL",
+        advisor_symbol=symbol,
+        advisor_symbol_choice=symbol if symbol in COMMON_DERIV_SYMBOLS else "custom",
+        advisor_custom_symbol=symbol,
+        advisor_use_web=bool(result.get("requested_web")),
+        last_advisor_result=result,
+        workspace_section="analysis",
+    )
+    budget = result.get("time_budget_seconds")
+    st.session_state.advisor_time_budget = max(4, min(budget, 25)) if type(budget) is int else 10
+    # This callback runs before the next page render, so controls can be seeded safely.
+    for widget_key in ADVISOR_INPUT_KEYS:
+        st.session_state.pop(widget_key, None)
 
 
 def render_advisor_council() -> None:
     zh = current_lang() == "zh"
     st.markdown('<div class="page-heading"><h2>' + ("市场分析" if zh else "Market analysis") + '</h2><p>' + ("从当前行情出发，得到可检查的结论。" if zh else "Start with current market evidence. Get a result you can inspect.") + '</p></div>', unsafe_allow_html=True)
+    for widget_key, saved_key in ADVISOR_INPUT_KEYS.items():
+        st.session_state[widget_key] = st.session_state[saved_key]
     scene_col, symbol_col = st.columns([2, 1])
     with scene_col:
         labels = {"observe": "快速看盘", "review": "复核想法", "research": "深入研究"} if zh else {"observe": "Observe", "review": "Review", "research": "Research"}
-        scene = st.segmented_control("分析方式" if zh else "Analysis mode", list(SCENES), format_func=labels.get, default="observe", key="advisor_scene_choice", selection_mode="single", width="stretch") or "observe"
-    current_symbol = normalize_deriv_symbol(str(st.session_state.advisor_symbol))
-    options = COMMON_DERIV_SYMBOLS + ["自定义" if zh else "Custom"]
-    selected = symbol_col.selectbox("交易品种" if zh else "Instrument", options, index=options.index(current_symbol) if current_symbol in options else len(options) - 1)
-    chosen = st.text_input("自定义品种" if zh else "Custom instrument", value=current_symbol, placeholder="R_75 / BOOM1000 / frxEURUSD") if selected == options[-1] else selected
+        scene = st.segmented_control("分析方式" if zh else "Analysis mode", list(SCENES), format_func=labels.get, key="advisor_scene_choice", selection_mode="single", width="stretch", on_change=remember_advisor_inputs) or "observe"
+    options = COMMON_DERIV_SYMBOLS + ["custom"]
+    selected = symbol_col.selectbox("交易品种" if zh else "Instrument", options, key="_advisor_symbol_choice", format_func=lambda value: ("自定义" if zh else "Custom") if value == "custom" else value, on_change=remember_advisor_inputs)
+    chosen = st.text_input("自定义品种" if zh else "Custom instrument", key="_advisor_custom_symbol", placeholder="R_75 / BOOM1000 / frxEURUSD", on_change=remember_advisor_inputs) if selected == "custom" else selected
     symbol = normalize_deriv_symbol(chosen.strip())
     st.session_state.advisor_scene = scene
     applicable_news = instrument_profile(symbol)["news_applicable"]
@@ -4761,15 +4862,18 @@ def render_advisor_council() -> None:
         "review": ("写下你的交易想法与理由，例如：均线向上，我认为本轮走势偏多。", "Describe your thesis and why you think the observations support it."),
         "research": ("想深入了解什么？例如：当前判断有哪些假设与矛盾？", "What would you like to investigate? Which assumptions or conflicts matter?"),
     }
-    with st.form("advisor_council_form", border=False):
-        question = st.text_area("分析问题" if zh else "Your question", key=f"advisor_question_{st.session_state.advisor_prompt_nonce}", height=110, placeholder=placeholders[scene][0 if zh else 1])
-        thesis = st.radio("你的预期方向" if zh else "Your expected direction", ["CALL", "PUT"], format_func=lambda value: {"CALL": "看涨 · CALL", "PUT": "看跌 · PUT"}[value] if zh else value, horizontal=True) if scene == "review" else ""
+    with st.container(border=False):
+        question = st.text_area("分析问题" if zh else "Your question", key="_advisor_question", height=110, placeholder=placeholders[scene][0 if zh else 1], on_change=remember_advisor_inputs)
+        thesis = st.radio("你的预期方向" if zh else "Your expected direction", ["CALL", "PUT"], key="_advisor_thesis", format_func=lambda value: {"CALL": "看涨 · CALL", "PUT": "看跌 · PUT"}[value] if zh else value, horizontal=True, on_change=remember_advisor_inputs) if scene == "review" else ""
         with st.expander("分析选项" if zh else "Analysis options", expanded=False):
-            budget = st.slider("思考时间上限（秒）" if zh else "Time budget (seconds)", min_value=4, max_value=25, value=int(st.session_state.advisor_time_budget), step=1)
-            use_web = st.toggle("加入近期新闻背景" if zh else "Include recent news context", value=bool(st.session_state.advisor_use_web) and applicable_news, disabled=not applicable_news)
+            budget = st.slider("思考时间上限（秒）" if zh else "Time budget (seconds)", min_value=4, max_value=25, key="_advisor_budget", step=1, on_change=remember_advisor_inputs)
+            if applicable_news:
+                use_web = st.toggle("加入近期新闻背景" if zh else "Include recent news context", key="_advisor_news", on_change=remember_advisor_inputs)
+            else:
+                use_web = False
             if not applicable_news:
                 st.caption("此品种不使用外部新闻推断价格，自动跳过新闻请求。" if zh else "This instrument does not use external news as a price signal. News is skipped.")
-        submitted = st.form_submit_button("开始分析" if zh else "Run analysis", type="primary", icon=":material/arrow_forward:", width="stretch")
+        submitted = st.button("开始分析" if zh else "Run analysis", type="primary", icon=":material/arrow_forward:", width="stretch")
     st.caption("分析不会提交订单。" if zh else "Analysis does not place orders.")
     if submitted:
         question = question.strip()
@@ -4781,11 +4885,30 @@ def render_advisor_council() -> None:
             return
         st.session_state.advisor_symbol = symbol
         st.session_state.advisor_time_budget = int(budget)
-        st.session_state.advisor_use_web = bool(use_web)
+        remember_advisor_inputs()
         with st.status("正在读取行情并分析…" if zh else "Reading market data…", expanded=False) as status:
-            result = run_advisor_council(question, symbol, int(budget), bool(use_web), st.write, scene=scene, thesis=thesis)
+            def show_progress(line: str) -> None:
+                phases = {
+                    "assessment_start": ("正在核对行情证据与思考路径…", "Checking market evidence and reasoning path…"),
+                    "jev_finish": ("Jev 复核完成，正在生成简短结论…", "Jev review complete. Preparing a concise result…"),
+                    "jev_deep": ("Jev 复核完成，本轮需要深入解释…", "Jev review complete. Further explanation is needed…"),
+                    "jev_wait": ("Jev 复核完成，本轮需要补充证据…", "Jev review complete. More evidence is needed…"),
+                    "path_finish": ("依据检查完成，正在整理结论…", "Evidence checks complete. Preparing result…"),
+                    "path_deep": ("本轮需要进一步解释…", "Further explanation is needed…"),
+                    "path_wait": ("本轮需要补充证据…", "More evidence is needed…"),
+                    "explanation_start": ("解释模型正在分析，本轮仍受时间上限约束…", "Explanation model running within this run's time budget…"),
+                    "explanation_done": ("解释调用已返回，正在检查结果…", "Explanation call returned. Checking result…"),
+                }
+                if line.startswith("Progress -> "):
+                    label = phases.get(line.removeprefix("Progress -> "))
+                    if label:
+                        status.update(label=label[0 if zh else 1])
+                elif line.startswith("Market ->"):
+                    status.update(label="行情已返回，正在检查依据与思考路径…" if zh else "Market response received. Checking evidence and reasoning path…")
+                elif line.startswith("Jev ->"):
+                    status.update(label="正在整理结论与记录…" if zh else "Preparing result and record…")
+            result = run_advisor_council(question, symbol, int(budget), bool(use_web), show_progress, scene=scene, thesis=thesis)
             status.update(label=("分析完成" if result["status"] == "completed" else "已返回 · 仍需补充证据或解释") if zh else ("Complete" if result["status"] == "completed" else "Returned · more evidence or explanation needed"), state="complete" if result["ok"] else "error", expanded=False)
-        st.session_state.advisor_prompt_nonce += 1
         render_advisor_result(result)
     elif st.session_state.get("last_advisor_result"):
         render_advisor_result(st.session_state.last_advisor_result)

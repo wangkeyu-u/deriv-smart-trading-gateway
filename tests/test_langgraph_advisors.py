@@ -152,3 +152,34 @@ def test_fallback_uses_original_deadline(monkeypatch):
     assert result["runtime"] == "local_fallback"
     assert len(seen) == 1
     assert result["stance"] == "WAIT"
+
+
+def test_jev_path_reaches_ui_thread_before_explanation_finishes(monkeypatch):
+    from evals.scenarios import snapshot, response
+    import jev_router
+    progress_received = threading.Event()
+    ui_thread = threading.get_ident()
+    messages = []
+    callback_threads = []
+    monkeypatch.setattr(web_app, "advisor_runtime_config", lambda: {
+        "jev_enabled": True, "jev_api_key": "fixture-key", "jev_model": "jev-1.13.0",
+        "llm_config": {"provider": "OpenAI", "api_key": "fixture-explanation-key", "model": "fixture"},
+    })
+    monkeypatch.setattr(web_app, "advisor_market_snapshot", lambda *a, **k: snapshot())
+    monkeypatch.setattr(jev_router, "_request", lambda *a, **k: response(path="deep"))
+    def explain(*a, **k):
+        assert progress_received.wait(2), "UI did not receive progress while explanation was still running"
+        return "Fixture explanation"
+    def writer(message):
+        messages.append(message)
+        callback_threads.append(threading.get_ident())
+        if message == "Progress -> explanation_start":
+            progress_received.set()
+    monkeypatch.setattr(web_app, "advisor_llm_synthesis", explain)
+    result = web_app.run_advisor_langgraph("explain the window", "frxEURUSD", 6, False, writer)
+    assert result is not None and not result.get("graph_error")
+    assert result["model_summary"] == "Fixture explanation"
+    assert messages.index("Progress -> jev_deep") < messages.index("Progress -> explanation_start") < messages.index("Progress -> explanation_done")
+    assert set(callback_threads) == {ui_thread}
+    assert "fixture-key" not in str(result) + str(messages)
+    assert "fixture-explanation-key" not in str(result) + str(messages)

@@ -24,6 +24,8 @@ System sans, PingFang SC / Microsoft YaHei for Chinese. Body 15–16px; section 
 
 Maximum content width 1160px. Compact brand/settings header; four workspace links. Analysis presents scenario and symbol, question, one submit action, then the latest result. Optional budget/news controls are collapsed. Settings use an explicit header popover; history belongs to Records.
 
+Draft question, custom instrument, review direction and budget persist across workspace changes. Results label prices as snapshots with an explicit UTC+8 timestamp. History shows one selected saved result, its evidence and export; reusing inputs returns to Analysis and waits for an explicit submit.
+
 ## Components
 
 8px form/button radius; 12px primary result surface. Native Streamlit widgets share colors, focus ring and 42px interaction height. Selected segments have a blue-tinted background and clear text. Disabled controls remain recognizable. No nested decorative cards. Results prioritize stance, reason, price and observed direction; rule vote shares and raw traces are secondary.
