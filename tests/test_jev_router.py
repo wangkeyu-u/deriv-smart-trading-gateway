@@ -39,7 +39,7 @@ def test_batch_contract_and_model_version(monkeypatch):
 @pytest.mark.parametrize("bad", [True, "0.94", float("nan"), float("inf"), -0.2, 1.1])
 def test_non_numeric_or_out_of_range_probabilities_rejected(monkeypatch, bad):
     body = response()
-    body["answers"]["market_stance"]["probabilities"]["CALL"] = bad
+    body["answers"]["market_stance"]["probabilities"]["UP"] = bad
     monkeypatch.setattr(jev_router, "_request", lambda *args: body)
     result = jev_router.assess_market({}, "key", deadline_at=time.perf_counter() + 5)
     assert result.source == "jev_error"
@@ -53,9 +53,9 @@ def test_partial_and_inconsistent_batch_never_accepts_stance(monkeypatch, mutati
     if mutation == "missing_path":
         del body["answers"]["reasoning_path"]
     elif mutation == "wrong_choice":
-        body["answers"]["market_stance"]["choice"] = "PUT"
+        body["answers"]["market_stance"]["choice"] = "DOWN"
     elif mutation == "probability_sum":
-        body["answers"]["market_stance"]["probabilities"]["PUT"] = .4
+        body["answers"]["market_stance"]["probabilities"]["DOWN"] = .4
     elif mutation == "missing_model":
         del body["model"]
     else:

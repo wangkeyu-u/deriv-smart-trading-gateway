@@ -6,10 +6,25 @@ Run:
 
 from __future__ import annotations
 
+from decimal import Decimal
+from uuid import uuid4
+from domain.risk import TradingState
+from domain.order import OrderStatus
+from domain.trade import TradeIntent
+from persistence.database import Database, resolve_database_path
+from persistence.repositories import OrderRepository
+from services.trading_service import trading_application, TradingService
+from services.context import ExecutionContext, current_context, use_context
+from services.analysis_service import build_evidence_checks
+from ai.manager import DRAFT_TOOL, propose_trade_intent, call_model, call_read_model
+
+from domain.market import ObservedTrend, EvidenceCheck, legacy_observation
+
 import asyncio
 import base64
 import concurrent.futures
 import html
+import hashlib
 import operator
 import os
 import json
@@ -35,7 +50,7 @@ from advisory_policy import SCENES, build_state, decide, instrument_profile, mar
 from server import (
     check_account_status,
     close_open_contract,
-    execute_simulated_trade,
+    place_contract,
     get_open_contract_status,
     get_historical_candles,
     get_market_ticks,
@@ -44,7 +59,7 @@ from server import (
 
 
 Provider = Literal["本地规则", "OpenAI", "DeepSeek", "Anthropic", "OpenAI-Compatible"]
-Action = Literal["get_market_ticks", "get_historical_candles", "execute_simulated_trade", "chat"]
+Action = Literal["get_market_ticks", "get_historical_candles", "place_contract", "chat"]
 
 DEFAULT_SYMBOL = "R_100"
 DEFAULT_GRANULARITY = 60
@@ -75,7 +90,8 @@ COMMON_DERIV_SYMBOLS = [
 ]
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "local_data"
-DB_PATH = DATA_DIR / "gateway.sqlite3"
+DB_PATH = resolve_database_path(os.getenv("DERIV_DB_PATH") or DATA_DIR / "gateway.sqlite3")
+DATA_DIR = DB_PATH.parent
 AGENT_PROMPTS_PATH = APP_DIR / "agent_prompts.json"
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
@@ -87,7 +103,7 @@ I18N = {
         "security": "安全密钥配置",
         "execution_safety": "交易安全闸门",
         "require_trade_confirmation": "下单前需要人工确认",
-        "confirm_next_trade": "我确认下一笔模拟盘订单",
+        "confirm_next_trade": "我确认以上账户与订单参数",
         "allow_live_execution": "允许 live 账户执行交易",
         "pending_trade": "待确认交易",
         "deriv_token": "Deriv API Token",
@@ -403,6 +419,8 @@ class TeamRunResult:
     ok: bool = True
     agent_reports: dict[str, Any] | None = None
     thinking_route: dict[str, Any] | None = None
+    request_id: str = ""
+    correlation_id: str = ""
 
 
 AGENT_SPECS: dict[str, dict[str, str]] = {
@@ -604,7 +622,7 @@ def default_agent_prompts() -> dict[str, dict[str, str]]:
         },
         "advisor.chief": {
             "name": "首席谋士",
-            "prompt": "你汇总所有谋士观点，只输出一个短线结论：CALL、PUT 或 WAIT；必须包含置信度、执行前提和失效条件。",
+            "prompt": "汇总确定性检查与历史观察为 UP/DOWN/FLAT/UNKNOWN，说明缺失证据；不生成交易信号。",
         },
     }
 
@@ -876,7 +894,7 @@ def agent_state_fallback(agent_id: str) -> str:
 
 
 def init_local_db() -> None:
-    DATA_DIR.mkdir(exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
@@ -922,6 +940,11 @@ def init_local_db() -> None:
             )
             """
         )
+    with sqlite3.connect(DB_PATH) as conn:
+        if 'order_id' not in {row[1] for row in conn.execute('PRAGMA table_info(trade_receipts)')}:
+            conn.execute('ALTER TABLE trade_receipts ADD COLUMN order_id TEXT')
+        conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS receipt_order_unique ON trade_receipts(order_id)')
+
 
 
 def save_team_run(user_prompt: str, result: TeamRunResult) -> None:
@@ -951,16 +974,17 @@ def save_team_run(user_prompt: str, result: TeamRunResult) -> None:
             ),
         )
         receipt = (result.execution_report or {}).get("receipt") or {}
-        if receipt:
+        order_id = (result.execution_report or {}).get("order_id")
+        if receipt and order_id:
             conn.execute(
                 """
-                INSERT INTO trade_receipts (
-                    created_at, contract_id, symbol, contract_type, amount,
+                INSERT OR IGNORE INTO trade_receipts (
+                    order_id, created_at, contract_id, symbol, contract_type, amount,
                     purchase_price, currency, receipt_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    datetime.now(timezone.utc).isoformat(),
+                    order_id, datetime.now(timezone.utc).isoformat(),
                     str(receipt.get("contract_id") or ""),
                     str(receipt.get("symbol") or ""),
                     str(receipt.get("contract_type") or ""),
@@ -1048,98 +1072,9 @@ def display_snapshot_time(value: Any) -> str:
         return "—"
 
 
-SYSTEM_PROMPT = """
-你是 Deriv Smart Trading Gateway 的中文自动交易执行智能体。你的任务是把用户自然语言转换成严格 JSON，并优先支持交易执行闭环。
-只能输出 JSON，不要输出 Markdown。
-
-可用 action:
-1. get_market_ticks: 获取最新 tick
-   params: {"symbol": "R_100", "subscribe": false}
-2. get_historical_candles: 获取 K 线
-   params: {"symbol": "R_100", "granularity": 60, "count": 60}
-3. execute_simulated_trade: 执行模拟交易
-   params: {
-     "symbol": "R_100",
-     "amount": 10.0,
-     "contract_type": "CALL",
-     "duration": 5,
-     "duration_unit": "m",
-     "condition": null,
-     "market_read": "tick",
-     "auto_execute": true
-   }
-4. chat: 普通解释或澄清
-   params: {}
-
-Deriv symbol 示例:
-- R_100 表示 Volatility 100 Index
-- R_75 表示 Volatility 75 Index
-- frxEURUSD 表示 EUR/USD
-
-中文映射:
-- K线、蜡烛图、历史走势、1分钟K、5分钟K、1小时K -> get_historical_candles
-- 最新价、行情、报价、tick -> get_market_ticks
-- 购买、下单、建仓、开仓、买入、买涨、做多、看涨、上涨、CALL -> execute_simulated_trade contract_type CALL
-- 买跌、做空、看跌、下跌、PUT -> execute_simulated_trade contract_type PUT
-- 平仓：当前只允许通过 execute_simulated_trade 提交新的模拟合约，不能真正 sell/close 现有合约；如果用户没有说明方向，action=chat 要求补充 CALL 或 PUT。
-- 1分钟=60, 5分钟=300, 1小时=3600
-- 如果用户说“如果/当/高于/低于/突破/跌破/大于/小于 ... 就下单”，必须把条件写入 condition:
-  {"metric": "latest_tick", "operator": ">", "value": 350.0}
-- 条件支持 latest_tick 的 >, >=, <, <=。条件下单也必须 action=execute_simulated_trade，后台会先读取行情再判断，再自动触发下单。
-
-交易执行要求:
-- 用户出现“购买/下单/建仓/开仓/买入/平仓/做多/做空/买涨/买跌”等写操作意图时，必须优先尝试输出 execute_simulated_trade。
-- 如果缺少 symbol，默认 R_100。
-- 如果缺少 duration_unit，默认 m。
-- 如果用户有交易意图但缺少 duration，经理默认使用 duration=5, duration_unit=t，并在总结里说明。
-- 如果缺少 amount、contract_type，action=chat 并说明缺哪个字段。
-- 不要把交易意图降级成 get_market_ticks。
-返回格式:
-{
-  "action": "execute_simulated_trade",
-  "params": {
-    "symbol": "R_100",
-    "amount": 10.0,
-    "contract_type": "CALL",
-    "duration": 5,
-    "duration_unit": "m",
-    "condition": {"metric": "latest_tick", "operator": ">", "value": 350.0},
-    "market_read": "tick",
-    "auto_execute": true
-  },
-  "rationale": "用户要求条件满足后自动买涨"
-}
-""".strip()
-
-MANAGER_SYSTEM_PROMPT = """
-你是【交易经理 Trading Manager】，一个精通风控和团队调配的资深交易经理。
-你直接对接人类用户，但你绝不能直接调用 Deriv 底层 API。你只能通过管理工具派活：
-
-1. assign_task_to_market_agent
-   派给【行情分析师】。用于抓取 tick/K线、判断趋势、检查连续下跌/上涨等市场条件。
-
-2. assign_task_to_execution_agent
-   派给【风控执行员】。用于检查账户、执行模拟盘订单、返回订单回执。
-3. assign_task_to_strategy_agent
-   派给【策略研究员】。用于拆解交易目标、提出观察窗口、定义任务链。
-4. assign_task_to_risk_agent
-   派给【风控官】。用于检查账户、Token 和金额边界。
-5. assign_task_to_compliance_agent
-   派给【合规审查员】。用于阻止含糊、高风险或未授权操作。
-6. assign_task_to_chart_agent
-   派给【图表工程师】。用于生成 K 线快照、多图表和数据导出。
-7. assign_task_to_report_agent
-   派给【报告员】。用于整理本轮时间线和复盘摘要。
-
-工作原则：
-- 用户有交易、购买、下单、建仓、开仓、平仓、买涨、买跌、做多、做空等意图时，必须先派行情分析师读取必要行情，再根据结果决定是否派执行员。
-- 对复杂目标，先派策略研究员拆解，再派行情、风控、合规、执行、报告。
-- 如果用户给出条件，例如“连续三个 Tick 都在跌”“高于 350 再买”，先派行情分析师验证条件。
-- 如果条件满足且交易参数完整，先派风控官和合规审查员，再派执行交易员执行模拟盘订单。
-- 如果缺少 amount、contract_type、duration 等关键字段，要向用户说明缺什么。
-- 你需要最终用简明中文总结：经理如何拆解任务、员工反馈、是否执行交易、订单结果。
-- 不要输出隐藏推理，只输出可审计的行动摘要。
-""".strip()
+SYSTEM_PROMPT = """只返回只读 JSON 计划，action 为 get_market_ticks/get_historical_candles/chat，参数放在 params。
+资金意图不能在这里生成执行计划；交易必须通过 TradeIntentDraft、明确确认和确定性执行服务。
+不要输出隐藏推理或账户密钥。"""
 
 MANAGER_TOOLS: list[dict[str, Any]] = [
     {
@@ -1161,26 +1096,6 @@ MANAGER_TOOLS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["task", "symbol"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "assign_task_to_execution_agent",
-            "description": "派风控执行员检查账户并执行 Deriv 模拟盘订单。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "task": {"type": "string", "description": "经理给执行员的中文任务说明。"},
-                    "symbol": {"type": "string", "description": "Deriv symbol，例如 R_100。"},
-                    "amount": {"type": "number", "exclusiveMinimum": 0},
-                    "contract_type": {"type": "string", "enum": ["CALL", "PUT"]},
-                    "duration": {"type": "integer", "minimum": 1},
-                    "duration_unit": {"type": "string", "enum": ["m", "h", "t"]},
-                    "risk_note": {"type": "string", "description": "经理给执行员的风控边界。"},
-                },
-                "required": ["task", "symbol", "amount", "contract_type", "duration", "duration_unit"],
             },
         },
     },
@@ -1265,6 +1180,10 @@ MANAGER_TOOLS: list[dict[str, Any]] = [
 ]
 
 
+MANAGER_TOOLS = MANAGER_TOOLS + [DRAFT_TOOL]
+MANAGER_SYSTEM_PROMPT = """你是只读交易意图助手。可以读取行情、图表和报告。涉及资金时只输出 propose_trade_intent，金额是 Decimal 字符串，然后立即结束。不能规划账户授权、proposal、buy、sell、重试、审批或风控。真实执行由固定程序与用户确认完成。不要输出隐藏推理。"""
+
+
 def manager_system_prompt() -> str:
     prompts = load_agent_prompts()
     prompt_lines = []
@@ -1315,7 +1234,7 @@ def init_state() -> None:
         "jev_model": JEV_MODEL,
         "advisor_scene": "observe",
         "advisor_question": "",
-        "advisor_thesis": "CALL",
+        "advisor_thesis": "UP",
         "advisor_symbol_choice": st.session_state.get("advisor_symbol", DEFAULT_SYMBOL) if st.session_state.get("advisor_symbol", DEFAULT_SYMBOL) in COMMON_DERIV_SYMBOLS else "custom",
         "advisor_custom_symbol": st.session_state.get("advisor_symbol", DEFAULT_SYMBOL),
         "advisor_use_web": True,
@@ -1384,15 +1303,71 @@ def render_settings() -> None:
 
 def render_trade_controls() -> None:
     zh = current_lang() == "zh"
+    review_repo=OrderRepository(Database(DB_PATH))
+    review_orders=review_repo.list(statuses={OrderStatus.APPROVAL_REQUIRED,OrderStatus.APPROVED,OrderStatus.UNKNOWN})
+    if review_orders and not st.session_state.pending_trade:
+        selected=st.selectbox("恢复订单 / MCP 草稿" if zh else "Saved orders / MCP drafts",[o.order_id for o in review_orders])
+        if st.button("核对这笔订单" if zh else "Review this order"):
+            order=review_repo.get(selected); intent=review_repo.intent(order.intent_id)
+            st.session_state.allow_live_execution=intent.account_mode=='live'
+            st.session_state.pending_trade={'action':'close_open_contract' if intent.action=='SELL' else 'place_contract',
+                'symbol':intent.symbol,'amount':float(intent.amount),'contract_type':intent.direction.value if intent.direction else None,
+                'duration':intent.duration,'duration_unit':intent.duration_unit,'contract_id':intent.contract_id,
+                'allow_live':intent.account_mode=='live','intent_id':intent.intent_id,
+                'credential_id':hashlib.sha256(st.session_state.deriv_token.encode()).hexdigest()}
+            st.session_state.confirm_next_trade=False
+            st.rerun()
     pending = st.session_state.pending_trade
     if pending:
         with st.container(border=True):
             st.subheader(t("pending_trade"))
             st.json(pending)
             st.session_state.confirm_next_trade = st.checkbox(t("confirm_next_trade"), value=bool(st.session_state.confirm_next_trade))
-            st.caption("确认仅适用于以上参数；勾选后重新发送相同交易指令。" if zh else "Confirmation applies only to these parameters. Resend the same order after confirming.")
+            st.caption("确认绑定以上参数；模型不会参与提交步骤。" if zh else "Confirmation binds these parameters. Submission is deterministic.")
+            if st.button("确认并提交" if zh else "Confirm and submit", disabled=not st.session_state.confirm_next_trade):
+                report=execution_agent(task='SELL' if pending['action']=='close_open_contract' else 'BUY',
+                    symbol=pending['symbol'],amount=pending['amount'],contract_type=pending.get('contract_type') or '',
+                    duration=pending['duration'],duration_unit=pending['duration_unit'],contract_id=pending.get('contract_id'),events=[])
+                st.session_state.last_trade_receipt=report
+                save_team_run('用户确认并提交',TeamRunResult(str(report.get('status') or report.get('reason')),[],execution_report=report,ok=report.get('ok',False)))
+                st.write(f"{report.get('status') or report.get('reason')}")
+    repo = OrderRepository(Database(DB_PATH))
+    with repo.db.transaction() as conn:
+        current_state = conn.execute('SELECT state FROM trading_control WHERE singleton=1').fetchone()[0]
+    def change_trading_state():
+        TradingService(Database(DB_PATH),None).set_trading_state(TradingState(st.session_state['_trading_state']))
+    st.session_state['_trading_state']=current_state
+    st.selectbox("执行状态" if zh else "Execution state",[s.value for s in TradingState],key='_trading_state',on_change=change_trading_state)
+    if st.button("停止所有新买入" if zh else "Halt new buys", type="secondary"):
+        TradingService(Database(DB_PATH),None).set_trading_state(TradingState.HALTED)
+        st.rerun()
+    if pending and pending.get('intent_id'):
+        order=repo.by_intent(pending['intent_id'])
+        if order:
+            st.caption(f"Order {order.order_id}: {order.status.value}")
+            if order.status==OrderStatus.UNKNOWN and st.button("只读对账" if zh else "Reconcile by reading"):
+                try:
+                    service=trading_application(st.session_state.deriv_token,source='streamlit',db_path=DB_PATH)
+                    run_async(service.reconcile_order(order.order_id))
+                    st.rerun()
+                except Exception as exc:
+                    st.info(type(exc).__name__)
+            if order.status==OrderStatus.UNKNOWN:
+                with st.expander("核对经纪商记录" if zh else "Match broker record"):
+                    cid=st.number_input("确认对应的 contract_id",min_value=1,step=1)
+                    if st.button("绑定合约并只读对账" if zh else "Bind contract and reconcile"):
+                        try:
+                            service=trading_application(st.session_state.deriv_token,source='streamlit',db_path=DB_PATH)
+                            run_async(service.bind_reconciliation_contract(order.order_id,int(cid)))
+                            st.rerun()
+                        except Exception as exc:
+                            st.info(type(exc).__name__)
     with st.expander("交易设置" if zh else "Order settings", expanded=False):
-        st.session_state.require_trade_confirmation = st.toggle(t("require_trade_confirmation"), value=bool(st.session_state.require_trade_confirmation))
+        st.caption("每个订单都需要持久化的参数确认。" if zh else "Every order requires persistent parameter-bound approval.")
+        if st.button("新建另一笔订单" if zh else "Start another order"):
+            st.session_state.pending_trade = None
+            st.session_state.confirm_next_trade = False
+            st.rerun()
         st.session_state.allow_live_execution = st.checkbox(t("allow_live_execution"), value=bool(st.session_state.allow_live_execution))
         if not st.session_state.deriv_token:
             st.caption("交易前请在右上角设置中连接 Deriv 账户。" if zh else "Connect a Deriv account in Settings before placing an order.")
@@ -1459,72 +1434,31 @@ def make_plan(user_text: str) -> ToolPlan:
     return local_rule_plan(user_text)
 
 
-def plan_with_openai_compatible(user_text: str, provider: Provider) -> ToolPlan | None:
-    try:
-        from openai import OpenAI
-
-        base_url = OPENAI_COMPATIBLE_BASE_URLS.get(provider)
-        if provider == "OpenAI-Compatible":
-            base_url = st.session_state.custom_base_url.strip() or None
-            if not base_url:
-                st.warning(
-                    "请先填写 OpenAI-Compatible 的 Base URL，已切换本地规则。"
-                    if current_lang() == "zh"
-                    else "Please enter an OpenAI-Compatible Base URL. Falling back to local rules."
-                )
-                return None
-
-        client_kwargs = {"api_key": st.session_state.llm_api_key}
-        if base_url:
-            client_kwargs["base_url"] = base_url
-        client = OpenAI(**client_kwargs)
-
-        request: dict[str, Any] = {
-            "model": st.session_state.llm_model,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_text},
-            ],
-            "temperature": 0.1,
-        }
-        if provider in {"OpenAI", "DeepSeek"}:
-            request["response_format"] = {"type": "json_object"}
-
-        response = client.chat.completions.create(**request)
-        content = response.choices[0].message.content or ""
-        data = extract_json_object(content)
-        return normalize_plan(data) if data else None
-    except Exception as exc:
-        if current_lang() == "zh":
-            st.warning(f"{provider} 规划失败，已切换本地规则：{exc}")
-        else:
-            st.warning(f"{provider} planning failed. Falling back to local rules: {exc}")
+def read_only_model_plan(user_text,provider):
+    if has_trade_intent(user_text) or has_close_intent(user_text):
         return None
+    seconds=current_context().remaining_time if current_context() else 15
+    base_url=OPENAI_COMPATIBLE_BASE_URLS.get(provider)
+    if provider=='OpenAI-Compatible':
+        base_url=st.session_state.custom_base_url.strip() or None
+        if not base_url: return None
+    try:
+        content=run_bounded(call_read_model(provider,st.session_state.llm_api_key,st.session_state.llm_model,
+            user_text,SYSTEM_PROMPT,seconds,base_url),seconds)
+        data=extract_json_object(content)
+        if not data or data.get('action') not in {'get_market_ticks','get_historical_candles','chat'}:
+            return None
+        return normalize_plan(data)
+    except Exception:
+        return None
+
+
+def plan_with_openai_compatible(user_text: str,provider: Provider) -> ToolPlan | None:
+    return read_only_model_plan(user_text,provider)
 
 
 def plan_with_anthropic(user_text: str) -> ToolPlan | None:
-    try:
-        from anthropic import Anthropic
-
-        client = Anthropic(api_key=st.session_state.llm_api_key)
-        response = client.messages.create(
-            model=st.session_state.llm_model,
-            max_tokens=700,
-            temperature=0.1,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_text}],
-        )
-        content = "\n".join(
-            block.text for block in response.content if getattr(block, "type", None) == "text"
-        )
-        data = extract_json_object(content)
-        return normalize_plan(data) if data else None
-    except Exception as exc:
-        if current_lang() == "zh":
-            st.warning(f"Anthropic 规划失败，已切换本地规则：{exc}")
-        else:
-            st.warning(f"Anthropic planning failed. Falling back to local rules: {exc}")
-        return None
+    return read_only_model_plan(user_text,'Anthropic')
 
 
 def normalize_plan(data: dict[str, Any]) -> ToolPlan:
@@ -1532,7 +1466,7 @@ def normalize_plan(data: dict[str, Any]) -> ToolPlan:
     if action not in {
         "get_market_ticks",
         "get_historical_candles",
-        "execute_simulated_trade",
+        "place_contract",
         "chat",
     }:
         action = "chat"
@@ -1549,7 +1483,7 @@ def normalize_plan(data: dict[str, Any]) -> ToolPlan:
             "granularity": int(params.get("granularity") or DEFAULT_GRANULARITY),
             "count": min(max(int(params.get("count") or DEFAULT_COUNT), 1), 1000),
         }
-    elif action == "execute_simulated_trade":
+    elif action == "place_contract":
         raw_condition = params.get("condition")
         condition = normalize_condition(raw_condition) if raw_condition else None
         duration = int(params.get("duration") or 0)
@@ -1604,7 +1538,9 @@ def local_rule_plan(user_text: str) -> ToolPlan:
             duration_unit = "t"
         contract_type = extract_contract_type(user_text)
         missing = []
-        if amount <= 0:
+        if has_close_intent(user_text) and not extract_contract_id(user_text):
+            missing.append("contract_id")
+        if amount <= 0 and not has_close_intent(user_text):
             missing.append("amount/金额")
         if not contract_type:
             missing.append("contract_type/方向 CALL 或 PUT")
@@ -1615,7 +1551,7 @@ def local_rule_plan(user_text: str) -> ToolPlan:
                 rationale=f"交易指令缺少 {', '.join(missing)}。",
             )
         return ToolPlan(
-            action="execute_simulated_trade",
+            action="place_contract",
             params={
                 "symbol": symbol,
                 "amount": amount,
@@ -1679,12 +1615,11 @@ def has_trade_intent(text: str) -> bool:
 
 
 def extract_contract_type(text: str) -> str:
-    lowered = text.lower()
-    if any(word in text for word in ["买跌", "看跌", "做空", "下跌"]) or "put" in lowered:
-        return "PUT"
-    if any(word in text for word in ["买涨", "看涨", "做多", "上涨", "购买", "买入", "下单", "建仓", "开仓", "平仓"]) or "call" in lowered:
-        return "CALL"
-    return ""
+    call=bool(re.search(r'\bcall\b',text,re.IGNORECASE)) or any(word in text for word in ['买涨','看涨','做多','上涨'])
+    put=bool(re.search(r'\bput\b',text,re.IGNORECASE)) or any(word in text for word in ['买跌','看跌','做空','下跌'])
+    if call==put:
+        return ''
+    return 'CALL' if call else 'PUT'
 
 
 def normalize_deriv_symbol(symbol: str) -> str:
@@ -1862,7 +1797,7 @@ def collect_advisor_web_context(
 ) -> list[dict[str, str]]:
     if not use_web or not instrument_profile(symbol)["news_applicable"]:
         return []
-    started = time.perf_counter()
+    started = time.monotonic()
     queries = build_advisor_queries(question, symbol)
     web_deadline = max(1.0, min(float(time_budget_seconds) * 0.35, 3.0))
     per_query_timeout = max(0.8, min(1.4, web_deadline / max(len(queries), 1) + 0.4))
@@ -1889,14 +1824,14 @@ def collect_advisor_web_context(
                         item["query"] = futures[future]
                         sources.append(item)
                         seen.add(key)
-                if len(sources) >= 8 or (time.perf_counter() - started) > web_deadline:
+                if len(sources) >= 8 or (time.monotonic() - started) > web_deadline:
                     break
         except concurrent.futures.TimeoutError:
             pass
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
     if writer:
-        writer(f"Web research -> {len(sources)} sources within {time.perf_counter() - started:.1f}s")
+        writer(f"Web research -> {len(sources)} sources within {time.monotonic() - started:.1f}s")
     return sources[:8]
 
 
@@ -1915,7 +1850,7 @@ def advisor_market_snapshot(
         "get_market_ticks",
         lambda: get_market_ticks(symbol, False),
         {"symbol": symbol, "subscribe": False, "advisor": True},
-        min(deadline_at, time.perf_counter() + 2.5),
+        min(deadline_at, time.monotonic() + 2.5),
         writer,
         trace_api=trace_api,
     )
@@ -1925,13 +1860,13 @@ def advisor_market_snapshot(
         if persist_state and in_streamlit_runtime():
             st.session_state.last_tick = tick_result
 
-    remaining = deadline_at - time.perf_counter()
+    remaining = deadline_at - time.monotonic()
     if tick_result.get("ok") and remaining > 0.8:
         candle_result = call_deriv_tool_before_deadline(
             "get_historical_candles",
             lambda: get_historical_candles(symbol, 60, 60),
             {"symbol": symbol, "granularity": 60, "count": 60, "advisor": True},
-            min(deadline_at, time.perf_counter() + 3.0),
+            min(deadline_at, time.monotonic() + 3.0),
             writer,
             trace_api=trace_api,
         )
@@ -1959,12 +1894,16 @@ def persist_advisor_market_state(market: dict[str, Any]) -> None:
         st.session_state.last_candles = candle_result
 
 
+def evidence_checks(market, symbol, sources=()):
+    return [check.model_dump(mode='json') for check in build_evidence_checks(market,symbol,sources)]
+
+
 def stance_from_market_and_news(market: dict[str, Any], news_signal: dict[str, Any]) -> str:
     symbol = str(market.get("symbol") or "")
     evidence = market_evidence(market, symbol)
     if evidence["status"] != "ready" or not instrument_profile(symbol)["directional_interpretation_allowed"]:
-        return "WAIT"
-    return {"up": "CALL", "down": "PUT"}.get(evidence["trend"], "WAIT")
+        return ObservedTrend.UNKNOWN
+    return ObservedTrend(evidence["trend"])
 
 
 def local_advisor_opinion(
@@ -1986,7 +1925,7 @@ def local_advisor_opinion(
         rationale = "检查报价与 K 线时间、连续性和缺失数据；历史走势只描述本轮观察。"
         invalidation = "最新 Tick 反向突破或连续三根反向波动。"
     elif advisor_id == "contrarian":
-        stance = "WAIT"
+        stance = ObservedTrend.UNKNOWN
         rationale = "反方视角：短线共识可能已经被价格吸收，必须等下一根确认。"
         invalidation = "下一轮有效行情需要重新检查，不能沿用本轮结论。"
     elif advisor_id == "quant":
@@ -1994,7 +1933,7 @@ def local_advisor_opinion(
         rationale = f"量化视角看 {market.get('summary')}；趋势不干净就不追。"
         invalidation = "MA5/MA20 关系反转，或最新价跌回本轮窗口中位。"
     elif advisor_id == "macro":
-        stance = "WAIT"
+        stance = ObservedTrend.UNKNOWN
         rationale = f"新闻只作背景，已筛选来源={source_count} 条；合成指数不使用外部新闻推断价格方向。"
         invalidation = "出现新的高影响消息或相关新闻标题方向反转。"
     else:
@@ -2006,33 +1945,22 @@ def local_advisor_opinion(
         "name": advisor_name(advisor, lang),
         "role": advisor_role(advisor, lang),
         "prompt": prompt,
-        "stance": stance,
+        "stance": "WAIT", "observed_trend": stance,
+        "check": EvidenceCheck(name=advisor_id,status=stance,reason=rationale).model_dump(mode="json"),
         "rationale": rationale,
         "invalidation": invalidation,
         "question": question,
     }
 
 
-def consensus_from_opinions(opinions: list[dict[str, Any]], market: dict[str, Any], sources: list[dict[str, str]]) -> dict[str, Any]:
-    votes = [str(item.get("stance") or "WAIT") for item in opinions]
-    counts = {stance: votes.count(stance) for stance in {"CALL", "PUT", "WAIT"}}
-    winner = "WAIT" if not market.get("tick") and not market.get("candles") else max(
-        ("WAIT", "CALL", "PUT"), key=lambda stance: counts[stance]
-    )
-    # This is agreement among deterministic rules, not a forecast probability.
-    support = counts[winner] / max(len(votes), 1) if market.get("tick") or market.get("candles") else 0.0
-    if winner == "CALL":
-        summary = "本地规则偏向看涨，只供交易前复核。"
-    elif winner == "PUT":
-        summary = "本地规则偏向看跌，只供交易前复核。"
-    else:
-        summary = "本地规则建议等待，当前信息不足以支持短线立即出手。"
-    return {
-        "stance": winner,
-        "summary": summary,
-        "confidence": round(support, 3),
-        "vote_counts": counts,
-    }
+def consensus_from_opinions(opinions, market, sources):
+    observed=stance_from_market_and_news(market,{})
+    checks=[item.get('check') or {'status':item.get('observed_trend','UNKNOWN')} for item in opinions]
+    counts={trend.value:sum(check['status']==trend.value for check in checks) for trend in ObservedTrend}
+    agreement=counts[observed.value]/max(len(checks),1)
+    # Counts remain a legacy display field, never a decision input or independent-agent majority.
+    return {'stance':'WAIT','observed_trend':observed.value,'summary':f'窗口观察 {observed.value}；没有交易信号。',
+            'confidence':round(agreement,3),'check_counts':counts,'vote_counts':counts}
 
 
 def advisor_llm_synthesis(
@@ -2093,7 +2021,7 @@ def advisor_synthesis_with_jev(
     if jev_api_key is None:
         jev_api_key = str(st.session_state.get("jev_api_key") or "") if in_streamlit_runtime() else ""
     deadline = started_at + budget
-    state = build_state(question, symbol, market, sources, scene, thesis, deadline - time.perf_counter())
+    state = build_state(question, symbol, market, sources, scene, thesis, deadline - time.monotonic())
     assessment = MarketAssessment(None, "disabled")
     if progress:
         progress("Progress -> assessment_start")
@@ -2101,21 +2029,21 @@ def advisor_synthesis_with_jev(
         assessment = MarketAssessment(None, "no_current_tick")
     elif jev_enabled:
         assessment = assess_market(state, jev_api_key, deadline_at=deadline, model=jev_model)
-    decision = decide(state, assessment, str(local_consensus["stance"]), enabled=bool(jev_enabled))
+    decision = decide(state, assessment, str(local_consensus.get("observed_trend") or "UNKNOWN"), enabled=bool(jev_enabled))
     if progress:
         participant = "jev" if assessment.source == "jev" else "path"
         progress(f"Progress -> {participant}_{decision['requested_path']}")
     reason = reason_text(decision["reason"])
     suffix = ""
-    consensus = {**local_consensus, "stance": decision["stance"], "summary": f"{reason}；{reason_text(decision['direction_reason'])}；结论 {decision['stance']}。" + suffix, "decision_state": state}
+    consensus = {**local_consensus, "stance": "WAIT", "observed_trend": decision["observed_trend"], "summary": f"{reason}；{reason_text(decision['direction_reason'])}；结论 {decision['stance']}。" + suffix, "decision_state": state}
     enriched = list(opinions)
     if assessment.source == "jev":
-        enriched.append({"advisor_id": "jev", "name": "Jev", "role": "场景与思考路径复核", "prompt": assessment.prompt_version, "stance": assessment.stance, "rationale": f"观察={assessment.stance}；下一步={assessment.reasoning_path}；想法复核={assessment.thesis_status or '未要求'}", "invalidation": "行情过期或本轮证据发生变化时重新运行。", "question": question})
-    remaining = deadline - time.perf_counter()
+        enriched.append({"advisor_id": "jev", "name": "Jev", "role": "场景与思考路径复核", "prompt": assessment.prompt_version, "stance": "WAIT", "observed_trend": assessment.stance, "rationale": f"观察={assessment.stance}；下一步={assessment.reasoning_path}；想法复核={assessment.thesis_status or '未要求'}", "invalidation": "行情过期或本轮证据发生变化时重新运行。", "question": question})
+    remaining = deadline - time.monotonic()
     summary = None
     mode = decision["requested_path"]
     explanation_status = "not_requested"
-    explanation_started = time.perf_counter()
+    explanation_started = time.monotonic()
     if mode == "deep":
         if remaining < 2.5:
             explanation_status, mode = "budget_exhausted", "wait"
@@ -2134,11 +2062,11 @@ def advisor_synthesis_with_jev(
         if mode == "wait":
             consensus["stance"] = "WAIT"
             consensus["summary"] = f"{reason}；深入解释未完成（{explanation_status}），结论 WAIT。" + suffix
-    if time.perf_counter() >= deadline or not tick_is_current(market):
+    if time.monotonic() >= deadline or not tick_is_current(market):
         mode, consensus["stance"] = "wait", "WAIT"
-        decision["reason"] = "deadline" if time.perf_counter() >= deadline else "no_current_tick"
+        decision["reason"] = "deadline" if time.monotonic() >= deadline else "no_current_tick"
         consensus["summary"] = reason_text(decision["reason"]) + "；结论 WAIT。"
-    route = {**decision, "mode": mode, "source": assessment.source, "reason_text": reason_text(decision["reason"]), "explanation_status": explanation_status, "latency_ms": assessment.latency_ms, "explanation_ms": round((time.perf_counter() - explanation_started) * 1000, 1), "evidence": state["evidence"], "decision_state": state}
+    route = {**decision, "mode": mode, "source": assessment.source, "reason_text": reason_text(decision["reason"]), "explanation_status": explanation_status, "latency_ms": assessment.latency_ms, "explanation_ms": round((time.monotonic() - explanation_started) * 1000, 1), "evidence": state["evidence"], "decision_state": state}
     route["stance"] = consensus["stance"]
     return summary, route, assessment.as_dict(), consensus, enriched
 
@@ -2182,14 +2110,14 @@ def advisor_runtime_config() -> dict[str, Any]:
 
 
 def advisor_synthesis_node(state: AdvisorGraphState, runtime: dict[str, Any], progress: Callable[[str], None] | None = None) -> dict[str, Any]:
-    started = time.perf_counter()
+    started = time.monotonic()
     opinions, sources, market = list(state.get("opinions") or []), list(state.get("sources") or []), dict(state.get("market") or {})
     local = consensus_from_opinions(opinions, market, sources)
     summary, route, assessment, consensus, enriched = advisor_synthesis_with_jev(
         str(state["question"]), str(state["symbol"]), market, sources, opinions, local,
         float(state["started_at"]), int(state["budget"]), scene=str(state.get("scene") or "observe"), thesis=str(state.get("thesis") or ""), progress=progress, **runtime,
     )
-    return {"local_consensus": local, "consensus": consensus["summary"], "model_summary": summary or "", "stance": consensus["stance"], "confidence": local["confidence"], "vote_counts": local["vote_counts"], "thinking_route": route, "jev_assessment": assessment, "opinions": enriched[len(opinions):], "logs": [f"Jev -> {route['reason_text']}; actual path={route['mode']}"], "stages": [{"stage": "jev", "elapsed_ms": assessment["latency_ms"], "status": assessment["error_code"] or assessment["source"]}, {"stage": "explanation", "elapsed_ms": route["explanation_ms"], "status": route["explanation_status"]}, {"stage": "decision_total", "elapsed_ms": round((time.perf_counter() - started) * 1000, 1), "status": route["mode"]}]}
+    return {"local_consensus": local, "consensus": consensus["summary"], "model_summary": summary or "", "stance": consensus["stance"], "confidence": local["confidence"], "vote_counts": local["vote_counts"], "thinking_route": route, "jev_assessment": assessment, "opinions": enriched[len(opinions):], "logs": [f"Jev -> {route['reason_text']}; actual path={route['mode']}"], "stages": [{"stage": "jev", "elapsed_ms": assessment["latency_ms"], "status": assessment["error_code"] or assessment["source"]}, {"stage": "explanation", "elapsed_ms": route["explanation_ms"], "status": route["explanation_status"]}, {"stage": "decision_total", "elapsed_ms": round((time.monotonic() - started) * 1000, 1), "status": route["mode"]}]}
 
 
 def build_advisor_langgraph(runtime: dict[str, Any] | None = None) -> Any:
@@ -2199,18 +2127,18 @@ def build_advisor_langgraph(runtime: dict[str, Any] | None = None) -> Any:
     graph = StateGraph(AdvisorGraphState)
 
     def web_research_node(state: AdvisorGraphState) -> dict[str, Any]:
-        started = time.perf_counter()
+        started = time.monotonic()
         remaining = max(0, float(state["started_at"]) + int(state["budget"]) - started)
         requested = bool(state["use_web"]) and instrument_profile(str(state["symbol"]))["news_applicable"] and remaining >= 1
         sources = collect_advisor_web_context(str(state["question"]), str(state["symbol"]), min(int(state["budget"]), remaining), requested, None) if requested else []
         sources = relevant_news(sources, str(state["symbol"]))
-        return {"sources": sources, "logs": [f"News -> {len(sources)} fresh sources"], "stages": [{"stage": "news", "elapsed_ms": round((time.perf_counter() - started) * 1000, 1), "status": "completed" if sources else "empty" if requested else "skipped"}]}
+        return {"sources": sources, "logs": [f"News -> {len(sources)} fresh sources"], "stages": [{"stage": "news", "elapsed_ms": round((time.monotonic() - started) * 1000, 1), "status": "completed" if sources else "empty" if requested else "skipped"}]}
 
     def market_snapshot_node(state: AdvisorGraphState) -> dict[str, Any]:
-        started = time.perf_counter()
+        started = time.monotonic()
         market_budget = max(1, int(state["budget"]) - (1.4 if runtime.get("jev_enabled") else 0))
         market = advisor_market_snapshot(str(state["symbol"]), float(state["started_at"]), market_budget, None, persist_state=False, trace_api=False)
-        return {"market": market, "logs": [f"Market -> {market.get('summary', 'no market data')}"], "stages": [{"stage": "market", "elapsed_ms": round((time.perf_counter() - started) * 1000, 1), "status": market_evidence(market, str(state["symbol"]))["status"]}]}
+        return {"market": market, "logs": [f"Market -> {market.get('summary', 'no market data')}"], "stages": [{"stage": "market", "elapsed_ms": round((time.monotonic() - started) * 1000, 1), "status": market_evidence(market, str(state["symbol"]))["status"]}]}
 
     def news_signal_node(state: AdvisorGraphState) -> dict[str, Any]:
         return {"news_signal": {"label": "context_only" if instrument_profile(str(state["symbol"]))["news_applicable"] else "not_applicable", "source_count": len(state.get("sources") or [])}}
@@ -2245,7 +2173,7 @@ def run_advisor_langgraph(
         app = build_advisor_langgraph(advisor_runtime_config())
     except ImportError:
         return None  # Only an absent dependency may select the local runner.
-    initial: AdvisorGraphState = {"question": question, "symbol": symbol, "budget": budget, "use_web": use_web, "language": current_lang(), "scene": scene, "thesis": thesis, "started_at": started_at if started_at is not None else time.perf_counter(), "opinions": [], "logs": [], "stages": []}
+    initial: AdvisorGraphState = {"question": question, "symbol": symbol, "budget": budget, "use_web": use_web, "language": current_lang(), "scene": scene, "thesis": thesis, "started_at": started_at if started_at is not None else time.monotonic(), "opinions": [], "logs": [], "stages": []}
     combined = dict(initial)
     try:
         for stream_kind, updates in app.stream(initial, stream_mode=["updates", "custom"]):
@@ -2273,12 +2201,15 @@ def run_advisor_council(
     question: str, symbol: str, time_budget_seconds: int, use_web: bool,
     writer: Callable[[str], None] | None = None, *, scene: str = "observe", thesis: str = "",
 ) -> dict[str, Any]:
-    started = time.perf_counter()
+    started = time.monotonic()
     budget = max(4, min(int(time_budget_seconds), 25))
+    context = ExecutionContext("streamlit",budget,monotonic_start=started)
     if scene not in SCENES:
         raise ValueError("unknown advisory scenario")
-    if scene == "review" and thesis not in {"CALL", "PUT"}:
-        raise ValueError("review requires an explicit CALL or PUT thesis")
+    if scene == "review" and thesis not in {"UP", "DOWN", "CALL", "PUT"}:
+        raise ValueError("review requires an explicit UP or DOWN thesis")
+    if thesis in {"CALL","PUT"}:
+        thesis=legacy_observation(thesis).value
     if writer:
         writer(f"{SCENES[scene][0]} · {symbol} · {budget}s")
     graph_state = run_advisor_langgraph(question, symbol, budget, use_web, writer, started_at=started, scene=scene, thesis=thesis)
@@ -2289,7 +2220,7 @@ def run_advisor_council(
         market_budget = max(1, budget - (1.4 if runtime.get("jev_enabled") else 0))
         market = advisor_market_snapshot(symbol, started, market_budget, writer)
         # Fallback spends the same deadline, never a new budget.
-        remaining = started + budget - time.perf_counter()
+        remaining = started + budget - time.monotonic()
         sources = relevant_news(collect_advisor_web_context(question, symbol, min(budget, remaining), use_web and remaining >= 1, writer), symbol)
         signal = {"label": "context_only" if instrument_profile(symbol)["news_applicable"] else "not_applicable"}
         opinions = [local_advisor_opinion(advisor, question, market, sources, signal) for advisor in advisor_specs()]
@@ -2301,19 +2232,19 @@ def run_advisor_council(
     sources = list(graph_state.get("sources") or [])
     route = dict(graph_state.get("thinking_route") or {})
     evidence = market_evidence(market, symbol)
-    elapsed_ms = (time.perf_counter() - started) * 1000
+    elapsed_ms = (time.monotonic() - started) * 1000
     stance = str(graph_state.get("stance") or "WAIT")
     if evidence["status"] != "ready" or elapsed_ms >= budget * 1000:
         stance = "WAIT"
     result = {
         "ok": not bool(graph_state.get("graph_error")), "status": "error" if graph_state.get("graph_error") else "incomplete" if evidence["status"] != "ready" or route.get("mode") == "wait" else "completed",
-        "question": question, "symbol": symbol, "scene": scene, "thesis": thesis if scene == "review" else None,
+        "request_id": context.request_id, "correlation_id": context.request_id, "question": question, "symbol": symbol, "scene": scene, "thesis": thesis if scene == "review" else None,
         "runtime": runtime_name, "time_budget_seconds": budget, "elapsed_ms": round(elapsed_ms, 1),
         "budget_exhausted": elapsed_ms >= budget * 1000, "used_web": bool(sources), "requested_web": bool(use_web),
         "news_policy": "dated_context_only" if instrument_profile(symbol)["news_applicable"] else "not_applicable",
         "source_count": len(sources), "sources": sources, "market": market, "news_signal": graph_state.get("news_signal") or {},
         "opinions": graph_state.get("opinions") or [], "consensus": graph_state.get("consensus") or "结论 WAIT。", "model_summary": graph_state.get("model_summary") or "",
-        "stance": stance, "confidence": graph_state.get("confidence", 0), "rule_agreement": graph_state.get("confidence", 0), "vote_counts": graph_state.get("vote_counts") or {},
+        "stance": "WAIT", "observed_trend": route.get("observed_trend", "UNKNOWN"), "checks": evidence_checks(market, symbol, sources), "confidence": graph_state.get("confidence", 0), "rule_agreement": graph_state.get("confidence", 0), "vote_counts": graph_state.get("vote_counts") or {},
         "thinking_route": route, "jev_assessment": graph_state.get("jev_assessment") or {}, "stages": graph_state.get("stages") or [], "evidence": evidence,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -2451,12 +2382,19 @@ def call_deriv_tool(
     writer: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     record_api_trace(tool_name, "START", params)
-    started = time.perf_counter()
+    started = time.monotonic()
     try:
-        result = parse_tool_response(run_async(coro))
+        context=current_context()
+        if context:
+            if context.remaining_time <= 0:
+                if hasattr(coro,'close'): coro.close()
+                raise TimeoutError('Request deadline exhausted')
+            result = parse_tool_response(run_bounded(coro, context.remaining_time))
+        else:
+            result = parse_tool_response(run_async(coro))
     except Exception as exc:
         result = {"ok": False, "error": {"message": str(exc)}}
-    elapsed = (time.perf_counter() - started) * 1000
+    elapsed = (time.monotonic() - started) * 1000
     record_api_trace(tool_name, "DONE" if result.get("ok") else "FAILED", params, result, elapsed)
     if writer:
         writer(
@@ -2475,7 +2413,7 @@ def call_deriv_tool_before_deadline(
     *,
     trace_api: bool = True,
 ) -> dict[str, Any]:
-    remaining = deadline_at - time.perf_counter()
+    remaining = deadline_at - time.monotonic()
     if remaining < 0.8:
         result = {"ok": False, "error": {"message": "advisor deadline reached before API call"}}
         if trace_api:
@@ -2486,14 +2424,14 @@ def call_deriv_tool_before_deadline(
 
     if trace_api:
         record_api_trace(tool_name, "START", params)
-    started = time.perf_counter()
+    started = time.monotonic()
     try:
         result = parse_tool_response(run_async(asyncio.wait_for(coro_factory(), timeout=remaining)))
     except TimeoutError:
         result = {"ok": False, "error": {"message": "advisor deadline reached during API call"}}
     except Exception as exc:
         result = {"ok": False, "error": {"message": str(exc)}}
-    elapsed = (time.perf_counter() - started) * 1000
+    elapsed = (time.monotonic() - started) * 1000
     if trace_api:
         record_api_trace(tool_name, "DONE" if result.get("ok") else "FAILED", params, result, elapsed)
     if writer:
@@ -2592,7 +2530,7 @@ def collect_market_ticks(
         st.session_state.last_tick = first
 
     attempts = 0
-    while len(ticks) < count and attempts < max(count, 3):
+    while len(ticks) < count and attempts < max(count, 3) and (not current_context() or current_context().remaining_time > 0):
         attempts += 1
         time.sleep(0.12)
         item = call_deriv_tool(
@@ -2864,202 +2802,54 @@ def report_agent(
     return report
 
 
-def execution_agent(
-    *,
-    task: str,
-    symbol: str,
-    amount: float,
-    contract_type: str,
-    duration: int,
-    duration_unit: str,
-    contract_id: int | None = None,
-    risk_note: str = "Use demo token and execute within user-specified parameters.",
-    events: list[AgentEvent],
-    writer: Callable[[str], None] | None = None,
-) -> dict[str, Any]:
-    append_team_event(
-        events,
-        "经理",
-        "执行交易员",
-        (
-            f"{task}；symbol={symbol}, amount={amount}, contract_type={contract_type}, "
-            f"duration={duration}{duration_unit}；风控边界：{risk_note}"
-        ),
-        writer,
-    )
+def execution_agent(*, task: str, symbol: str, amount: float, contract_type: str,
+                    duration: int, duration_unit: str, contract_id: int | None = None,
+                    risk_note: str = "", events: list[AgentEvent], writer=None, stage_only=False) -> dict[str, Any]:
     if not st.session_state.deriv_token:
-        report = {
-            "role": "Risk & Execution Agent",
-            "ok": False,
-            "status": "blocked",
-            "reason": "missing_deriv_api_token",
-        }
-        append_team_event(
-            events,
-            "执行交易员",
-            "经理",
-            "无法执行：尚未配置 Deriv API Token。请使用 demo token 后再下单。",
-            writer,
-        )
+        return {"ok":False,"reason":"missing_deriv_api_token"}
+    close = has_close_intent(task)
+    contract_id=contract_id or extract_contract_id(task)
+    if close and not contract_id:
+        return {"ok":False,"reason":"missing_contract_id_for_close"}
+    mode='live' if st.session_state.allow_live_execution else 'demo'
+    pending={"action":"close_open_contract" if close else "place_contract","symbol":symbol,
+        "amount":0.0 if close else float(amount),"contract_type":None if close else contract_type,
+        "duration":0 if close else int(duration),"duration_unit":duration_unit,"contract_id":contract_id,
+        "allow_live":bool(st.session_state.allow_live_execution),
+        "credential_id":hashlib.sha256(st.session_state.deriv_token.encode()).hexdigest()}
+    old=st.session_state.pending_trade or {}
+    same=all(old.get(k)==v for k,v in pending.items())
+    intent_id=old.get('intent_id') if same else str(uuid4())
+    pending['intent_id']=intent_id
+    service=trading_application(st.session_state.deriv_token,source='streamlit',db_path=DB_PATH,
+                                context=current_context() or ExecutionContext('streamlit'))
+    intent=TradeIntent(intent_id=intent_id,action='SELL' if close else 'BUY',symbol=symbol,
+        direction=None if close else contract_type,amount=Decimal(str(pending['amount'])),
+        duration=pending['duration'],duration_unit=duration_unit,contract_id=contract_id if close else None,
+        account_mode=mode,source='manager' if current_context() and current_context().source=='manager' else 'streamlit')
+    service.create_trade_intent(intent)
+    st.session_state.pending_trade=pending
+    existing=service.repo.by_intent(intent_id)
+    if existing and existing.status.value in {'SUBMITTING','ACKNOWLEDGED','OPEN','CLOSED','EXPIRED','UNKNOWN','RECONCILING','REJECTED','CANCELLED'}:
+        return {"ok":existing.status.value in {'OPEN','CLOSED','EXPIRED'},"status":existing.status.value,
+                "order_id":existing.order_id,"intent_id":intent_id,"receipt":existing.receipt,"reason":existing.status.value}
+    if stage_only or not same or not st.session_state.confirm_next_trade:
+        st.session_state.confirm_next_trade=False
+        return {"ok":False,"reason":"pending_human_confirmation","pending_trade":pending}
+    try:
+        order=run_async(service.confirm_and_execute(intent))
+        report={"ok":order.status.value in {'OPEN','CLOSED','EXPIRED'},"status":order.status.value,
+                "request_id":order.request_id,"correlation_id":order.correlation_id,"order_id":order.order_id,"intent_id":intent_id,"receipt":order.receipt,
+                "reason":order.last_error or order.status.value,"action":pending['action']}
+        st.session_state.last_trade_receipt=report
+        # Keep the logical intent until the user explicitly starts a new order, including UNKNOWN.
+        st.session_state.confirm_next_trade=False
+        remember_agent_report('execution',report)
+        append_team_event(events,'执行服务','用户',f"Order {order.order_id}: {order.status.value}",writer)
         return report
-
-    close_intent = has_close_intent(task)
-    contract_id = contract_id or extract_contract_id(task)
-    pending = {
-        "action": "close_open_contract" if close_intent else "execute_simulated_trade",
-        "symbol": symbol,
-        "amount": float(amount),
-        "contract_type": contract_type,
-        "duration": int(duration),
-        "duration_unit": duration_unit,
-        "contract_id": contract_id,
-        "allow_live": bool(st.session_state.allow_live_execution),
-    }
-    if st.session_state.require_trade_confirmation and (
-        st.session_state.pending_trade != pending or not st.session_state.confirm_next_trade
-    ):
-        st.session_state.pending_trade = pending
-        st.session_state.confirm_next_trade = False
-        report = {
-            "role": "Execution Trader",
-            "ok": False,
-            "status": "blocked",
-            "reason": "pending_human_confirmation",
-            "pending_trade": pending,
-        }
-        append_team_event(events, "执行交易员", "经理", "已拦截写操作：需要老板在侧边栏确认下一笔订单。", writer)
-        remember_agent_report("execution", report)
-        return report
-
-    account_result = call_deriv_tool(
-        "check_account_status",
-        check_account_status(st.session_state.deriv_token),
-        {"api_token": st.session_state.deriv_token},
-        writer,
-    )
-    account_ok = bool(account_result.get("ok"))
-    account_type = ((account_result.get("data") or {}).get("account_type") or "unknown")
-    if not account_ok or account_type not in {"demo", "live"}:
-        report = {
-            "role": "Execution Trader",
-            "ok": False,
-            "status": "blocked",
-            "reason": "account_authorization_unverified",
-        }
-        append_team_event(events, "执行交易员", "经理", "账户授权未验证，已阻止写操作。", writer)
-        remember_agent_report("execution", report)
-        return report
-    if account_type == "live" and not st.session_state.allow_live_execution:
-        report = {
-            "role": "Execution Trader",
-            "ok": False,
-            "status": "blocked",
-            "reason": "live_account_blocked",
-            "account": account_result.get("data"),
-        }
-        append_team_event(events, "执行交易员", "经理", "已拦截 live 账户写操作：默认只允许 demo token。", writer)
-        remember_agent_report("execution", report)
-        return report
-
-    if close_intent:
-        if not contract_id:
-            status_result = call_deriv_tool(
-                "get_open_contract_status",
-                get_open_contract_status(st.session_state.deriv_token, None),
-                {"api_token": st.session_state.deriv_token, "contract_id": None},
-                writer,
-            )
-            report = {
-                "role": "Execution Trader",
-                "ok": False,
-                "status": "blocked",
-                "reason": "missing_contract_id_for_close",
-                "account_checked": account_ok,
-                "account": account_result.get("data"),
-                "open_contract_status": status_result.get("data"),
-            }
-            append_team_event(events, "执行交易员", "经理", "平仓需要明确 contract_id。我已读取持仓状态供老板选择。", writer)
-            remember_agent_report("execution", report)
-            return report
-        receipt_result = call_deriv_tool(
-            "close_open_contract",
-            close_open_contract(
-                st.session_state.deriv_token,
-                contract_id,
-                0.0,
-                bool(st.session_state.allow_live_execution),
-            ),
-            {
-                "api_token": st.session_state.deriv_token,
-                "contract_id": contract_id,
-                "price": 0.0,
-                "allow_live": bool(st.session_state.allow_live_execution),
-            },
-            writer,
-        )
-    else:
-        receipt_result = call_deriv_tool(
-            "execute_simulated_trade",
-            execute_simulated_trade(
-                st.session_state.deriv_token,
-                symbol,
-                float(amount),
-                contract_type,
-                int(duration),
-                duration_unit,
-                bool(st.session_state.allow_live_execution),
-            ),
-            {
-                "api_token": st.session_state.deriv_token,
-                "symbol": symbol,
-                "amount": float(amount),
-                "contract_type": contract_type,
-                "duration": int(duration),
-                "duration_unit": duration_unit,
-                "allow_live": bool(st.session_state.allow_live_execution),
-            },
-            writer,
-        )
-    st.session_state.confirm_next_trade = False
-    st.session_state.pending_trade = None
-    if receipt_result.get("ok"):
-        st.session_state.last_trade_receipt = receipt_result
-        receipt = ((receipt_result.get("data") or {}).get("receipt") or (receipt_result.get("data") or {}).get("sell") or {})
-        report = {
-            "role": "Execution Trader",
-            "ok": True,
-            "account_checked": account_ok,
-            "account": account_result.get("data"),
-            "receipt": receipt,
-            "action": pending["action"],
-        }
-        append_team_event(
-            events,
-            "执行交易员",
-            "经理",
-            (
-                ("平仓成功，" if close_intent else "下单成功，")
-                +
-                f"合同ID: {receipt.get('contract_id') or contract_id}，"
-                f"成交价: {receipt.get('purchase_price') or receipt.get('sold_for') or receipt.get('sell_price')} "
-                f"{receipt.get('currency', '')}。"
-            ),
-            writer,
-        )
-        remember_agent_report("execution", report)
-        return report
-
-    error_message = (receipt_result.get("error") or {}).get("message", "unknown error")
-    report = {
-        "role": "Execution Trader",
-        "ok": False,
-        "account_checked": account_ok,
-        "account": account_result.get("data"),
-        "error": error_message,
-    }
-    append_team_event(events, "执行交易员", "经理", f"下单失败：{error_message}", writer)
-    remember_agent_report("execution", report)
-    return report
+    except Exception as exc:
+        st.session_state.confirm_next_trade=False
+        return {"ok":False,"reason":getattr(exc,"code",type(exc).__name__),"intent_id":intent_id}
 
 
 def assign_task_to_market_agent(
@@ -3183,7 +2973,12 @@ def manager_tool_dispatch(
     if name == "assign_task_to_market_agent":
         return assign_task_to_market_agent(arguments, events, writer)
     if name == "assign_task_to_execution_agent":
-        return assign_task_to_execution_agent(arguments, events, writer)
+        return {"ok":False,"error":"Execution tool removed from Manager; propose a TradeIntentDraft"}
+    if name == "propose_trade_intent":
+        try:
+            return propose_trade_intent(arguments)
+        except Exception:
+            return {"ok":False,"error":"Invalid TradeIntentDraft"}
     if name == "assign_task_to_strategy_agent":
         return assign_task_to_strategy_agent(arguments, events, writer)
     if name == "assign_task_to_risk_agent":
@@ -3214,7 +3009,7 @@ def manager_with_openai_tool_calling(
         kwargs: dict[str, Any] = {"api_key": st.session_state.llm_api_key}
         if base_url:
             kwargs["base_url"] = base_url
-        client = OpenAI(**kwargs)
+
 
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": manager_system_prompt()},
@@ -3227,13 +3022,11 @@ def manager_with_openai_tool_calling(
 
         append_team_event(events, "用户", "经理", user_text, writer)
         for _ in range(5):
-            response = client.chat.completions.create(
-                model=st.session_state.llm_model,
-                messages=messages,
-                tools=MANAGER_TOOLS,
-                tool_choice="auto",
-                temperature=0.1,
-            )
+            if current_context():
+                current_context().require_time()
+            seconds=current_context().remaining_time if current_context() else 15
+            response=run_bounded(call_model(provider, st.session_state.llm_api_key, st.session_state.llm_model,
+                messages,MANAGER_TOOLS,seconds,base_url=base_url),seconds)
             message = response.choices[0].message
             messages.append(message.model_dump(exclude_none=True))
             tool_calls = message.tool_calls or []
@@ -3248,8 +3041,10 @@ def manager_with_openai_tool_calling(
                 agent_reports[tool_call.function.name] = result
                 if tool_call.function.name == "assign_task_to_market_agent":
                     market_report = result
-                elif tool_call.function.name == "assign_task_to_execution_agent":
+                elif tool_call.function.name == "propose_trade_intent":
                     execution_report = result
+                    return TeamRunResult("订单草稿已生成，请核对并确认。", events, market_report, execution_report,
+                                         ok=bool(result.get('ok')), agent_reports=agent_reports)
                 messages.append(
                     {
                         "role": "tool",
@@ -3271,7 +3066,7 @@ def manager_with_openai_tool_calling(
             agent_reports=agent_reports,
         )
     except Exception as exc:
-        append_team_event(events, "系统", "经理", f"大模型 tool calling 失败，切换 Python 状态机：{exc}", writer)
+        append_team_event(events, "系统", "经理", f"大模型 tool calling 失败，切换 Python 状态机：{type(exc).__name__}", writer)
         return None
 
 
@@ -3283,7 +3078,6 @@ def manager_with_anthropic_tool_calling(
     try:
         from anthropic import Anthropic
 
-        client = Anthropic(api_key=st.session_state.llm_api_key)
         anthropic_tools = [
             {
                 "name": tool["function"]["name"],
@@ -3300,14 +3094,11 @@ def manager_with_anthropic_tool_calling(
 
         append_team_event(events, "用户", "经理", user_text, writer)
         for _ in range(5):
-            response = client.messages.create(
-                model=st.session_state.llm_model,
-                max_tokens=1400,
-                temperature=0.1,
-                system=manager_system_prompt(),
-                tools=anthropic_tools,
-                messages=messages,
-            )
+            if current_context():
+                current_context().require_time()
+            seconds=current_context().remaining_time if current_context() else 15
+            response=run_bounded(call_model('Anthropic',st.session_state.llm_api_key,st.session_state.llm_model,
+                messages,anthropic_tools,seconds,system=manager_system_prompt()),seconds)
             tool_results = []
             assistant_blocks = []
             for block in response.content:
@@ -3322,8 +3113,10 @@ def manager_with_anthropic_tool_calling(
                     agent_reports[block.name] = result
                     if block.name == "assign_task_to_market_agent":
                         market_report = result
-                    elif block.name == "assign_task_to_execution_agent":
+                    elif block.name == "propose_trade_intent":
                         execution_report = result
+                        return TeamRunResult("订单草稿已生成，请核对并确认。", events, market_report, execution_report,
+                                             ok=bool(result.get('ok')), agent_reports=agent_reports)
                     tool_results.append(
                         {
                             "type": "tool_result",
@@ -3348,7 +3141,7 @@ def manager_with_anthropic_tool_calling(
             agent_reports=agent_reports,
         )
     except Exception as exc:
-        append_team_event(events, "系统", "经理", f"Anthropic tool calling 失败，切换 Python 状态机：{exc}", writer)
+        append_team_event(events, "系统", "经理", f"Anthropic tool calling 失败，切换 Python 状态机：{type(exc).__name__}", writer)
         return None
 
 
@@ -3396,7 +3189,7 @@ def deterministic_manager_summary(
     if execution_report and execution_report.get("ok"):
         receipt = execution_report.get("receipt") or {}
         return (
-            "经理总结：行情员工完成市场检查，执行交易员已通过模拟盘下单。"
+            "订单处理完成，状态见持久回执。"
             f"合同 ID：{receipt.get('contract_id')}，成交价：{receipt.get('purchase_price')}。"
         )
     if execution_report and not execution_report.get("ok"):
@@ -3411,6 +3204,8 @@ def deterministic_manager_state_machine(
     events: list[AgentEvent],
     writer: Callable[[str], None] | None = None,
 ) -> TeamRunResult:
+    if current_context():
+        current_context().require_time()
     append_team_event(events, "用户", "经理", user_text, writer)
     symbol = extract_symbol(user_text)
     market_report = None
@@ -3475,9 +3270,11 @@ def deterministic_manager_state_machine(
         agent_reports["risk"] = risk_report
         agent_reports["compliance"] = compliance_report
         missing = []
-        if amount <= 0:
+        if has_close_intent(user_text) and not extract_contract_id(user_text):
+            missing.append("contract_id")
+        if amount <= 0 and not has_close_intent(user_text):
             missing.append("金额 amount")
-        if contract_type not in {"CALL", "PUT"}:
+        if contract_type not in {"CALL", "PUT"} and not has_close_intent(user_text):
             missing.append("方向 CALL/PUT")
         if missing:
             message = f"缺少交易参数：{', '.join(missing)}。请补充后我再派执行交易员。"
@@ -3503,29 +3300,21 @@ def deterministic_manager_state_machine(
             )
 
         append_team_event(events, "经理", "经理", f"风控条件判断：{condition_note}", writer)
-        compliance_ok = bool((agent_reports.get("compliance") or {}).get("ok", True))
+        compliance_ok = has_close_intent(user_text) or bool((agent_reports.get("compliance") or {}).get("ok", True))
         risk_hard_block = (agent_reports.get("risk") or {}).get("reason") not in {None, "missing_deriv_api_token"}
         if condition_passed and compliance_ok and not risk_hard_block:
-            execution_report = assign_task_to_execution_agent(
-                {
-                    "task": "条件已满足，立刻执行用户授权的模拟盘订单。",
-                    "symbol": symbol,
-                    "amount": amount,
-                    "contract_type": contract_type,
-                    "duration": duration,
-                    "duration_unit": duration_unit,
-                    "risk_note": condition_note,
-                },
-                events,
-                writer,
-            )
+            execution_report=propose_trade_intent({"action":"SELL" if has_close_intent(user_text) else "BUY",
+                "symbol":symbol,"amount":"0" if has_close_intent(user_text) else str(amount),
+                "direction":None if has_close_intent(user_text) else contract_type,
+                "duration":0 if has_close_intent(user_text) else duration,"duration_unit":duration_unit,
+                "contract_id":extract_contract_id(user_text) if has_close_intent(user_text) else None})
             agent_reports["execution"] = execution_report
         else:
             append_team_event(
                 events,
                 "经理",
                 "执行交易员",
-                "条件未满足，暂停下单，不触发 execute_simulated_trade。",
+                "条件未满足，暂停下单，不触发 place_contract。",
                 writer,
             )
 
@@ -3561,7 +3350,7 @@ def jev_read_only_candidate(user_text: str) -> bool:
     )
 
 
-def run_hierarchical_trading_team(
+def _run_hierarchical_trading_team(
     user_text: str,
     writer: Callable[[str], None] | None = None,
 ) -> TeamRunResult:
@@ -3579,6 +3368,7 @@ def run_hierarchical_trading_team(
             {"task": "read_only_manager_routing", "request": user_text[:1000], "symbol": extract_symbol(user_text)},
             st.session_state.jev_api_key,
             model=str(st.session_state.get("jev_model") or JEV_MODEL),
+            deadline_at=current_context().deadline if current_context() else None,
         )
         thinking_route = route.as_dict()
         push_runtime_event("thinking", "Jev", "Manager", f"{route.mode} ({route.source}, {route.latency_ms:.0f}ms)")
@@ -3601,6 +3391,26 @@ def run_hierarchical_trading_team(
     result = deterministic_manager_state_machine(user_text, events, writer)
     result.thinking_route = thinking_route
     return result
+
+
+def run_hierarchical_trading_team(user_text: str, writer=None) -> TeamRunResult:
+    context=ExecutionContext('manager',15)
+    with use_context(context):
+        try:
+            result=_run_hierarchical_trading_team(user_text,writer)
+            result.request_id=context.request_id
+            result.correlation_id=context.request_id
+            draft=(result.execution_report or {}).get('draft')
+            if draft:
+                stage=execution_agent(task='SELL' if draft['action']=='SELL' else 'BUY',symbol=draft['symbol'],
+                    amount=float(draft['amount']),contract_type=draft.get('direction') or '',duration=draft['duration'],
+                    duration_unit=draft['duration_unit'],contract_id=draft.get('contract_id'),events=result.events,
+                    writer=writer,stage_only=True)
+                result.execution_report={**stage,'draft':draft,'request_id':context.request_id,'correlation_id':context.request_id}
+                result.final_answer='订单草稿已生成，等待核对参数并确认。' if stage.get('reason')=='pending_human_confirmation' else f"订单状态：{stage.get('status') or stage.get('reason')}"
+            return result
+        except TimeoutError:
+            return TeamRunResult('本轮时间已用完；未开始新的资金写操作。',[],ok=False)
 
 
 def reset_agent_log() -> list[str]:
@@ -3640,107 +3450,18 @@ def evaluate_condition(condition: dict[str, Any] | None, latest_quote: float) ->
 
 
 def execute_trade_closed_loop(plan: ToolPlan) -> tuple[dict[str, Any], str]:
-    log = reset_agent_log()
-    params = plan.params
-    safe_params = dict(params)
-    safe_params.pop("api_token", None)
-    log.append(f"1. 解析交易意图: action=execute_simulated_trade")
-    log.append(f"   params={json.dumps(safe_params, ensure_ascii=False, default=str)}")
-    log.append(f"   rationale={plan.rationale}")
-    log.append(f"2. 数据读取: get_market_ticks(symbol={params['symbol']}, subscribe=False)")
-
-    tick_result = call_deriv_tool(
-        "get_market_ticks",
-        get_market_ticks(params["symbol"], False),
-        {"symbol": params["symbol"], "subscribe": False},
-    )
-    st.session_state.last_tick = tick_result
-    if not tick_result.get("ok"):
-        log.append("   read_status=FAILED")
-        log.append(f"   error={(tick_result.get('error') or {}).get('message', 'unknown error')}")
-        log.append("3. 条件判断: SKIPPED")
-        log.append("4. 自动触发下单: ABORTED")
-        publish_agent_log(log)
-        return tick_result, summarize_result(plan, tick_result)
-
-    tick = ((tick_result.get("data") or {}).get("tick") or {})
-    latest_quote = float(tick.get("quote"))
-    log.append("   read_status=OK")
-    log.append(f"   latest_tick={latest_quote}")
-    log.append(f"   tick_timestamp={tick.get('timestamp')}")
-    log.append(f"3. 条件判断: {condition_to_text(params.get('condition'))}")
-
-    condition_passed, condition_detail = evaluate_condition(params.get("condition"), latest_quote)
-    log.append(f"   condition_result={condition_detail}")
-    if not condition_passed:
-        result = {
-            "ok": True,
-            "tool": "execute_simulated_trade",
-            "data": {
-                "status": "skipped",
-                "reason": "condition_not_met",
-                "latest_tick": latest_quote,
-                "condition": params.get("condition"),
-            },
-        }
-        log.append("4. 自动触发下单: SKIPPED")
-        log.append("   reason=condition_not_met")
-        publish_agent_log(log)
-        return result, "条件没有满足，智能体没有触发模拟下单。执行链条已写入自动执行日志。"
-
-    log.append("4. 自动触发下单: READY")
-    if not st.session_state.deriv_token:
-        result = {
-            "ok": False,
-            "error": {"message": "请先在右上角设置中配置 Deriv API Token。建议使用 demo token。"},
-        }
-        log.append("   order_status=ABORTED")
-        log.append("   reason=missing_deriv_api_token")
-        publish_agent_log(log)
-        return result, summarize_result(plan, result)
-
-    log.append("   token_status=configured(masked)")
-    log.append(
-        "   tool_call=execute_simulated_trade("
-        f"symbol={params['symbol']}, amount={params['amount']}, "
-        f"contract_type={params['contract_type']}, duration={params['duration']}, "
-        f"duration_unit={params['duration_unit']})"
-    )
-    result = call_deriv_tool(
-        "execute_simulated_trade",
-        execute_simulated_trade(
-            st.session_state.deriv_token,
-            params["symbol"],
-            params["amount"],
-            params["contract_type"],
-            params["duration"],
-            params["duration_unit"],
-            bool(st.session_state.allow_live_execution),
-        ),
-        {
-            "api_token": st.session_state.deriv_token,
-            "symbol": params["symbol"],
-            "amount": params["amount"],
-            "contract_type": params["contract_type"],
-            "duration": params["duration"],
-            "duration_unit": params["duration_unit"],
-            "allow_live": bool(st.session_state.allow_live_execution),
-        },
-    )
-
-    if result.get("ok"):
-        st.session_state.last_trade_receipt = result
-        receipt = ((result.get("data") or {}).get("receipt") or {})
-        log.append("   order_status=SUCCESS")
-        log.append(f"   contract_id={receipt.get('contract_id')}")
-        log.append(f"   purchase_price={receipt.get('purchase_price')}")
-        log.append(f"   transaction_id={receipt.get('transaction_id')}")
-    else:
-        log.append("   order_status=FAILED")
-        log.append(f"   error={(result.get('error') or {}).get('message', 'unknown error')}")
-
-    publish_agent_log(log)
-    return result, summarize_result(plan, result)
+    params=plan.params
+    if params.get('condition'):
+        result=call_deriv_tool('get_market_ticks',get_market_ticks(params.get('symbol',DEFAULT_SYMBOL)),{'symbol':params.get('symbol',DEFAULT_SYMBOL)})
+        tick=(result.get('data') or {}).get('tick') or {}
+        if not result.get('ok') or not tick_is_current({'symbol':params.get('symbol',DEFAULT_SYMBOL),'tick':tick}):
+            return {'ok':False,'reason':'no_current_tick'},'需要新鲜报价才能复核条件。'
+        passed,note=evaluate_condition(params['condition'],float(tick['quote']))
+        if not passed: return {'ok':False,'reason':'condition_not_met'},note
+    report=execution_agent(task='BUY',symbol=params.get('symbol',DEFAULT_SYMBOL),amount=params.get('amount',0),
+        contract_type=params.get('contract_type',''),duration=params.get('duration',5),
+        duration_unit=params.get('duration_unit','t'),events=[])
+    return report, report.get('reason','Order created')
 
 
 def execute_plan(plan: ToolPlan) -> tuple[dict[str, Any], str]:
@@ -3792,7 +3513,7 @@ def execute_plan(plan: ToolPlan) -> tuple[dict[str, Any], str]:
         publish_agent_log(log)
         return result, summarize_result(plan, result)
 
-    if plan.action == "execute_simulated_trade":
+    if plan.action == "place_contract":
         return execute_trade_closed_loop(plan)
 
     publish_agent_log(reset_agent_log() + ["1. 普通对话: 未触发工具", "2. 自动触发下单: 无"])
@@ -3812,7 +3533,7 @@ def summarize_result(plan: ToolPlan, result: dict[str, Any]) -> str:
         data = result.get("data") or {}
         return f"已获取 {data.get('symbol')} 的 {data.get('returned_count')} 根 K 线，并在下方绘制成蜡烛图。"
 
-    if plan.action == "execute_simulated_trade":
+    if plan.action == "place_contract":
         data = result.get("data") or {}
         if data.get("status") == "skipped":
             return (
@@ -4644,7 +4365,7 @@ def direct_tool_for_agent(agent_id: str) -> str:
         "risk": "assign_task_to_risk_agent",
         "compliance": "assign_task_to_compliance_agent",
         "chart": "assign_task_to_chart_agent",
-        "execution": "assign_task_to_execution_agent",
+        "execution": "propose_trade_intent",
         "report": "assign_task_to_report_agent",
     }[agent_id]
 
@@ -4675,16 +4396,11 @@ def direct_arguments(agent_id: str, task: str) -> dict[str, Any]:
     elif agent_id == "compliance":
         base = {"task": task, "amount": amount, "contract_type": contract_type}
     elif agent_id == "execution":
-        base.update(
-            {
-                "amount": amount,
-                "contract_type": contract_type,
-                "duration": extract_duration(task) or 5,
-                "duration_unit": extract_duration_unit(task),
-                "contract_id": extract_contract_id(task),
-                "risk_note": "老板直派执行任务，请按模拟盘安全边界执行。",
-            }
-        )
+        close=has_close_intent(task)
+        base={'action':'SELL' if close else 'BUY','symbol':symbol,'amount':'0' if close else str(amount),
+              'direction':None if close else extract_contract_type(task) or None,
+              'duration':0 if close else extract_duration(task) or 5,'duration_unit':extract_duration_unit(task),
+              'contract_id':extract_contract_id(task) if close else None}
     return base
 
 
@@ -4726,6 +4442,11 @@ def render_direct_dispatch() -> None:
         events,
         st.write,
     )
+    if selected_agent=='execution' and result.get('draft'):
+        draft=result['draft']
+        execution_agent(task=draft['action'],symbol=draft['symbol'],amount=float(draft['amount']),
+            contract_type=draft.get('direction') or '',duration=draft['duration'],duration_unit=draft['duration_unit'],
+            contract_id=draft.get('contract_id'),events=events,stage_only=True)
     done_line = (
         f"{agent_name(selected_agent)} 已完成直派任务。"
         if current_lang() == "zh"
@@ -4743,9 +4464,9 @@ def render_advisor_result(result: dict[str, Any], *, historical: bool = False, k
     evidence = result.get("evidence") or {}
     route = result.get("thinking_route") or {}
     jev = result.get("jev_assessment") or {}
-    stance = str(result.get("stance") or "WAIT")
-    titles = {"WAIT": "等待补充" if result.get("status") != "completed" else "保持观察", "CALL": "观察偏向上行", "PUT": "观察偏向下行"} if zh else {"WAIT": "Wait for evidence" if result.get("status") != "completed" else "Keep observing", "CALL": "Upward observation", "PUT": "Downward observation"}
-    trends = {"up": "上行", "down": "下行", "mixed": "震荡", "unknown": "暂无数据"} if zh else {"up": "Upward", "down": "Downward", "mixed": "Mixed", "unknown": "No data"}
+    stance = str(result.get("observed_trend") or legacy_observation(result.get("stance")))
+    titles = {"WAIT": "等待补充" if result.get("status") != "completed" else "保持观察", "UP": "窗口上行", "DOWN": "窗口下行", "FLAT": "窗口震荡"} if zh else {"WAIT": "Wait for evidence" if result.get("status") != "completed" else "Keep observing", "UP": "Upward window", "DOWN": "Downward window", "FLAT": "Flat window"}
+    trends = {"UP": "上行", "DOWN": "下行", "FLAT": "震荡", "UNKNOWN": "暂无数据"} if zh else {"UP": "Upward", "DOWN": "Downward", "FLAT": "Flat", "UNKNOWN": "No data"}
     tick = market.get("tick") or {}
     quote = tick.get("quote")
     price = f"{quote:,.5f}".rstrip("0").rstrip(".") if type(quote) in (int, float) and math.isfinite(quote) else "—"
@@ -4796,7 +4517,7 @@ def render_advisor_result(result: dict[str, Any], *, historical: bool = False, k
         opinions = result.get("opinions") or []
         if opinions:
             st.dataframe([{"检查项" if zh else "Check": item.get("name"), "结论" if zh else "Stance": item.get("stance"), "依据" if zh else "Reason": item.get("rationale")} for item in opinions], hide_index=True, width="stretch")
-        st.caption(("规则票数：" if zh else "Rule votes: ") + " · ".join(f"{k} {v}" for k,v in (result.get("vote_counts") or {}).items()))
+        st.caption(("检查状态计数（相关规则）：" if zh else "Correlated check counts: ") + " · ".join(f"{k} {v}" for k,v in (result.get("vote_counts") or {}).items()))
     if result.get("sources"):
         with st.expander(("新闻背景" if zh else "News context") + f" · {len(result['sources'])}"):
             st.dataframe([{k: item.get(k) for k in ("title", "source", "published", "url")} for item in result["sources"]], hide_index=True, width="stretch", column_config={"url": st.column_config.LinkColumn("来源" if zh else "Source")})
@@ -4827,7 +4548,7 @@ def restore_advisor_inputs(result: dict[str, Any]) -> None:
     st.session_state.update(
         advisor_question=str(result.get("question") or ""),
         advisor_scene=result.get("scene") if result.get("scene") in SCENES else "observe",
-        advisor_thesis=result.get("thesis") if result.get("thesis") in {"CALL", "PUT"} else "CALL",
+        advisor_thesis=result.get("thesis") if result.get("thesis") in {"UP", "DOWN"} else legacy_observation(result.get("thesis")).value if result.get("thesis") in {"CALL", "PUT"} else "UP",
         advisor_symbol=symbol,
         advisor_symbol_choice=symbol if symbol in COMMON_DERIV_SYMBOLS else "custom",
         advisor_custom_symbol=symbol,
@@ -4864,7 +4585,7 @@ def render_advisor_council() -> None:
     }
     with st.container(border=False):
         question = st.text_area("分析问题" if zh else "Your question", key="_advisor_question", height=110, placeholder=placeholders[scene][0 if zh else 1], on_change=remember_advisor_inputs)
-        thesis = st.radio("你的预期方向" if zh else "Your expected direction", ["CALL", "PUT"], key="_advisor_thesis", format_func=lambda value: {"CALL": "看涨 · CALL", "PUT": "看跌 · PUT"}[value] if zh else value, horizontal=True, on_change=remember_advisor_inputs) if scene == "review" else ""
+        thesis = st.radio("你的预期方向" if zh else "Your expected direction", ["UP", "DOWN"], key="_advisor_thesis", format_func=lambda value: {"UP": "上行 · UP", "DOWN": "下行 · DOWN"}[value] if zh else value, horizontal=True, on_change=remember_advisor_inputs) if scene == "review" else ""
         with st.expander("分析选项" if zh else "Analysis options", expanded=False):
             budget = st.slider("思考时间上限（秒）" if zh else "Time budget (seconds)", min_value=4, max_value=25, key="_advisor_budget", step=1, on_change=remember_advisor_inputs)
             if applicable_news:
@@ -5025,6 +4746,17 @@ def render_chat() -> None:
 
 def main() -> None:
     init_state()
+    from execution.reconciler import Reconciler
+    repo = OrderRepository(Database(DB_PATH))
+    run_async(Reconciler(repo).recover_incomplete_orders())
+    if st.session_state.deriv_token and repo.list(statuses={OrderStatus.UNKNOWN}) and time.monotonic() >= st.session_state.get("_recovery_next", 0):
+        st.session_state._recovery_next = time.monotonic() + 30
+        try:
+            service = trading_application(st.session_state.deriv_token, source="streamlit", db_path=DB_PATH, context=ExecutionContext("streamlit", 5))
+            run_async(service.recover_incomplete_orders())
+            st.session_state._recovery_done = True
+        except Exception:
+            pass
     configure_page()
     render_header()
     workspace = st.segmented_control(

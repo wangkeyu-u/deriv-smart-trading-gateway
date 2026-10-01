@@ -11,13 +11,15 @@ from email.utils import parsedate_to_datetime
 from typing import Any
 
 from jev_router import MarketAssessment
+from domain.market import ObservedTrend, legacy_observation
 
 SCENES = {
     "observe": ("快速看盘", "Quick observation"),
     "review": ("交易想法复核", "Review a thesis"),
     "research": ("深入研究", "Deeper research"),
 }
-POLICY_VERSION = "advisory-v2"
+POLICY_VERSION = "advisory-v3"
+THRESHOLD_STATUS = "UNCALIBRATED_THRESHOLD"
 
 
 def number(value: Any) -> float | None:
@@ -72,7 +74,7 @@ def market_evidence(market: dict[str, Any], symbol: str, now: float | None = Non
         "quote": number(tick.get("quote")),
         "candles_current": False,
         "candle_count": 0,
-        "trend": "unknown",
+        "trend": ObservedTrend.UNKNOWN,
         "status": "no_current_tick" if not current else "insufficient_candles",
     }
     raw = market.get("candles") or {}
@@ -107,7 +109,7 @@ def market_evidence(market: dict[str, Any], symbol: str, now: float | None = Non
             result["status"] = "stale_candles" if current else "no_current_tick"
             return result
         ma5, ma20 = sum(closes[-5:]) / 5, sum(closes[-20:]) / 20
-        trend = "up" if closes[-1] > closes[0] and ma5 > ma20 else "down" if closes[-1] < closes[0] and ma5 < ma20 else "mixed"
+        trend = ObservedTrend.UP if closes[-1] > closes[0] and ma5 > ma20 else ObservedTrend.DOWN if closes[-1] < closes[0] and ma5 < ma20 else ObservedTrend.FLAT
         result.update(candles_current=True, trend=trend, ma5=ma5, ma20=ma20, latest_close=closes[-1], change_pct=(closes[-1] / closes[0] - 1) * 100, window_minutes=len(closes), status="ready" if current else "no_current_tick")
     except (ValueError, TypeError, AttributeError, OverflowError):
         result["status"] = "invalid_candles" if current else "no_current_tick"
@@ -138,9 +140,10 @@ def build_state(question: str, symbol: str, market: dict[str, Any], sources: lis
     evidence = market_evidence(market, symbol)
     return {
         "policy_version": POLICY_VERSION,
+        "threshold_status": THRESHOLD_STATUS,
         "scene": scene,
         "question": question[:800],
-        "thesis_direction": thesis if scene == "review" else "not_requested",
+        "thesis_direction": (legacy_observation(thesis).value if thesis in {"CALL", "PUT"} else thesis) if scene == "review" else "not_requested",
         "symbol": symbol,
         "instrument": profile,
         "evidence": evidence,
@@ -154,7 +157,7 @@ def build_state(question: str, symbol: str, market: dict[str, Any], sources: lis
 def decide(state: dict[str, Any], assessment: MarketAssessment, local_stance: str, *, enabled: bool) -> dict[str, Any]:
     evidence = state["evidence"]
     scene = state["scene"]
-    stance, path, reason = "WAIT", "wait", "no_current_tick"
+    stance, path, reason = "UNKNOWN", "wait", "no_current_tick"
     valid_model = assessment.source == "jev"
     if evidence["tick_current"]:
         path = "deep" if scene == "research" else "finish"
@@ -164,38 +167,38 @@ def decide(state: dict[str, Any], assessment: MarketAssessment, local_stance: st
         if valid_model:
             path_prob = assessment.path_probabilities.get(assessment.reasoning_path or "", 0)
             if path_prob < 0.8 or (assessment.path_confidence or 0) < 0.7:
-                path, stance, reason = "deep", "WAIT", "uncertain_path"
+                path, stance, reason = "deep", "UNKNOWN", "uncertain_path"
             elif assessment.reasoning_path == "wait":
-                path, stance, reason = "wait", "WAIT", "jev_needs_evidence"
+                path, stance, reason = "wait", "UNKNOWN", "jev_needs_evidence"
             else:
                 path = "deep" if scene == "research" else str(assessment.reasoning_path)
                 reason = "research_requested" if scene == "research" else "jev_" + path
                 selected = (assessment.probabilities or {}).get(assessment.stance or "", 0)
-                supported = {"up": "CALL", "down": "PUT"}.get(evidence["trend"], "WAIT")
+                supported = {"UP": "UP", "DOWN": "DOWN", "FLAT": "FLAT"}.get(evidence["trend"], "UNKNOWN")
                 if selected >= 0.8 and (assessment.confidence or 0) >= 0.7 and evidence["status"] == "ready" and state["instrument"]["directional_interpretation_allowed"]:
-                    candidate = assessment.stance or "WAIT"
-                    stance = candidate if candidate == supported and local_stance in {candidate, "WAIT"} else "WAIT"
+                    candidate = assessment.stance or "UNKNOWN"
+                    stance = candidate if candidate == supported and local_stance in {candidate, "UNKNOWN"} else "UNKNOWN"
                 else:
-                    stance = "WAIT"
+                    stance = "UNKNOWN"
                 if scene == "review":
                     thesis_ok = assessment.thesis_status == "supported" and assessment.thesis_probabilities.get("supported", 0) >= 0.8 and (assessment.thesis_confidence or 0) >= 0.7
                     if not thesis_ok or stance != state["thesis_direction"]:
-                        stance = "WAIT"
+                        stance = "UNKNOWN"
         elif enabled:
-            stance = "WAIT"
+            stance = "UNKNOWN"
             path = "deep" if assessment.source == "jev_error" else "wait"
             reason = assessment.error_code or assessment.source
         elif scene == "review":
-            stance, reason = "WAIT", "thesis_requires_review"
+            stance, reason = "UNKNOWN", "thesis_requires_review"
     direction_reason = "observed_window"
     if evidence["status"] != "ready":
-        stance, path, reason = "WAIT", "wait", evidence["status"]
+        stance, path, reason = "UNKNOWN", "wait", evidence["status"]
         direction_reason = evidence["status"]
     elif not state["instrument"]["directional_interpretation_allowed"]:
-        stance, direction_reason = "WAIT", "descriptive_only"
-    elif stance == "WAIT":
+        stance, direction_reason = "UNKNOWN", "descriptive_only"
+    elif stance == "UNKNOWN":
         direction_reason = "thesis_not_supported" if scene == "review" else "direction_not_supported"
-    return {"direction_reason": direction_reason, "requested_path": path, "reason": reason, "stance": stance, "evidence_id": hashlib.sha256(json.dumps(state, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()).hexdigest()[:16], "policy_version": POLICY_VERSION}
+    return {"direction_reason": direction_reason, "requested_path": path, "reason": reason, "stance": "WAIT", "observed_trend": stance, "evidence_id": hashlib.sha256(json.dumps(state, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()).hexdigest()[:16], "policy_version": POLICY_VERSION}
 
 
 REASONS = {

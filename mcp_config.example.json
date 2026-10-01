@@ -7,6 +7,7 @@
       ],
       "env": {
         "DERIV_APP_ID": "1089",
+        "DERIV_DB_PATH": "/absolute/path/to/deriv-smart-trading-gateway/local_data/gateway.sqlite3",
         "DERIV_WS_URL_TEMPLATE": "wss://ws.derivws.com/websockets/v3?app_id={app_id}"
       }
     }

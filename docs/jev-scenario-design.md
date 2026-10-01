@@ -1,12 +1,12 @@
 # Jev 场景控制器：分析与实现
 
-资料核对：2026-09-29。当前默认固定 `jev-1.13.0`，可显式切换 `jev-latest`。本文描述本仓库的只读分析流程。
+资料核对：2026-09-29；执行与语义更新：2026-10-01。当前默认固定 `jev-1.13.0`，可显式切换 `jev-latest`。本文描述本仓库的只读分析流程。
 
 ## 从官方能力出发
 
 Jev 是结构化判断模型。API 接收一份 state 和多道独立题目，返回 Choice、Score 或 Noul；不生成解释文本。多个问题共享状态、并行评估，适合把“观察是什么”和“下一步做什么”放在一次请求中。[介绍](https://docs.typesafe.ai/introduction) · [API](https://docs.typesafe.ai/api) · [并行问题模式](https://docs.typesafe.ai/patterns/fan-out)
 
-`confidence` 从选项分布计算，并非额外独立证据。产品中的 0.8 选项概率、0.7 confidence 只是初始门槛；尚无本项目真实样本校准，不能解释为正确率或盈利概率。[confidence](https://docs.typesafe.ai/confidence)
+`confidence` 从选项分布计算，并非额外独立证据。产品中的 0.8 选项概率、0.7 confidence 只是初始门槛，标为 UNCALIBRATED_THRESHOLD；尚无本项目真实样本校准，不能解释为正确率或盈利概率。[confidence](https://docs.typesafe.ai/confidence)
 
 官方列出的弱项包括算术、日期判断、含糊范围、过长状态及指令注入。本实现由代码计算报价年龄、K 线连续性、均线、品种和预算，只让 Jev 判断简短状态中的语义关系；提示词不是可靠的执行权限边界。[Jev 1.13 局限](https://docs.typesafe.ai/model-jaggedness/jev-1.13)
 
@@ -17,10 +17,10 @@ Deriv 明确说明外部新闻不驱动合成指数，且一般合成指数的�
 | 场景 | Jev 同批问题 | 后续行为 |
 | --- | --- | --- |
 | 快速看盘 | 观察解释、思考路径 | finish 输出简短结果；deep 按需解释；wait 补证据 |
-| 交易想法复核 | 上述两题 + 想法 supported / contradicted / unclear | 用户必须明确 CALL 或 PUT；仅一致、达到阈值且有有效外汇观察时保留方向 |
+| 交易想法复核 | 上述两题 + 想法 supported / contradicted / unclear | 用户明确 UP 或 DOWN 的观察假设；只复核证据一致性，不产生交易信号 |
 | 深入研究 | 观察解释、思考路径 | 有足够证据时请求解释模型；Jev wait 阻止浪费推理 |
 
-市场问题使用 CALL / PUT / WAIT 延续现有数据契约；CALL/PUT 仅表示外汇历史观察窗口方向，不能证明下一 Tick 或特定合约期限的胜率。界面明确展示实际路径与请求路径。未配置解释模型、时间不足、解释调用失败均展示原因并保留 WAIT。
+市场问题改为严格 ObservedTrend：UP / DOWN / FLAT / UNKNOWN。顶层兼容 stance 保持 WAIT；CALL/PUT 只属于交易领域。旧历史在读取边界映射，原 JSON 保留。Choice 外形不变，语义迁移版本为 scenario-v3/advisory-v3。界面明确展示实际路径与请求路径。未配置解释模型、时间不足、解释调用失败均展示原因并保留 WAIT。
 
 ## 运行过程
 
@@ -66,3 +66,12 @@ Jev 总请求上限 1.2 秒，解释模型上限为剩余预算且不超过 8 �
 - Jev 开始复核、路径判定完成和解释调用开始时，图节点立即通过自定义流发送阶段事件，页面主线程更新状态。通知不会等待整次解释调用结束；事件只包含阶段标识，密钥保持在本次运行闭包中。[LangGraph 流写入 API](https://reference.langchain.com/python/langgraph/config/get_stream_writer)
 - 最终自动测试：93 项全部通过。新增测试将解释调用暂停，直到页面主线程收到开始事件后才允许其完成，验证阶段通知及时性和线程边界。记录损坏时保留原摘要并给出可读提示；测试使用临时 SQLite，不写用户历史。
 - 浏览器验证：行情未取得有效数据时约 2.7 秒返回，问题保留；记录查看和参数复用完成，无自动新请求。[历史详情截图](assets/workbench-history.png)
+
+## 2026-10-01 交易核心与评估更新
+
+- 分析确定性角色使用 EvidenceCheck，检查状态的相关计数不参与交易风控，也不作为独立 Agent 多数票。
+- Jev 没有增加模型层或获得订单权限。Manager 的写相关能力收窄为 TradeIntentDraft，真正执行共享 TradingService/RiskEngine/OrderEngine/DerivAdapter。
+- 评估报告新增 Jev、纯规则、always_finish、always_deep 四种路由；所有对照共用数据有效性闸门。
+- routing_accuracy 为实际路径与人工路径相同的比例；WAIT_accuracy 为是否需要等待的二分类准确度。unnecessary_deep_rate 分母为人工无需 deep 的场景；missed_deep_rate 分母为人工要求 deep 的场景。failure_rate 为模型请求失败比例。
+- 延迟分位使用真实模式的模型请求耗时，包含失败请求。离线模拟不报告真实延迟、token 和成本。费用仅在提供明确单价时估算，不宣称账单已核实。
+- 最终 pytest：153 passed；离线场景仍为 12/12。离线 Jev 的正确路由来自人工答案，不是实测模型优势；本轮没有真实 Jev 或外部交易调用。真实评估缺失 token usage 时保留 null，避免把缺失统计误报为零消耗。

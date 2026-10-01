@@ -36,4 +36,4 @@ At 640px and below, settings remains easy to reach, controls stack, navigation w
 
 ## Implementation
 
-`ui/theme.css` is the common surface/widget style; `.streamlit/config.toml` supplies native theme defaults. `web_app.py` uses the same colors for Plotly and the optional graph canvas. Trading approval visibility and backend checks remain part of the workflow.
+`ui/theme.css` is the common surface/widget style; `.streamlit/config.toml` supplies native theme defaults. `web_app.py` uses the same colors for Plotly and the optional graph canvas. Trading approval shows the persisted parameters and requires an explicit submit action. Order status, read-only reconciliation and global HALTED stay visible in Orders; the existing colors and layout are retained.

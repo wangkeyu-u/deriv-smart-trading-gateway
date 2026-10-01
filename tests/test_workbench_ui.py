@@ -33,12 +33,12 @@ def test_custom_symbol_and_review_controls_update_before_submit():
     ui.get("button_group")[1].set_value("review").run()
     assert not ui.exception
     assert ui.radio[0].label == "你的预期方向"
-    assert ui.radio[0].value == "CALL"
+    assert ui.radio[0].value == "UP"
 
 
 def test_trade_confirmation_remains_bound_to_visible_pending_order():
     ui = app()
-    pending = {"action": "execute_simulated_trade", "symbol": "R_75", "amount": 10, "contract_type": "CALL", "duration": 5, "duration_unit": "t"}
+    pending = {"action": "place_contract", "symbol": "R_75", "amount": 10, "contract_type": "CALL", "duration": 5, "duration_unit": "t"}
     ui.session_state["pending_trade"] = pending
     ui.get("button_group")[0].set_value("trade").run()
     assert not ui.exception
@@ -78,13 +78,13 @@ def test_draft_and_review_parameters_survive_workspace_navigation():
     next(item for item in ui.text_input if item.label == "自定义品种").input("frxGBPUSD").run()
     ui.get("button_group")[1].set_value("review").run()
     ui.text_area[0].input("均线转弱，复核下行观察").run()
-    ui.radio[0].set_value("PUT").run()
+    ui.radio[0].set_value("DOWN").run()
     ui.slider[0].set_value(15).run()
     ui.get("button_group")[0].set_value("market").run()
     ui.get("button_group")[0].set_value("analysis").run()
     assert not ui.exception
     assert ui.text_area[0].value == "均线转弱，复核下行观察"
-    assert ui.radio[0].value == "PUT"
+    assert ui.radio[0].value == "DOWN"
     assert ui.slider[0].value == 15
     assert ui.get("button_group")[1].value == "review"
     assert next(item for item in ui.text_input if item.label == "自定义品种").value == "frxGBPUSD"
@@ -128,7 +128,7 @@ def test_persisted_history_can_be_inspected_and_reused_without_network(monkeypat
     assert not ui.exception
     assert ui.get("button_group")[0].value == "analysis"
     assert ui.text_area[0].value == result["question"]
-    assert ui.radio[0].value == "PUT"
+    assert ui.radio[0].value == "DOWN"
     assert ui.slider[0].value == 15
     assert next(item for item in ui.selectbox if item.label == "交易品种").value == "frxGBPUSD"
 

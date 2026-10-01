@@ -17,3 +17,6 @@ def isolated_storage(tmp_path, monkeypatch):
     monkeypatch.setattr(web_app, "DATA_DIR", tmp_path)
     monkeypatch.setattr(web_app, "DB_PATH", tmp_path / "test.sqlite3")
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.setenv("DERIV_DB_PATH", str(tmp_path / "test.sqlite3"))
+    monkeypatch.delenv("DERIV_LIVE_WRITES_ENABLED", raising=False)
+    monkeypatch.delenv("DERIV_MCP_LIVE_WRITES_ENABLED", raising=False)

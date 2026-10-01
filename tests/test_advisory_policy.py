@@ -17,8 +17,8 @@ def test_scenario_policy_replay(monkeypatch, case):
     state = policy.build_state(case["question"], case["symbol"], market, [], case["scene"], case.get("thesis", ""), 10)
     monkeypatch.setattr(jev_router, "_request", lambda *args: case["reply"])
     assessment = jev_router.assess_market(state, "key", deadline_at=time.perf_counter() + 3)
-    decision = policy.decide(state, assessment, "CALL", enabled=True)
-    assert [decision["stance"], decision["requested_path"]] == case["expect"]
+    decision = policy.decide(state, assessment, "UP", enabled=True)
+    assert [decision["observed_trend"], decision["requested_path"]] == case["expect"]
 
 
 @pytest.mark.parametrize("quote,epoch", [(True, 0), (float("nan"), 0), (100, None), (100, "123"), (100, float("inf"))])
@@ -47,12 +47,12 @@ def test_news_date_filter_and_synthetic_exclusion():
 
 
 def synthesize(monkeypatch, *, path="finish", scene="observe", thesis="", quality="ready", llm=True, budget=10, enabled=True, symbol="frxEURUSD", thesis_status=None):
-    body = response("CALL", path, thesis_status)
+    body = response("UP", path, thesis_status)
     monkeypatch.setattr(jev_router, "_request", lambda *args: body)
     calls = []
     monkeypatch.setattr(web_app, "advisor_llm_synthesis", lambda *args: calls.append(args) or "explanation")
     market = snapshot(symbol, quality=quality)
-    result = web_app.advisor_synthesis_with_jev("review this", symbol, market, [], [], {"stance": "CALL", "confidence": .6, "summary": "local", "vote_counts": {"CALL": 3, "WAIT": 2}}, time.perf_counter(), budget, jev_enabled=enabled, jev_api_key="key", llm_config={"provider": "OpenAI", "api_key": "key", "model": "example"} if llm else {}, scene=scene, thesis=thesis)
+    result = web_app.advisor_synthesis_with_jev("review this", symbol, market, [], [], {"stance": "WAIT", "observed_trend": "UP", "confidence": .6, "summary": "local", "vote_counts": {"UP": 3, "WAIT": 2}}, time.perf_counter(), budget, jev_enabled=enabled, jev_api_key="key", llm_config={"provider": "OpenAI", "api_key": "key", "model": "example"} if llm else {}, scene=scene, thesis=thesis)
     return result, calls
 
 
@@ -90,8 +90,8 @@ def test_synthetic_never_promoted_even_by_decisive_jev(monkeypatch):
 def test_model_error_cannot_preserve_directional_local_vote(monkeypatch):
     market = snapshot()
     state = policy.build_state("observe", "frxEURUSD", market, [], "observe", "", 10)
-    decision = policy.decide(state, jev_router.MarketAssessment(None, "jev_error", error_code="timeout"), "CALL", enabled=True)
-    assert decision["stance"] == "WAIT"
+    decision = policy.decide(state, jev_router.MarketAssessment(None, "jev_error", error_code="timeout"), "UP", enabled=True)
+    assert decision["observed_trend"] == "UNKNOWN"
     assert decision["requested_path"] == "deep"
 
 
