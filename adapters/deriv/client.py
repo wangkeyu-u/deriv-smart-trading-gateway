@@ -320,5 +320,3 @@ def summarize_portfolio(portfolio_response: dict[str, Any]) -> dict[str, Any]:
         "total_potential_payout": total_payout,
         "contracts": contract_rows,
     }
-
-
