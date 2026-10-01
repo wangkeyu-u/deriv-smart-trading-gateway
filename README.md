@@ -2,6 +2,8 @@
 
 An agent orchestration prototype that turns a request into bounded tools, checks account authorization and human confirmation, and records execution outcomes.
 
+中文项目全景说明：[项目结构与设计思路](docs/project-architecture.md)。包含当前目录职责、两条主流程、Jev 控制逻辑、界面、记录、验证范围和后续扩展建议。
+
 The Streamlit workbench uses a compact graphite and blue interface with shared widget, chart and result styles. Settings live in the header, advanced analysis controls are collapsed, and the workspace has four focused areas: **Analysis**, **Market**, **Orders**, and **History**. Analysis shows market evidence, the final stance, source links, Jev participation and measured elapsed time. Detailed rule opinions and runtime traces stay available on demand.
 
 Question drafts and analysis settings survive workspace changes. After submission, the question stays available for another fresh read. History opens the saved evidence, reasoning path and JSON export, and can reuse the question and settings without starting a new request. Results show their snapshot time and describe evidence quality at the time of analysis. The status indicator receives progress while Jev and the explanation model are running, including the transition to deeper explanation.
