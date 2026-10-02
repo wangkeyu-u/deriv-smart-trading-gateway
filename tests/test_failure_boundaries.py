@@ -28,20 +28,19 @@ def test_failed_account_check_cannot_reach_write(monkeypatch, status):
                                      contract_type="CALL", duration=5, duration_unit="t", events=[])
     assert staged["reason"] == "pending_human_confirmation"
     st.session_state.confirm_next_trade = True
-    called = []
-
-    def call(name, coro, params, writer=None):
-        if inspect.iscoroutine(coro):
-            coro.close()
-        called.append(name)
-        assert name == "check_account_status"
-        return status
-
-    monkeypatch.setattr(web_app, "call_deriv_tool", call)
-    result = web_app.execution_agent(task="buy", symbol="R_75", amount=10,
-                                    contract_type="CALL", duration=5, duration_unit="t", events=[])
-    assert result["reason"] == "account_authorization_unverified"
-    assert called == ["check_account_status"]
+    called=[]
+    original=web_app.trading_application
+    def factory(*args,**kwargs):
+        service=original(*args,**kwargs)
+        async def account():
+            called.append('account')
+            raise server.DerivAPIError('Unverified authorization')
+        service.adapter.get_account=account
+        return service
+    monkeypatch.setattr(web_app,'trading_application',factory)
+    result=web_app.execution_agent(task='buy',symbol='R_75',amount=10,contract_type='CALL',duration=5,duration_unit='t',events=[])
+    assert result['reason']=='account_authorization_unverified'
+    assert called==['account']
 
 
 def test_unknown_account_rejected_even_with_live_flag():
@@ -85,17 +84,32 @@ def test_trade_transport_failure_never_retries_buy(monkeypatch, failure):
             raise server.DerivTimeoutError("Write outcome unknown")
 
     monkeypatch.setattr(server, "DerivWebSocketClient", FakeClient)
-    result = json.loads(asyncio.run(server.execute_simulated_trade(
-        "test-token", "INVALID" if failure == "invalid_symbol" else "R_75",
-        10.0, "CALL", 5, "t")))
-    assert result["ok"] is False
+    from services.context import ExecutionContext
+    from adapters.deriv.websocket import WebSocketDerivAdapter
+    from domain.trade import TradeIntent
+    from decimal import Decimal
+    from execution.engine import UnknownOutcomeError
+    from domain.order import Order
+    intent=TradeIntent(action='BUY',symbol='INVALID' if failure=='invalid_symbol' else 'R_75',direction='CALL',
+        amount=Decimal('10'),duration=5,duration_unit='t',account_mode='demo',source='streamlit')
+    adapter=WebSocketDerivAdapter('test-token',FakeClient,ExecutionContext('streamlit'))
+    if failure=='invalid_symbol':
+        with pytest.raises(server.DerivAPIError):
+            asyncio.run(adapter.get_proposal(intent))
+    else:
+        proposal=asyncio.run(adapter.get_proposal(intent))
+        order=Order(intent_id=intent.intent_id,idempotency_key='key',account_id='VRTC123',action=intent.action,
+            symbol=intent.symbol,direction=intent.direction,amount=intent.amount,proposal_id=proposal.proposal_id)
+        with pytest.raises(UnknownOutcomeError):
+            asyncio.run(adapter.place_order(intent,order))
     buys = [payload for payload, _ in calls if "buy" in payload]
     assert len(buys) == (0 if failure == "invalid_symbol" else 1)
 
 
-def test_one_advisor_failure_falls_back_without_executing_trade(monkeypatch):
+def test_one_advisor_failure_does_not_restart_or_execute_trade(monkeypatch):
     original = web_app.local_advisor_opinion
     failed = False
+    market_calls = []
 
     def flaky(advisor, *args, **kwargs):
         nonlocal failed
@@ -109,12 +123,15 @@ def test_one_advisor_failure_falls_back_without_executing_trade(monkeypatch):
 
     monkeypatch.setattr(web_app, "local_advisor_opinion", flaky)
     monkeypatch.setattr(web_app, "collect_advisor_web_context", lambda *a, **k: [])
-    monkeypatch.setattr(web_app, "advisor_market_snapshot", lambda *a, **k: {
+    monkeypatch.setattr(web_app, "advisor_market_snapshot", lambda *a, **k: market_calls.append(1) or {
         "symbol": "R_75", "summary": "synthetic market", "trend": "up", "latest_close": 100.0})
     monkeypatch.setattr(web_app, "advisor_llm_synthesis", lambda *a, **k: None)
     monkeypatch.setattr(web_app, "save_advisor_run", lambda *a, **k: None)
-    monkeypatch.setattr(web_app, "execute_simulated_trade", forbidden_write)
+    monkeypatch.setattr(web_app, "place_contract", forbidden_write)
     result = web_app.run_advisor_council("inspect R_75", "R_75", 4, False)
     assert failed
-    assert result["runtime"] == "local_fallback"
-    assert result["opinions"]
+    assert result["runtime"] == "langgraph"
+    assert result["ok"] is False
+    assert result["status"] == "error"
+    assert result["stance"] == "WAIT"
+    assert market_calls == [1]

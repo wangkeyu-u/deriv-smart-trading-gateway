@@ -1,261 +1,131 @@
-# Deriv operation guide — retained feature and setup reference
+# Deriv Gateway 操作指南
 
-> The current [README](README.md) defines validated behavior and limitations. Statements below about all writes requiring confirmation apply only to the default Streamlit execution path. Direct MCP callers require their own approval policy; local logs are not independently immutable. The historical test count below predates the failure-boundary audit.
+更新：2026-10-02。当前架构见 [项目说明](docs/project-architecture.md)，实现与故障记录见 [阶段记录](docs/execution-refactor.md)。
 
-> 把自然语言交易意图变成市场快照、多智能体建议、风险检查和人工确认执行的 AI 交易控制室。
->
-> Turns natural-language trading intent into market snapshots, multi-agent advice, risk checks, and human-confirmed execution.
-
-[![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
-[![Streamlit](https://img.shields.io/badge/UI-Streamlit-FF4B4B)](https://streamlit.io/)
-[![LangGraph](https://img.shields.io/badge/Agents-LangGraph-008080)](https://langchain-ai.github.io/langgraph/)
-[![FastMCP](https://img.shields.io/badge/Tools-FastMCP-6B4FBB)](https://gofastmcp.com/)
-
----
-
-## 项目简介（中文）
-
-Deriv 智能交易网关把自然语言交易意图转化为协调的多智能体工作流：读取实时 Deriv 市场数据、构建 K 线快照、模拟交易、审查风险，并通过人工确认安全门准备执行。核心是 **Boss Advisor Room**——一个 LangGraph 多顾问委员会，宏观顾问、量化顾问、资金流顾问、风险顾问和反向顾问各自独立分析后由首席顾问综合出 CALL / PUT / WAIT 建议。Streamlit 是操作 UI，LangGraph 是智能体编排引擎，FastMCP 暴露 Deriv 工具层。所有写操作需人工确认，实盘交易被默认锁定。
-
----
-
-# Deriv Smart Trading Gateway
-
-![Deriv Smart Trading Gateway hero](docs/assets/readme-hero.png)
-
-AI trading control room for Deriv. It turns natural-language trading intent into market snapshots, multi-agent advice, risk checks, and human-confirmed execution.
-
-**Built for:** Deriv market data, LangGraph advisor teams, FastMCP tools, Streamlit operations, safer trade review.
-
-## What It Is
-
-Deriv Smart Trading Gateway turns natural-language trading intent into a coordinated multi-agent workflow. It can read live Deriv market data, build candle snapshots, simulate trades, review risk, and prepare execution through a human-confirmed safety gate.
-
-The newest layer is the **Boss Advisor Room**: a LangGraph council where multiple advisor agents read market context, optional web research, and short-horizon signals before producing one clear `CALL`, `PUT`, or `WAIT` recommendation.
-
-Streamlit is the operator UI. LangGraph is the agent orchestration engine. FastMCP exposes the Deriv tool layer for MCP-compatible clients.
-
-## Highlights
-
-- **LangGraph advisor council** with independent advisor nodes, merged graph state, and a chief synthesizer.
-- **Extensible agent prompts** through `agent_prompts.json`, including manager, execution workers, and advisor personas.
-- **Deriv WebSocket tools** for ticks, historical candles, account checks, simulated trades, open-contract status, and close-contract flows.
-- **Natural-language command center** for Chinese and English trading prompts.
-- **Human-in-the-loop execution gates** so write actions require explicit confirmation before Deriv order submission.
-- **Live-account protection** that blocks live trading unless both UI and backend explicitly allow it.
-- **Multi-symbol charting** for synthetic indices, jump indices, boom/crash, and forex symbols such as `R_100`, `R_75`, `BOOM1000`, and `frxEURUSD`.
-- **Local audit trail** for team runs, advisor decisions, role dialogue, API traces, and trade receipts.
-- **Smoke and pytest coverage** for agent configuration, symbol parsing, LangGraph compilation, advisor runtime, and safety gates.
-
-## Architecture
-
-```text
-User / Boss
-  |
-  v
-Streamlit Command Center
-  |
-  +--> LangGraph Advisor Council
-  |      web_research -> market_snapshot -> news_signal -> advisor_* -> synthesize
-  |
-  +--> Hierarchical Execution Team
-  |      manager -> market / strategy / chart / risk / compliance / execution / report
-  |
-  v
-FastMCP Deriv Tool Server
-  |
-  v
-Deriv WebSocket API
-```
-
-## Repository Layout
-
-```text
-.
-├── agent_prompts.json              # Editable prompt registry for manager, workers, and advisors
-├── docs/assets/                    # README and project media
-├── mcp_config.example.json         # MCP client configuration template
-├── scripts/print_mcp_config.py     # Prints paths for this checkout
-├── requirements.txt                # Python dependencies
-├── server.py                       # FastMCP server with Deriv WebSocket tools
-├── smoke_test.py                   # End-to-end runtime smoke checks
-├── tests/                          # Pytest coverage for parsing, safety, prompts, and LangGraph
-└── web_app.py                      # Streamlit operator UI and multi-agent runtime
-```
-
-## Quick Start
+## 运行和配置
 
 ```bash
-cd /path/to/deriv-smart-trading-gateway
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-.venv/bin/streamlit run web_app.py --server.port 8501
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/streamlit run web_app.py --server.port 8511
 ```
 
-Open the app:
-
-```text
-http://localhost:8501
-```
-
-On macOS you can also double-click:
-
-```text
-/path/to/deriv-smart-trading-gateway/Deriv Gateway.command
-```
-
-The launcher creates `.venv` if needed and installs dependencies only when `requirements.txt` changes.
-
-## Run The MCP Server
-
-```bash
-cd /path/to/deriv-smart-trading-gateway
-.venv/bin/python server.py
-```
-
-To configure an MCP client, generate absolute paths for this checkout:
+工作台不需要另启动 MCP 服务。外部客户端可以启动 `.venv/bin/python server.py`，使用 stdio；生成本机路径配置：
 
 ```bash
 .venv/bin/python scripts/print_mcp_config.py
 ```
 
-Copy the printed JSON into your MCP client configuration. `mcp_config.example.json` shows the same structure with placeholders.
+| 配置 | 用途 |
+| --- | --- |
+| TYPESAFE_API_KEY | 启动时提供 Jev 密钥，也可在工作台设置中填写 |
+| DERIV_DB_PATH | Streamlit/MCP 共用的 SQLite 路径；默认 local_data/gateway.sqlite3 |
+| DERIV_APP_ID / DERIV_WS_URL_TEMPLATE | 现有 Legacy WebSocket 接入 |
+| DERIV_RISK_POLICY | 风控 JSON 配置文件的路径 |
+| DERIV_LIVE_WRITES_ENABLED=1 | 主机显式开放 live 写能力，仍需确认和风控 |
+| DERIV_MCP_LIVE_WRITES_ENABLED=1 | 外部 MCP 的额外 live 能力开关 |
 
-Available MCP tools:
+Deriv Token 和解释模型密钥在工作台设置或工具参数中提供，不保存到订单库。代码不自动加载 `.env`。分享 MCP 配置时不填写完整密钥。
 
-- `get_market_ticks`
-- `get_historical_candles`
-- `execute_simulated_trade`
-- `check_account_status`
-- `get_open_contract_status`
-- `close_open_contract`
+## 四个工作区
 
-## Agent System
+### 分析
 
-The app uses two complementary agent systems.
+选择快速看盘、复核想法或深入研究，填写问题和品种。复核方向是 UP/DOWN。可调 4–25 秒预算和外汇近期新闻。Jev 决定 finish/deep/wait，解释模型按需补充文字，分析不会提交订单。
 
-**Execution Team**
+输入草稿跨页面保留。记录页可查看历史证据、下载 JSON 和复用参数；复用后需要用户再次提交才会读取行情。价格为带时间的快照。
 
-- Trading Manager decomposes the boss request and dispatches work.
-- Market Analyst, Strategy Researcher, Chart Engineer, and Report Agent gather context and produce artifacts.
-- Risk Sentinel and Compliance Reviewer block unsafe or incomplete trade requests.
-- Execution Trader is the only worker allowed to submit Deriv write operations.
+### 行情
 
-**Quick market decision**
+读取 Tick、60/300/3600 秒 K 线、保存图表快照，并保留对比、测量与下载数据功能。品种支持原来的自定义输入；能查看某品种不等于该品种被风控允许交易。
 
-- Five deterministic local rules inspect news tone, momentum, price rhythm, risk and the opposite case. Their vote share is shown as rule agreement, never as a profit probability.
-- When configured, Jev reads the current Tick, candle trend metrics and recent headline titles. It contributes a typed `CALL` / `PUT` / `WAIT` opinion that can change the published advisory stance under evidence checks. It never calls the execution worker.
+### 交易
 
-With LangGraph installed, web research and the market snapshot start in parallel. The local checks follow after both finish. If LangGraph is unavailable, the app uses a local runner. Jev and language-model settings are passed into the graph at invocation so background nodes use the selected configuration.
+示例：“买入 R_100，10 USD CALL，5 Tick”；“平仓合同 123456”。Manager 只理解意图并产生草稿。核对账户、金额、方向、期限后勾选确认，点击“确认并提交”。实际授权、风险、proposal、buy/sell 都由固定程序执行。
 
-## Extend Agents
+重复指令和页面 rerun 沿用原逻辑意图。“新建另一笔订单”用于明确启动新的订单。修改金额、期限或 Token 会重新要求确认。
 
-All core prompts live in:
+执行状态可选择 ENABLED/REDUCE_ONLY/HALTED。“停止所有新买入”保存全局 HALTED。它不会关闭账户查询和已批准平仓。
 
-```text
-agent_prompts.json
-```
+重启后或 MCP 创建的草稿可在“恢复订单 / MCP 草稿”中载入。UNKNOWN 使用“只读对账”；不能唯一匹配时保留状态。用户核对经纪商账单后可显式填写对应 contract_id，再核对该合约；这不会重新 buy。已确认或绑定的合约 ID 不能改为另一合约。卖出请求结果未知时，合约自然到期不作为请求卖出成功的证明。
 
-Add a new advisor by creating an `advisor.<id>` entry:
+### 记录
+
+原分析、团队记录和回执保留。新增领域订单在交易页查看状态，详细事件、风险和恢复队列保存于 SQLite。旧历史 CALL/PUT 只在读取边界映射到窗口趋势，不修改原记录。
+
+## MCP 工具迁移
+
+| 工具 | 用途 |
+| --- | --- |
+| get_market_ticks / get_historical_candles | 公开行情 |
+| check_account_status | 账户余额及持仓 |
+| get_open_contract_status | 指定合约，或开放持仓列表 |
+| create_trade_intent | 创建严格意图并验证账户，返回待确认订单 |
+| get_trade_intent / get_order_status | 查询意图/订单；订单 refresh=true 可只读核对 |
+| place_contract | 提交已有本地批准的 BUY 意图 |
+| close_open_contract | 提交已有本地批准的 SELL 意图，当前只支持 market price=0 |
+
+旧 execute_simulated_trade 已迁移为 place_contract，旧接口不再注册。所有写入口必须传 intent_id，不能靠 Token 和 allow_live 直接买入。
+
+创建草稿的 payload 是 JSON 字符串。例如：
 
 ```json
 {
-  "advisor.breakout": {
-    "name": "Breakout Advisor",
-    "prompt": "Only evaluate breakout and failed-breakout setups. Always include confirmation price, invalidation level, and whether to wait."
-  }
+  "intent_id": "user-request-unique-001",
+  "source": "mcp",
+  "action": "BUY",
+  "symbol": "R_100",
+  "direction": "CALL",
+  "amount": "10.00",
+  "duration": 5,
+  "duration_unit": "t",
+  "account_mode": "demo"
 }
 ```
 
-The UI automatically creates a matching LangGraph advisor node for custom advisor prompts. The reserved `advisor.chief` prompt controls the final synthesizer.
+相同请求重发时沿用这个 ID，新订单使用新 ID。之后在工作台载入并确认；MCP 没有 approve 工具。已批准意图的提交参数必须完全匹配，数值等值的 10/10.0/10.00 视为相同金额。
 
-To add a new execution worker, add its prompt first, then register the corresponding tool or node in `web_app.py`.
+默认 MCP 不能直接 live execution；即使同时启用两个主机开关，也不能绕过持久 Approval、账户匹配、全局状态或 RiskEngine。
 
-## Safety Model
+## 风控配置
 
-The gateway is designed to keep execution explicit:
+配置文件可只写需要覆盖的字段；其余使用默认值。以下是默认配置，金额为账户币种：
 
-- API keys are stored only in Streamlit session state, not hardcoded in source files.
-- Missing token, missing amount, missing direction, or unclear trade intent blocks execution.
-- Deriv write actions require human confirmation from the UI.
-- Demo accounts are supported by default.
-- Live-account execution is blocked unless `allow_live=true` is explicitly provided by both UI and backend paths.
-- Advisor recommendations never bypass the execution safety gate.
-
-## Local Data
-
-The app stores run history and audit records in a local SQLite database:
-
-```text
-local_data/gateway.sqlite3
+```json
+{
+  "max_stake_per_trade": "50",
+  "max_total_open_stake": "200",
+  "max_open_contracts": 5,
+  "max_symbol_exposure": "100",
+  "max_daily_loss": "50",
+  "max_consecutive_losses": 3,
+  "cooldown_after_loss": 60,
+  "min_available_balance": "10",
+  "allowed_symbols": ["R_100", "R_75", "R_50", "R_25", "R_10", "frxEURUSD", "frxGBPUSD"],
+  "allowed_contract_types": ["CALL", "PUT"],
+  "max_duration": 3600,
+  "max_tick_duration": 10,
+  "max_orders_per_minute": 5
+}
 ```
 
-Stored records include team runs, advisor runs, role dialogue, API traces, execution logs, and trade receipts. API keys are not written to this database.
+通过 `DERIV_RISK_POLICY` 指向文件。严格校验拒绝额外字段和非法类型。日亏损为 UTC 当日已结算净损益的负数部分；连亏来自最近结算记录。损益按合约去重，读取覆盖当日与完整的尾部亏损序列；非有限值、负金额、记录冲突、超过 2000 条读取边界或读取失败时不提交。未知订单计入预留并阻止新 BUY。
 
-## Model Providers
+## 数据升级与恢复
 
-The model selector supports:
+保留原 SQLite 文件，启动会执行增量 migration；本轮 v3 仅增加对账 lease_token。订单意图、状态、事件、确认、风险、回执和对账任务均持久化。不要删除数据库来“清除”未知订单；这样会失去幂等与恢复依据。
 
-- Local rule engine with no model API key.
-- OpenAI.
-- DeepSeek through the OpenAI-compatible base URL `https://api.deepseek.com`.
-- Anthropic.
-- Custom OpenAI-compatible providers with a configurable base URL.
+运行实例需要共享同一数据库路径。进程退出可由 owner_pid 检测；无法证明退出时租约到期再恢复。MCP 无账户密钥启动仅排队；显式带账户调用 `get_order_status(refresh=true)` 可以恢复。没有常驻后台对账服务。
 
-Jev uses a separate TypeSafe API key and the System One decision endpoint. Enable it in the sidebar to let it participate in the Advisor Council even when the main model provider is the local rule engine. With a valid, supported Jev decision, the council skips the final prose model call to reduce response time. See [README.md](README.md#optional-jev-live-decision) for the decision rules and limits.
-
-## Symbol Examples
-
-The chart and advisor workflows accept many Deriv symbols:
-
-```text
-Draw the latest 120 one-minute candles for R_100
-Draw frxEURUSD 60 candles at 5m
-Analyze R_75 for the next 5 minutes
-Check BOOM1000 momentum before execution
-```
-
-Common symbols include:
-
-```text
-R_10, R_25, R_50, R_75, R_100
-1HZ10V, 1HZ25V, 1HZ50V, 1HZ75V, 1HZ100V
-BOOM500, BOOM1000, CRASH500, CRASH1000
-JD10, JD25, JD50, JD75, JD100
-frxEURUSD, frxGBPUSD, frxUSDJPY
-```
-
-## Validation
-
-Run the checks:
+## 测试与 Jev 评估
 
 ```bash
-.venv/bin/python -m py_compile web_app.py server.py smoke_test.py
-.venv/bin/python -m pytest -q
-.venv/bin/python smoke_test.py
+.venv/bin/python -m pytest -q --disable-warnings --tb=short --show-capture=no
+.venv/bin/python scripts/evaluate_jev.py --output local_data/jev-offline-replay.json
+# 显式真实模型调用，仅发送人工场景
+.venv/bin/python scripts/evaluate_jev.py --live --output local_data/jev-live-eval.json
 ```
 
-Recent validation:
+离线结果中的 Jev 答案为模拟，真实 latency/token/cost 为 null。`--live` 使用 TYPESAFE_API_KEY；可用 `--input-price-per-million` 和 `--output-price-per-million` 提供明确报价进行估算，不作为经核实账单。
 
-```text
-13 passed
-dependencies: OK
-prompts_and_symbols: OK
-langgraph_compile: OK
-deriv_market_tools: OK
-advisor_runtime: OK
-```
-
-## Deriv Endpoint
-
-The implementation defaults to the compatible Deriv v3 WebSocket endpoint:
-
-```text
-wss://ws.derivws.com/websockets/v3?app_id={app_id}
-```
-
-Override it with `DERIV_WS_URL_TEMPLATE` if you need a different endpoint.
-
-## Disclaimer
-
-This project is a local trading assistant and research gateway. It is not financial advice. Always review advisor output, risk gates, account mode, and order parameters before placing trades.
+`smoke_test.py` 包含真实行情请求并可能写本地分析记录。它不是离线测试，也不证明真实交易通过。
