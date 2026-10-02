@@ -1,5 +1,6 @@
 """Broker boundary. Business code never builds Deriv request JSON."""
 import asyncio
+import math
 from decimal import Decimal
 
 from domain.trade import TradingMode
@@ -74,11 +75,15 @@ class WebSocketDerivAdapter:
                     raise NotSentError('Account mismatch')
                 attempted=True
                 response=await client.request(payload, retries=0)
-                result=response.get(response_key) or {}
-                if response_key=='buy' and (type(result.get('contract_id')) is not int or result['contract_id']<=0):
-                    raise UnknownOutcomeError('Missing contract_id')
+                result=response.get(response_key)
+                if not isinstance(result,dict) or type(result.get('contract_id')) is not int or result['contract_id']<=0:
+                    raise UnknownOutcomeError('Missing contract identity')
+                if type(result.get('transaction_id')) is not int or result['transaction_id'] <= 0:
+                    raise UnknownOutcomeError('Missing transaction identity')
+                if response_key=='sell' and result['contract_id'] != intent.contract_id:
+                    raise UnknownOutcomeError('Sell response contract mismatch')
                 safe={key:result[key] for key in ('contract_id','transaction_id','buy_price','purchase_price','sold_for','sell_price','longcode','start_time') if key in result}
-                return {**safe,'contract_id':result.get('contract_id') or intent.contract_id,
+                return {**safe,'contract_id':result['contract_id'],
                         'transaction_id':result.get('transaction_id'), 'symbol':intent.symbol,
                         'contract_type':intent.direction.value if intent.direction else None,
                         'purchase_price':result.get('buy_price'), 'currency':auth.get('currency'),
@@ -106,7 +111,12 @@ class WebSocketDerivAdapter:
             async with self.client() as client:
                 self._authorize(client)
                 raw=(await client.request({'proposal_open_contract':1,'contract_id':contract_id}, retries=0)).get('proposal_open_contract',{})
-                return ContractSnapshot(int(raw['contract_id']),bool(raw.get('is_sold')),bool(raw.get('is_expired')),raw)
+                if type(raw.get('contract_id')) is not int or raw['contract_id'] != contract_id:
+                    raise ValueError('Contract identity mismatch')
+                for flag in ('is_sold','is_expired'):
+                    if type(raw.get(flag)) not in (bool,int) or raw[flag] not in (0,1):
+                        raise ValueError('Incomplete contract state')
+                return ContractSnapshot(contract_id,bool(raw['is_sold']),bool(raw['is_expired']),raw)
         return await asyncio.wait_for(read(), self.context.remaining_time)
 
     async def get_statement(self, since):
@@ -122,16 +132,28 @@ class WebSocketDerivAdapter:
         async def read():
             async with self.client() as client:
                 self._authorize(client)
-                rows=[]
-                # Fetch all of today plus enough recent trades to determine a loss streak.
+                rows={}
+                # Cover today and the complete trailing loss streak, or fail closed at the bound.
                 for offset in range(0,2000,100):
                     response=await client.request({'profit_table':1,'description':1,'limit':100,'offset':offset,'sort':'DESC'},retries=0)
                     batch=response.get('profit_table',{}).get('transactions')
                     if not isinstance(batch,list):
                         raise ValueError('Missing broker profit history')
-                    rows.extend(batch)
-                    if len(batch)<100 or (len(rows)>=100 and min(float(r['sell_time']) for r in batch)<today):
-                        return [ClosedContract(int(r['contract_id']),Decimal(str(r['buy_price'])),Decimal(str(r['sell_price'])),float(r['sell_time'])) for r in rows]
+                    for raw in batch:
+                        row=ClosedContract(int(raw['contract_id']),Decimal(str(raw['buy_price'])),
+                                           Decimal(str(raw['sell_price'])),float(raw['sell_time']))
+                        if (row.contract_id <= 0 or not math.isfinite(row.sell_time) or row.sell_time < 0
+                                or not row.buy_price.is_finite() or not row.sell_price.is_finite()
+                                or row.buy_price < 0 or row.sell_price < 0):
+                            raise ValueError('Invalid broker profit record')
+                        if row.contract_id in rows and rows[row.contract_id] != row:
+                            raise ValueError('Conflicting broker profit records')
+                        rows[row.contract_id]=row
+                    history=sorted(rows.values(),key=lambda row:row.sell_time,reverse=True)
+                    streak_known=any(row.sell_price>=row.buy_price for row in history)
+                    today_covered=bool(history) and history[-1].sell_time<today
+                    if len(batch)<100 or (today_covered and streak_known):
+                        return history
                 raise ValueError('Profit history exceeds bounded page limit')
         return await asyncio.wait_for(read(),self.context.remaining_time)
 
@@ -139,22 +161,31 @@ class WebSocketDerivAdapter:
         account=await self.get_account()
         if account.account_id != order.account_id:
             return ReconciliationResult(False)
+        contract=None
         if order.contract_id:
             contract=await self.get_contract(order.contract_id)
             if contract.contract_id != order.contract_id or (order.action=='SELL' and not contract.is_sold):
                 return ReconciliationResult(False)
-            return ReconciliationResult(True,'EXPIRED' if contract.is_expired and contract.is_sold else 'CLOSED' if contract.is_sold else 'OPEN',
-                {'contract_id':order.contract_id,'transaction_id':order.transaction_id})
+            if order.action=='BUY' or not contract.is_expired:
+                return ReconciliationResult(True,'EXPIRED' if contract.is_expired and contract.is_sold else 'CLOSED' if contract.is_sold else 'OPEN',
+                    {'contract_id':order.contract_id,'transaction_id':order.transaction_id})
         transactions=await self.get_statement(int((order.submitted_at or order.created_at).timestamp())-60)
         # Statement passthrough/proposal IDs are optional. Similar-looking trades aren't proof.
         candidates=[row for row in transactions if
-                    (row.get('passthrough') or {}).get('order_id')==order.order_id or
-                    (order.proposal_id and row.get('proposal_id')==order.proposal_id)]
+                    ((row.get('passthrough') or {}).get('order_id')==order.order_id or
+                     (order.proposal_id and row.get('proposal_id')==order.proposal_id))
+                    and (order.action=='BUY' or (
+                        row.get('action_type')=='sell' and row.get('contract_id')==order.contract_id))]
         identities={int(row['contract_id']) for row in candidates if row.get('contract_id')}
         if len(identities)==1:
-            cid=next(iter(identities)); contract=await self.get_contract(cid)
-            if contract.contract_id==cid:
-                return ReconciliationResult(True,'EXPIRED' if contract.is_expired and contract.is_sold else 'CLOSED' if contract.is_sold else 'OPEN',{'contract_id':cid})
+            cid=next(iter(identities))
+            if contract is None or contract.contract_id!=cid:
+                contract=await self.get_contract(cid)
+            if contract.contract_id==cid and (order.action=='BUY' or contract.is_sold):
+                tid=next((row['transaction_id'] for row in candidates
+                          if type(row.get('transaction_id')) is int and row['transaction_id']>0),None)
+                status='CLOSED' if order.action=='SELL' else 'EXPIRED' if contract.is_expired and contract.is_sold else 'CLOSED' if contract.is_sold else 'OPEN'
+                return ReconciliationResult(True,status,{'contract_id':cid,'transaction_id':tid})
         return ReconciliationResult(False)
 
     async def sync_server_time(self):

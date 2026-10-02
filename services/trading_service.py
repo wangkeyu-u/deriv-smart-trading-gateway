@@ -50,9 +50,12 @@ class TradingService:
         if account.mode != intent.account_mode:
             raise AccountValidationError('live_account_blocked' if account.mode=='live' else 'account_mode_mismatch')
         order=self.repo.create_order(intent,account.account_id,self.context.request_id)
-        if order.status == S.CREATED:
-            order=self.repo.transition(order.order_id,S.VALIDATED,'validated')
-            order=self.repo.transition(order.order_id,S.APPROVAL_REQUIRED,'approval_required')
+        with self.repo.db.transaction() as conn:
+            order=self.repo.get(order.order_id,conn)
+            if order.status == S.CREATED:
+                order=self.repo.transition(order.order_id,S.VALIDATED,'validated',conn=conn)
+            if order.status == S.VALIDATED:
+                order=self.repo.transition(order.order_id,S.APPROVAL_REQUIRED,'approval_required',conn=conn)
         return order
 
     def approve_trade(self, intent_id, account_id, *, expected_intent, approved_by='local-user'):
@@ -67,6 +70,7 @@ class TradingService:
             contract_id=intent.contract_id,fingerprint=fingerprint(intent,account_id),approved_by=approved_by,
             expires_at=utc_now()+timedelta(minutes=10))
         with self.repo.db.transaction() as conn:
+            order=self.repo.get(order.order_id,conn)
             conn.execute('INSERT INTO approvals VALUES(?,?,?,?,?)',
                 (approval.approval_id,intent_id,account_id,approval.fingerprint,approval.model_dump_json()))
             if order.status == S.APPROVAL_REQUIRED:
@@ -85,10 +89,9 @@ class TradingService:
                    a.fingerprint==fingerprint(intent,order.account_id) for row in rows)
 
     async def execute_trade(self, intent_id):
-        order=self.repo.by_intent(intent_id)
-        if order and order.status not in {S.CREATED,S.VALIDATED,S.APPROVAL_REQUIRED,S.APPROVED}:
-            return order
         order=await self.validate_trade(intent_id)
+        if order.status not in {S.CREATED,S.VALIDATED,S.APPROVAL_REQUIRED,S.APPROVED}:
+            return order
         intent=self.repo.intent(intent_id)
         if intent.account_mode == 'live':
             if os.getenv('DERIV_LIVE_WRITES_ENABLED') != '1' or (self.context.source=='mcp' and os.getenv('DERIV_MCP_LIVE_WRITES_ENABLED') != '1'):
@@ -100,6 +103,9 @@ class TradingService:
         self.context.require_time()
         if order.action == 'BUY':
             proposal=await self.adapter.get_proposal(intent)
+            if (not proposal.proposal_id or not isinstance(proposal.ask_price,Decimal)
+                    or not proposal.ask_price.is_finite() or not 0 < proposal.ask_price <= intent.amount):
+                raise ValueError('Invalid proposal or price exceeds confirmed stake')
             # Update proposal without a status event: the submission claim still happens only once.
             with self.repo.db.transaction() as conn:
                 old=self.repo.get(order.order_id,conn)
@@ -124,8 +130,16 @@ class TradingService:
             state=TradingState(conn.execute('SELECT state FROM trading_control WHERE singleton=1').fetchone()[0])
             if not self.valid_approval(claimed,conn):
                 result=RiskResult(allowed=False,code='APPROVAL_EXPIRED',reason='Approval expired before submission')
+            elif self.context.remaining_time <= 0:
+                result=RiskResult(allowed=False,code='DEADLINE_EXHAUSTED',reason='Deadline exhausted before submission')
             elif account.account_id != claimed.account_id or account.mode != intent.account_mode:
                 result=RiskResult(allowed=False,code='ACCOUNT_MISMATCH',reason='Authenticated account differs')
+            elif claimed.action == 'SELL' and any(
+                    other.order_id != claimed.order_id and other.action == 'SELL'
+                    and other.contract_id == claimed.contract_id
+                    for other in self.repo.list(claimed.account_id,
+                        {S.SUBMITTING,S.ACKNOWLEDGED,S.UNKNOWN,S.RECONCILING,S.CLOSED},conn)):
+                result=RiskResult(allowed=False,code='CONTRACT_CLOSE_IN_PROGRESS',reason='Contract close already submitted')
             elif time.monotonic()-snapshot_at>5:
                 result=RiskResult(allowed=False,code='STALE_RISK_SNAPSHOT',reason='Risk snapshot is stale')
             else:
@@ -174,6 +188,9 @@ class TradingService:
         return state
 
     async def confirm_and_execute(self, expected_intent: TradeIntent, *, approved_by='local-user'):
+        stored=self.repo.intent(expected_intent.intent_id)
+        if fingerprint(stored,'') != fingerprint(expected_intent,''):
+            raise ValueError('Confirmation parameters do not match the immutable intent')
         order=await self.validate_trade(expected_intent.intent_id)
         if order.status in {S.APPROVAL_REQUIRED,S.APPROVED} and not self.valid_approval(order):
             self.approve_trade(expected_intent.intent_id,order.account_id,expected_intent=expected_intent,approved_by=approved_by)
@@ -190,18 +207,14 @@ class TradingService:
             raise AccountValidationError('account_authorization_unverified')
         contract=await self.adapter.get_contract(order.contract_id)
         if contract.is_sold:
-            return self.repo.transition(order_id,S.EXPIRED if contract.is_expired else S.CLOSED,'broker_settled')
+            return self.repo.transition(order_id,S.EXPIRED if contract.is_expired else S.CLOSED,
+                                        'broker_settled',expected=S.OPEN)
         return order
 
     async def close_trade(self, intent_id):
         if self.repo.intent(intent_id).action != 'SELL':
             raise ValueError('close_trade requires a SELL intent')
-        order=await self.execute_trade(intent_id)
-        if order.status == S.CLOSED:
-            for parent in self.repo.list(order.account_id,{S.OPEN}):
-                if parent.contract_id == order.contract_id:
-                    self.repo.transition(parent.order_id,S.CLOSED,'closed_by_sell')
-        return order
+        return await self.execute_trade(intent_id)
 
     def get_order_status(self, order_id):
         return self.repo.get(order_id)
@@ -214,6 +227,8 @@ class TradingService:
         account=await self.adapter.get_account()
         if account.account_id!=order.account_id or order.status!=S.UNKNOWN:
             raise ValueError('Only an uncertain order for this account can be resolved')
+        if order.contract_id is not None and order.contract_id != contract_id:
+            raise ValueError('Cannot change the confirmed contract identity')
         contract=await self.adapter.get_contract(contract_id)
         if contract.contract_id!=contract_id:
             raise ValueError('Contract identity mismatch')
@@ -221,6 +236,8 @@ class TradingService:
         with self.repo.db.transaction() as conn:
             old=self.repo.get(order_id,conn)
             if old.status!=S.UNKNOWN: return old
+            if old.contract_id is not None and old.contract_id != contract_id:
+                raise ValueError('Cannot change the confirmed contract identity')
             updated=old.model_copy(update={'contract_id':contract_id})
             conn.execute('UPDATE orders SET contract_id=?,data_json=? WHERE order_id=?',(contract_id,updated.model_dump_json(),order_id))
             self.repo._event(conn,updated,old.status,'human_contract_binding',{'contract_id':contract_id})

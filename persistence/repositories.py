@@ -122,7 +122,7 @@ class OrderRepository:
         if status == S.SUBMITTING:
             conn.execute('UPDATE orders SET lease_until=?,owner_pid=? WHERE order_id=?', (time.time() + 60, os.getpid(), order_id))
         if status == S.UNKNOWN:
-            conn.execute('INSERT INTO reconciliation_jobs(order_id,due_at) VALUES(?,?) ON CONFLICT(order_id) DO UPDATE SET due_at=excluded.due_at,lease_until=0,owner_pid=NULL', (order_id, time.time()))
+            conn.execute('INSERT INTO reconciliation_jobs(order_id,due_at) VALUES(?,?) ON CONFLICT(order_id) DO UPDATE SET due_at=excluded.due_at,lease_until=0,owner_pid=NULL,lease_token=NULL', (order_id, time.time()))
         return order
 
     def claim_submission(self, order_id, risk_check=None):
@@ -137,23 +137,41 @@ class OrderRepository:
             return self.transition(order_id, S.SUBMITTING, 'submit_claimed', expected=S.APPROVED,
                                    changes={'submitted_at': utc_now()}, conn=conn), True
 
-    def acknowledge(self, order_id, receipt):
-        with self.db.transaction() as conn:
-            old = self.get(order_id, conn)
-            if old.status in {S.OPEN, S.CLOSED, S.EXPIRED, S.REJECTED, S.CANCELLED}:
-                return old
-            for row in conn.execute('SELECT order_id,receipt_json FROM order_receipts WHERE account_id=?',(old.account_id,)):
-                other=json.loads(row['receipt_json'])
-                if row['order_id']!=order_id and old.action=='BUY' and other.get('contract_id')==receipt.get('contract_id'):
-                    return self.transition(order_id,S.UNKNOWN,'conflicting_broker_identity',changes={'last_error':'BROKER_IDENTITY_CONFLICT'},conn=conn)
-            if old.status==S.UNKNOWN:
-                old=self.transition(order_id,S.RECONCILING,'late_receipt_resolution',conn=conn)
-            conn.execute('INSERT OR IGNORE INTO order_receipts VALUES(?,?,?,?)',
-                         (order_id, old.account_id, receipt.get('transaction_id'), json.dumps(receipt)))
-            order = self.transition(order_id, S.ACKNOWLEDGED, 'broker_ack', changes={
-                'receipt': receipt, 'contract_id': receipt['contract_id'],
-                'transaction_id': receipt.get('transaction_id'), 'last_error': None}, conn=conn)
-            return self.transition(order_id, S.CLOSED if order.action == 'SELL' else S.OPEN, 'broker_effect_confirmed', conn=conn)
+    def acknowledge(self, order_id, receipt, conn=None):
+        if conn is None:
+            with self.db.transaction() as connection:
+                return self.acknowledge(order_id,receipt,connection)
+        old = self.get(order_id, conn)
+        if old.status in {S.OPEN, S.CLOSED, S.EXPIRED, S.REJECTED, S.CANCELLED}:
+            return old
+        cid=receipt.get('contract_id')
+        tid=receipt.get('transaction_id')
+        if type(cid) is not int or cid <= 0 or (tid is not None and (type(tid) is not int or tid <= 0)):
+            raise ValueError('Invalid broker receipt identity')
+        if old.action == 'SELL' and cid != old.contract_id:
+            raise ValueError('Receipt does not match confirmed SELL contract')
+        for row in conn.execute('SELECT order_id,receipt_json FROM order_receipts WHERE account_id=?',(old.account_id,)):
+            other=json.loads(row['receipt_json'])
+            if row['order_id']!=order_id and (
+                    (old.action=='BUY' and other.get('contract_id')==cid)
+                    or (tid is not None and other.get('transaction_id')==tid)):
+                return self.transition(order_id,S.UNKNOWN,'conflicting_broker_identity',
+                    changes={'last_error':'BROKER_IDENTITY_CONFLICT'},conn=conn)
+        if old.status==S.UNKNOWN:
+            old=self.transition(order_id,S.RECONCILING,'late_receipt_resolution',conn=conn)
+        existing=conn.execute('SELECT receipt_json FROM order_receipts WHERE order_id=?',(order_id,)).fetchone()
+        if existing is None:
+            conn.execute('INSERT INTO order_receipts VALUES(?,?,?,?)',
+                         (order_id, old.account_id, tid, json.dumps(receipt)))
+        order = self.transition(order_id, S.ACKNOWLEDGED, 'broker_ack', changes={
+            'receipt': receipt, 'contract_id': cid, 'transaction_id': tid, 'last_error': None}, conn=conn)
+        order=self.transition(order_id, S.CLOSED if order.action == 'SELL' else S.OPEN, 'broker_effect_confirmed', conn=conn)
+        if order.action == 'SELL':
+            for parent in self.list(order.account_id,{S.OPEN},conn):
+                if parent.action == 'BUY' and parent.contract_id == cid:
+                    self.transition(parent.order_id,S.CLOSED,'closed_by_sell',conn=conn)
+        conn.execute('DELETE FROM reconciliation_jobs WHERE order_id=?',(order_id,))
+        return order
 
     def events(self, order_id):
         with self.db.transaction() as conn:

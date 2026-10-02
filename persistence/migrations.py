@@ -37,7 +37,8 @@ MIGRATIONS = {
     2: [
         'ALTER TABLE orders ADD COLUMN owner_pid INTEGER',
         'ALTER TABLE reconciliation_jobs ADD COLUMN owner_pid INTEGER',
-    ]
+    ],
+    3: ['ALTER TABLE reconciliation_jobs ADD COLUMN lease_token TEXT'],
 }
 
 

@@ -64,7 +64,11 @@ class DerivWebSocketClient:
         self.authorization: dict[str, Any] | None = None
 
     async def __aenter__(self) -> "DerivWebSocketClient":
-        await self._connect_and_authorize()
+        try:
+            await self._connect_and_authorize()
+        except BaseException:
+            await self.close()
+            raise
         return self
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:

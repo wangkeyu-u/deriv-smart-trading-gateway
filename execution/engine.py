@@ -26,13 +26,17 @@ class OrderEngine:
         intent = self.repo.intent(order.intent_id)
         try:
             receipt = await (adapter.place_order(intent, order) if order.action == 'BUY' else adapter.close_order(intent, order))
-            if not receipt.get('contract_id'):
+            if (not isinstance(receipt,dict) or type(receipt.get('contract_id')) is not int
+                    or receipt['contract_id'] <= 0):
                 raise UnknownOutcomeError('Missing broker contract identity')
+            return self.repo.acknowledge(order_id, receipt)
         except asyncio.CancelledError:
-            self.repo.transition(order_id,S.UNKNOWN,'submission_cancelled',changes={'last_error':'CANCELLED_AFTER_CLAIM'})
+            self.repo.transition(order_id,S.UNKNOWN,'submission_cancelled',expected=S.SUBMITTING,
+                                 changes={'last_error':'CANCELLED_AFTER_CLAIM'})
             raise
         except (NotSentError, BrokerRejectedError) as exc:
-            return self.repo.transition(order_id, S.REJECTED, type(exc).__name__, changes={'last_error': type(exc).__name__})
+            return self.repo.transition(order_id, S.REJECTED, type(exc).__name__, expected=S.SUBMITTING,
+                                        changes={'last_error': type(exc).__name__})
         except Exception as exc:
-            return self.repo.transition(order_id, S.UNKNOWN, 'outcome_unknown', changes={'last_error': type(exc).__name__})
-        return self.repo.acknowledge(order_id, receipt)
+            return self.repo.transition(order_id, S.UNKNOWN, 'outcome_unknown', expected=S.SUBMITTING,
+                                        changes={'last_error': type(exc).__name__})
