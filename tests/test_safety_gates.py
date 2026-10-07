@@ -61,7 +61,7 @@ def test_execution_requires_human_confirmation_before_write() -> None:
 
     assert report["ok"] is False
     assert report["reason"] == "pending_human_confirmation"
-    assert st.session_state.pending_trade["action"] == "execute_simulated_trade"
+    assert st.session_state.pending_trade["action"] == "place_contract"
 
 
 def test_confirmation_is_bound_to_pending_order_parameters() -> None:
@@ -93,24 +93,20 @@ def test_execution_blocks_live_account_without_allow_live(monkeypatch: Any) -> N
     st.session_state.confirm_next_trade = True
     st.session_state.allow_live_execution = False
 
-    def fake_call_deriv_tool(tool_name: str, coro: Any, params: dict[str, Any], writer: Any = None) -> dict[str, Any]:
-        if inspect.iscoroutine(coro):
-            coro.close()
-        if tool_name == "check_account_status":
-            return {"ok": True, "data": {"account_type": "live"}}
-        raise AssertionError("write tool should not be called for blocked live account")
-
-    monkeypatch.setattr(web_app, "call_deriv_tool", fake_call_deriv_tool)
+    original=web_app.trading_application
+    def factory(*args,**kwargs):
+        from adapters.deriv.models import AccountSnapshot
+        from domain.trade import TradingMode
+        from decimal import Decimal
+        service=original(*args,**kwargs)
+        async def account(): return AccountSnapshot('CR1',TradingMode.LIVE,Decimal('1000'),'USD')
+        service.adapter.get_account=account
+        return service
+    monkeypatch.setattr(web_app,'trading_application',factory)
     events: list[web_app.AgentEvent] = []
-    report = web_app.execution_agent(
-        task="执行模拟盘订单",
-        symbol="R_75",
-        amount=10,
-        contract_type="CALL",
-        duration=5,
-        duration_unit="t",
-        events=events,
-    )
-
-    assert report["ok"] is False
-    assert report["reason"] == "live_account_blocked"
+    kwargs=dict(task="执行模拟盘订单",symbol="R_75",amount=10,contract_type="CALL",duration=5,duration_unit="t",events=events)
+    assert web_app.execution_agent(**kwargs)['reason']=='pending_human_confirmation'
+    st.session_state.confirm_next_trade=True
+    report=web_app.execution_agent(**kwargs)
+    assert report['ok'] is False
+    assert report['reason']=='live_account_blocked'

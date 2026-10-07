@@ -1,0 +1,42 @@
+name: Execution regression checks
+
+on:
+  push:
+    branches: [main, codex/jev-scenario-controller]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: execution-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
+    env:
+      DERIV_LIVE_WRITES_ENABLED: '0'
+      DERIV_MCP_LIVE_WRITES_ENABLED: '0'
+      TYPESAFE_API_KEY: ''
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Unit and failure-injection tests
+        run: python -m pytest -q --disable-warnings --tb=short --show-capture=no
+      - name: Offline advisory policy replay
+        run: python scripts/evaluate_jev.py --output "$RUNNER_TEMP/advisory-replay.json"
+      - name: Check patch whitespace
+        run: git show --format= --check HEAD
