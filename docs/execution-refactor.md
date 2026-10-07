@@ -105,3 +105,23 @@ Phase 7 最终完整测试：153 passed（2026-10-01）。离线场景回放 12/
 | 替换 Adapter 可能绕过报价金额限制 | TradingService 也检查报价不超过确认金额，提交事务内复核 deadline |
 
 复现与回归位于 `tests/test_execution_review.py`。全部使用本地 SQLite 与假传输；没有真实账户订单或 Jev 调用。[Deriv sell 文档](https://developers.deriv.com/docs/trading/sell/)描述的是提前卖出开放合约，复审保留了“自然到期不能证明某次卖出请求成功”的保守判断。
+
+## 2026-10-07 执行与对账补充审计
+
+在 `427c29b` 的既有执行核心上补充修复，未重写交易流程。新增故障回归先在未修实现上运行：即时回执组出现 4 个失败，账户快照组 34 个失败，对账证据组 26 个失败，随后修复对应边界。
+
+| 问题 | 当前行为 |
+| --- | --- |
+| 替换 Adapter 的即时回执仅有合约 ID 就被确认 | BUY/SELL 的即时回执同时要求正整数合约和交易 ID；缺失、布尔、字符串、非整数或非正标识保留 UNKNOWN，不重复发送 |
+| 负仓位价、非法合约 ID 或重复合约可降低曝光 | 默认 Adapter 和 TradingService 共用账户快照校验，求和和字典去重前拒绝异常；最终预检失败落盘 RISK_DATA_UNAVAILABLE，不提交 |
+| BUY 对账接受 SELL 账单；浮点合约 ID 被截断 | 动作须与意图一致；账单 ID 不强制转换，非法证据保持 UNKNOWN |
+| 同一合约多笔交易任选第一笔 | 核对唯一 `(contract_id, transaction_id)` 身份；相同身份重复记录可合并，不同身份不能自动确认 |
+| UNKNOWN SELL 仅见合约已售出就确认成功 | 必须有归属于本逻辑 SELL 的唯一卖出账单；其他操作关闭合约不会产生本订单的成交回执 |
+
+只读恢复在充分证据下允许缺交易 ID，保留已绑定 BUY 的指定合约核对。回归包含这一兼容约束。
+
+纯计划类型、默认解析常量和 16 个纯解析函数移至 `planning.py`，在 `web_app.py` 保留显式导入兼容入口。迁移前后函数 AST 一致；模型调用、会话、确认与执行没有搬迁。
+
+定向验证：财务执行、风险、账户和对账回归 **149 passed**；原计划、Manager、确认、界面及失败边界回归 **33 passed**；冻结补丁后的完整回归 **261 passed**。本轮新增测试位于 `test_order_engine.py`、`test_reconciliation.py`、`test_account_snapshots.py` 和 `test_reconciliation_evidence.py`。全部使用假传输和临时 SQLite，没有真实 Deriv、Jev 或解释模型调用。
+
+GitHub Actions 在 Python 3.11/3.12 上执行完整回归、离线策略回放和补丁空白检查，关闭实盘写入能力且不配置模型密钥。离线回放只验证策略路由，不是实盘或真实模型验收。

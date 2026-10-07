@@ -39,6 +39,7 @@ flowchart TD
 
 ```text
 web_app.py                    页面、会话状态、现有分析图、只读角色兼容入口
+planning.py                   纯计划类型、参数解析与本地规则，无 UI、网络或执行依赖
 server.py                     FastMCP 参数边界与 TradingService 调用
 advisory_policy.py            行情时效、连续性、场景与观察策略
 jev_router.py                 限时 Jev Choice 协议
@@ -84,6 +85,8 @@ local_data/gateway.sqlite3    本地运行数据，不提交到 Git
 
 保留大部分分析和页面代码在 `web_app.py`，优先抽出资金写入边界。没有为目录齐全而搬迁全部函数。
 
+2026-10-07 将 `ToolPlan`、默认解析常量和 16 个纯解析函数移入 `planning.py`。`web_app.py` 显式导入并保留原调用入口；模型调用、会话状态、确认和执行仍由工作台负责，解析行为保持不变。
+
 ## 4. 运行入口与共享状态
 
 | 模式 | 启动方式 | 数据与确认 |
@@ -128,6 +131,10 @@ flowchart TD
 ```
 
 SELL 使用独立意图与订单，确认卖出后进入 CLOSED，并在同一事务中更新对应的本地 OPEN 买入订单，正常回执和对账确认共用这一步。不同 SELL 意图也不能并发关闭同一合约。自然结算状态可通过只读刷新核对；刷新不会覆盖并发平仓后的终态。CANCELLED 用于尚未提交订单的领域迁移；当前界面未增加取消工具。
+
+即时 BUY/SELL 回执在执行核心同时要求正整数 `contract_id` 和 `transaction_id`，替换 Adapter 也不能省略交易标识。只读恢复可以在充分关联证据下缺少 `transaction_id`：已绑定的 BUY 可核对指定合约；未绑定 BUY 与 UNKNOWN SELL 必须核对动作匹配、逻辑意图关联和唯一成交身份的账单。相同身份的重复账单可合并，同一合约出现不同交易标识则保持 UNKNOWN。目标合约已售出本身不能证明某个 SELL 请求成功。
+
+账户快照在默认 Adapter 和共享服务边界均校验：余额与仓位价格必须有限且非负，合约标识必须是正整数，品种不能空缺或包含空白，同一快照不能重复合约标识。校验发生在曝光求和及合约字典构造前，避免负价或重复记录降低风险计算结果。提交前的最终快照校验失败记录 `RISK_DATA_UNAVAILABLE` 并拒绝该订单。
 
 `orders.intent_id` 和 `idempotency_key` 有 UNIQUE 约束；幂等键绑定规范化参数及实际授权账户。SQLite `BEGIN IMMEDIATE` 事务原子认领 APPROVED → SUBMITTING。只有认领者能调用 buy/sell，重复请求返回原订单。`req_id` 和 passthrough 只是请求关联信息，不是服务器端幂等键。
 
