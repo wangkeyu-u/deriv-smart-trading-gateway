@@ -52,6 +52,6 @@ python3.12 -m venv .venv
 .venv/bin/python scripts/evaluate_jev.py --output local_data/jev-offline-replay.json
 ```
 
-2026-10-02：181 项测试通过，包括成交后超时、重复请求、进程退出恢复、审批金额变更、并发资金预留、HALTED、MCP 绕过，以及本轮新增的回执冲突、迟到对账、卖出结果缺失和损益分页检查。测试使用假网络，不执行外部订单；复审记录见[执行核心改造记录](docs/execution-refactor.md#2026-10-02-执行核心复审)。
+2026-10-07：完整回归 **261 项通过**，GitHub Actions 在 Python 3.11 / 3.12 上检查完整测试、离线策略回放和补丁空白。覆盖成交后超时、重复请求、进程恢复、确认绑定、并发风险预留、HALTED、MCP 绕过、回执身份冲突、异常账户快照和可归因的唯一对账证据。测试使用假传输与临时 SQLite，不执行外部订单；记录见[执行核心改造记录](docs/execution-refactor.md#2026-10-07-执行与对账补充审计)，工作流见[Execution regression checks](https://github.com/wangkeyu-u/deriv-smart-trading-gateway/actions/workflows/ci.yml)。
 
 Jev 对照评估提供路由正确性、WAIT 分类、deep 使用、失败率、延迟、usage 和成本字段。离线 Jev 使用模拟答案；它不证明模型准确率、实际速度或交易盈利。真实评估使用显式 `--live`，需要密钥，0.8/0.7 门槛标为 UNCALIBRATED_THRESHOLD。
