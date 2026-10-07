@@ -50,7 +50,13 @@ python3.12 -m venv .venv
 ```bash
 .venv/bin/python -m pytest -q --disable-warnings --tb=short --show-capture=no
 .venv/bin/python scripts/evaluate_jev.py --output local_data/jev-offline-replay.json
+# 只读检查已经存在的订单数据库，无需 Token 或启动工作台
+.venv/bin/python scripts/check_execution_state.py
 ```
+
+数据库诊断输出聚合订单状态、对账队列和全局执行状态，不初始化数据库、不迁移、不提交订单。UNKNOWN 或积压显示在 `attention` 中；退出码及 WAL 边界见[操作指南](OPERATIONS.md#数据升级与恢复)。
+
+2026-10-08：新增 11 项真实临时 SQLite / CLI 诊断回归，完整套件 **272 项通过**；包含缺失路径不创建、异常 schema 不迁移、未 checkpoint 的 WAL 状态和循环符号链接的受控错误。
 
 2026-10-07：完整回归 **261 项通过**，GitHub Actions 在 Python 3.11 / 3.12 上检查完整测试、离线策略回放和补丁空白。覆盖成交后超时、重复请求、进程恢复、确认绑定、并发风险预留、HALTED、MCP 绕过、回执身份冲突、异常账户快照和可归因的唯一对账证据。测试使用假传输与临时 SQLite，不执行外部订单；记录见[执行核心改造记录](docs/execution-refactor.md#2026-10-07-执行与对账补充审计)，工作流见[Execution regression checks](https://github.com/wangkeyu-u/deriv-smart-trading-gateway/actions/workflows/ci.yml)。
 

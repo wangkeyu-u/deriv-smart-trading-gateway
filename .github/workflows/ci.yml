@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, codex/jev-scenario-controller]
   pull_request:
-    branches: [main]
+    branches: [main, codex/jev-scenario-controller]
 
 permissions:
   contents: read
