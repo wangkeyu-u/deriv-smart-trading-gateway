@@ -41,7 +41,7 @@ class FakeDeriv:
             cls.sells+=1; cls.sold=True
             return {'sell':{'contract_id':42,'transaction_id':44,'sold_for':9}}
         if 'profit_table' in payload: return {'profit_table':{'transactions':[]}}
-        if 'statement' in payload: return {'statement':{'transactions':[{'contract_id':42,'proposal_id':'proposal-1'}] if cls.committed else []}}
+        if 'statement' in payload: return {'statement':{'transactions':[{'contract_id':42,'proposal_id':'proposal-1','action_type':'buy'}] if cls.committed else []}}
         if 'proposal_open_contract' in payload: return {'proposal_open_contract':{'contract_id':42,'is_sold':int(cls.sold),'is_expired':0}}
         raise AssertionError(payload)
 

@@ -29,6 +29,10 @@ class OrderEngine:
             if (not isinstance(receipt,dict) or type(receipt.get('contract_id')) is not int
                     or receipt['contract_id'] <= 0):
                 raise UnknownOutcomeError('Missing broker contract identity')
+            # An immediate write response must identify the transaction. Read-only
+            # reconciliation can still resolve a verified contract without this ID.
+            if type(receipt.get('transaction_id')) is not int or receipt['transaction_id'] <= 0:
+                raise UnknownOutcomeError('Missing broker transaction identity')
             return self.repo.acknowledge(order_id, receipt)
         except asyncio.CancelledError:
             self.repo.transition(order_id,S.UNKNOWN,'submission_cancelled',expected=S.SUBMITTING,

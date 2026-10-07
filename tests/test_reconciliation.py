@@ -27,6 +27,21 @@ def test_committed_timeout_reconciles_without_second_buy(repo):
     assert [e['new_status'] for e in repo.events(order.order_id)][-4:] == ['UNKNOWN','RECONCILING','ACKNOWLEDGED','OPEN']
 
 
+def test_verified_read_only_reconciliation_can_resolve_without_transaction_identity(repo):
+    class ContractIdentified(CommittedButTimedOut):
+        async def resolve_order(self, order, intent):
+            return ReconciliationResult(True, 'OPEN', {'contract_id': 42})
+
+    order = prepare(repo)
+    adapter = ContractIdentified()
+    assert asyncio.run(OrderEngine(repo).execute(order.order_id, adapter)).status == S.UNKNOWN
+    resolved = asyncio.run(Reconciler(repo).reconcile(order.order_id, adapter))
+    assert resolved.status == S.OPEN
+    assert resolved.contract_id == 42
+    assert resolved.transaction_id is None
+    assert adapter.buys == 1
+
+
 def test_restart_after_submitting_recovers_only_by_reads(repo):
     order = prepare(repo)
     repo.claim_submission(order.order_id)

@@ -17,9 +17,11 @@ def repo(tmp_path):
     return OrderRepository(Database(tmp_path/'orders.sqlite3'))
 
 
-def prepare(repo, intent_id='intent-one'):
-    intent = TradeIntent(intent_id=intent_id, action='BUY', symbol='R_100', direction='CALL',
-                         amount=Decimal('10'), duration=5, duration_unit='t', account_mode='demo', source='streamlit')
+def prepare(repo, intent_id='intent-one', action='BUY'):
+    intent = TradeIntent(intent_id=intent_id, action=action, symbol='R_100', direction='CALL' if action=='BUY' else None,
+                         amount=Decimal('10') if action=='BUY' else Decimal(0), duration=5 if action=='BUY' else 0,
+                         duration_unit='t', contract_id=42 if action=='SELL' else None,
+                         account_mode='demo', source='streamlit')
     order = repo.create_order(intent, 'VRTC1')
     for status in (S.VALIDATED, S.APPROVAL_REQUIRED, S.APPROVED):
         order = repo.transition(order.order_id, status)
@@ -56,6 +58,38 @@ def test_before_send_and_after_send_are_distinct(repo, failure, status):
     assert asyncio.run(OrderEngine(repo).execute(order.order_id, broker)).status == status
     asyncio.run(OrderEngine(repo).execute(order.order_id, broker))
     assert broker.buys == 1
+
+
+@pytest.mark.parametrize('action', ['BUY', 'SELL'])
+@pytest.mark.parametrize('receipt', [
+    {'contract_id': 42},
+    {'contract_id': 42, 'transaction_id': None},
+    {'contract_id': 42, 'transaction_id': True},
+    {'contract_id': 42, 'transaction_id': 0},
+    {'contract_id': 42, 'transaction_id': -1},
+    {'contract_id': 42, 'transaction_id': '43'},
+    {'contract_id': 42, 'transaction_id': 43.0},
+])
+def test_incomplete_write_receipt_stays_unknown_without_resubmission(repo, action, receipt):
+    class IncompleteReceiptAdapter:
+        writes = 0
+
+        async def place_order(self, intent, order):
+            self.writes += 1
+            return receipt
+
+        close_order = place_order
+
+    order = prepare(repo, action=action)
+    adapter = IncompleteReceiptAdapter()
+    engine = OrderEngine(repo)
+
+    assert asyncio.run(engine.execute(order.order_id, adapter)).status == S.UNKNOWN
+    assert asyncio.run(engine.execute(order.order_id, adapter)).status == S.UNKNOWN
+    assert adapter.writes == 1
+    with repo.db.transaction() as conn:
+        assert conn.execute('SELECT count(*) FROM order_receipts').fetchone()[0] == 0
+        assert conn.execute('SELECT count(*) FROM reconciliation_jobs WHERE order_id=?', (order.order_id,)).fetchone()[0] == 1
 
 
 def test_migration_preserves_existing_history_and_events_are_append_only(tmp_path):

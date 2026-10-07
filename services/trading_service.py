@@ -10,6 +10,7 @@ from risk.policy import RiskPolicy
 import os
 
 from domain.approval import Approval
+from adapters.deriv.models import validate_account_snapshot
 from domain.order import OrderStatus as S
 from domain.trade import TradeIntent, TradeSource, utc_now
 from execution.engine import OrderEngine
@@ -44,7 +45,7 @@ class TradingService:
         intent=self.repo.intent(intent_id)
         self.context.require_time()
         try:
-            account=await self.adapter.get_account()
+            account=validate_account_snapshot(await self.adapter.get_account())
         except Exception as exc:
             raise AccountValidationError('account_authorization_unverified') from exc
         if account.mode != intent.account_mode:
@@ -114,7 +115,7 @@ class TradingService:
                     conn.execute('UPDATE orders SET data_json=? WHERE order_id=?',(updated.model_dump_json(),order.order_id))
         self.context.require_time()
         try:
-            account=await self.adapter.get_account()
+            account=validate_account_snapshot(await self.adapter.get_account())
             snapshot_at=time.monotonic()
             closed=await self.adapter.get_closed_contracts() if order.action=='BUY' else []
         except Exception:
@@ -156,6 +157,7 @@ class TradingService:
         return await self.engine.execute(order.order_id,self.adapter,risk_check)
 
     def risk_snapshot(self, intent, account, closed, conn):
+        validate_account_snapshot(account)
         portfolio={row.contract_id:row for row in account.contracts}
         reservations=self.repo.list(account.account_id,{S.SUBMITTING,S.ACKNOWLEDGED,S.OPEN,S.UNKNOWN,S.RECONCILING},conn)
         closed_ids={row.contract_id for row in closed}

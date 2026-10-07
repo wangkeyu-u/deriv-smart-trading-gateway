@@ -4,7 +4,7 @@ import math
 from decimal import Decimal
 
 from domain.trade import TradingMode
-from adapters.deriv.models import AccountSnapshot, OpenPosition, ClosedContract, Proposal, ContractSnapshot, ReconciliationResult
+from adapters.deriv.models import AccountSnapshot, OpenPosition, ClosedContract, Proposal, ContractSnapshot, ReconciliationResult, validate_account_snapshot
 from execution.engine import NotSentError, BrokerRejectedError, UnknownOutcomeError
 
 
@@ -43,8 +43,8 @@ class WebSocketDerivAdapter:
                     raise ValueError('Incomplete portfolio response')
                 if balance.get('loginid') and balance['loginid']!=self.account_id:
                     raise ValueError('Balance account mismatch')
-                return AccountSnapshot(self.account_id,self.account_mode,Decimal(str(balance['balance'])),auth['currency'],
-                    tuple(OpenPosition(int(row['contract_id']),row['symbol'],Decimal(str(row['buy_price'])),row.get('contract_type')) for row in portfolio.get('contracts',[])))
+                return validate_account_snapshot(AccountSnapshot(self.account_id,self.account_mode,Decimal(str(balance['balance'])),auth['currency'],
+                    tuple(OpenPosition(row['contract_id'],row['symbol'],Decimal(str(row['buy_price'])),row.get('contract_type')) for row in portfolio['contracts'])))
         return await asyncio.wait_for(read(), self.context.remaining_time)
 
     async def get_proposal(self, intent):
@@ -166,24 +166,39 @@ class WebSocketDerivAdapter:
             contract=await self.get_contract(order.contract_id)
             if contract.contract_id != order.contract_id or (order.action=='SELL' and not contract.is_sold):
                 return ReconciliationResult(False)
-            if order.action=='BUY' or not contract.is_expired:
+            # A known BUY identity may be explicitly bound by the user. A sold
+            # contract alone cannot attribute the close to this logical SELL.
+            if order.action=='BUY':
                 return ReconciliationResult(True,'EXPIRED' if contract.is_expired and contract.is_sold else 'CLOSED' if contract.is_sold else 'OPEN',
                     {'contract_id':order.contract_id,'transaction_id':order.transaction_id})
         transactions=await self.get_statement(int((order.submitted_at or order.created_at).timestamp())-60)
         # Statement passthrough/proposal IDs are optional. Similar-looking trades aren't proof.
-        candidates=[row for row in transactions if
-                    ((row.get('passthrough') or {}).get('order_id')==order.order_id or
-                     (order.proposal_id and row.get('proposal_id')==order.proposal_id))
-                    and (order.action=='BUY' or (
-                        row.get('action_type')=='sell' and row.get('contract_id')==order.contract_id))]
-        identities={int(row['contract_id']) for row in candidates if row.get('contract_id')}
+        if not isinstance(transactions, list):
+            return ReconciliationResult(False)
+        identities=set()
+        for row in transactions:
+            if not isinstance(row, dict):
+                return ReconciliationResult(False)
+            passthrough=row.get('passthrough') or {}
+            if not isinstance(passthrough, dict):
+                return ReconciliationResult(False)
+            if not (passthrough.get('order_id')==order.order_id or
+                    (order.proposal_id and row.get('proposal_id')==order.proposal_id)):
+                continue
+            cid,tid=row.get('contract_id'),row.get('transaction_id')
+            if (row.get('action_type') != order.action.lower()
+                    or type(cid) is not int or cid <= 0
+                    or (tid is not None and (type(tid) is not int or tid <= 0))
+                    or (order.action=='SELL' and cid != order.contract_id)):
+                return ReconciliationResult(False)
+            # Exact repeats identify the same transaction; distinct IDs remain
+            # ambiguous even when they refer to the same contract.
+            identities.add((cid,tid))
         if len(identities)==1:
-            cid=next(iter(identities))
+            cid,tid=next(iter(identities))
             if contract is None or contract.contract_id!=cid:
                 contract=await self.get_contract(cid)
             if contract.contract_id==cid and (order.action=='BUY' or contract.is_sold):
-                tid=next((row['transaction_id'] for row in candidates
-                          if type(row.get('transaction_id')) is int and row['transaction_id']>0),None)
                 status='CLOSED' if order.action=='SELL' else 'EXPIRED' if contract.is_expired and contract.is_sold else 'CLOSED' if contract.is_sold else 'OPEN'
                 return ReconciliationResult(True,status,{'contract_id':cid,'transaction_id':tid})
         return ReconciliationResult(False)
