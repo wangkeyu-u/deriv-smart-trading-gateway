@@ -1,6 +1,6 @@
 # Deriv Gateway 操作指南
 
-更新：2026-10-02。当前架构见 [项目说明](docs/project-architecture.md)，实现与故障记录见 [阶段记录](docs/execution-refactor.md)。
+更新：2026-10-08。当前架构见 [项目说明](docs/project-architecture.md)，实现与故障记录见 [阶段记录](docs/execution-refactor.md)。
 
 ## 运行和配置
 
@@ -112,6 +112,19 @@ Deriv Token 和解释模型密钥在工作台设置或工具参数中提供，�
 通过 `DERIV_RISK_POLICY` 指向文件。严格校验拒绝额外字段和非法类型。日亏损为 UTC 当日已结算净损益的负数部分；连亏来自最近结算记录。损益按合约去重，读取覆盖当日与完整的尾部亏损序列；非有限值、负金额、记录冲突、超过 2000 条读取边界或读取失败时不提交。未知订单计入预留并阻止新 BUY。
 
 ## 数据升级与恢复
+
+无需启动工作台、MCP 或连接 Deriv，即可检查现有执行数据库：
+
+```bash
+.venv/bin/python scripts/check_execution_state.py
+.venv/bin/python scripts/check_execution_state.py --db /absolute/path/gateway.sqlite3
+```
+
+路径选择顺序为 `--db`、`DERIV_DB_PATH`、默认 `local_data/gateway.sqlite3`；相对路径始终以仓库根目录为基准。输出 JSON 包含 schema 版本、全局执行状态、各订单状态数量、对账队列总数/到期未租用数/租用数及事件数量，不输出账户、意图、回执内容或密钥。
+
+退出码 `0` 表示读取完成，`2` 表示数据库缺失、不可读、schema 不受支持或状态异常。`ok: true` 只表示诊断完成；`attention` 会提示 UNKNOWN 订单及对账积压，不能据此判断实际成交或交易安全。队列租约按检查时刻计算；无法证明进程已经退出的租约仍算租用。
+
+该命令使用 SQLite `mode=ro` 和单个读事务，包含尚未 checkpoint 的 WAL 数据；不会创建缺失数据库、迁移 schema、修改订单或启动恢复。SQLite 读取 WAL 时可能使用或更新 `-shm` 协调文件。它不代替经纪商核对，读取失败也不会把现有记录当成空库。
 
 保留原 SQLite 文件，启动会执行增量 migration；本轮 v3 仅增加对账 lease_token。订单意图、状态、事件、确认、风险、回执和对账任务均持久化。不要删除数据库来“清除”未知订单；这样会失去幂等与恢复依据。
 
